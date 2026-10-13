@@ -379,6 +379,25 @@ class TestSerialization(unittest.TestCase):
         )
         self.assertEqual(st.to_dict()["nonce"], 3)
 
+    def test_from_dict_rejects_mixed_type_extra_keys(self):
+        # All required fields plus BOTH an integer extra key and a string
+        # extra key. Non-string keys must raise InvalidTransactionError (the
+        # domain exception for malformed data) rather than an incidental
+        # Python TypeError from sorting/formatting mixed-type keys.
+        st = sign_record(
+            fixed_key(),
+            recipient=GOLDEN_RECIPIENT,
+            amount=7,
+            nonce=0,
+            chain_id=DEFAULT_CHAIN_ID,
+        )
+        base = st.to_dict()
+        record = dict(base)
+        record[7] = "integer extra key"
+        record["extra"] = "string extra key"
+        with self.assertRaises(InvalidTransactionError):
+            SignedTransaction.from_dict(record)
+
     def test_repr_hides_nothing_public_but_no_private_key(self):
         st = sign_record(
             fixed_key(),

@@ -448,6 +448,30 @@ class TestReplayAtomicityAndInvariants(unittest.TestCase):
         self.assertEqual(balances[BOB.address], 5)
         self.assertEqual(next_nonces[ALICE.address], 1)
 
+    def test_ordinary_transfer_of_exact_full_balance_omits_sender(self):
+        # A sender transferring their entire balance in an ordinary (non-self)
+        # transfer must be omitted from the working balance mapping, the
+        # recipient must receive the full amount, and the sender's next nonce
+        # must advance by exactly one. This keeps working state canonical.
+        record = sign(ALICE, BOB.address, 100, nonce=0)
+        balances = {ALICE.address: 100}
+        next_nonces = {}
+        _process_transaction(record, balances, next_nonces, CHAIN_ID)
+        self.assertNotIn(ALICE.address, balances)
+        self.assertEqual(balances[BOB.address], 100)
+        self.assertEqual(next_nonces[ALICE.address], 1)
+
+    def test_self_transfer_of_full_balance_keeps_sender_entry(self):
+        # A self-transfer of the entire balance must NOT delete the sender's
+        # entry, and must still consume exactly one nonce.
+        record = sign(ALICE, ALICE.address, 100, nonce=0)
+        balances = {ALICE.address: 100}
+        next_nonces = {}
+        _process_transaction(record, balances, next_nonces, CHAIN_ID)
+        self.assertIn(ALICE.address, balances)
+        self.assertEqual(balances[ALICE.address], 100)
+        self.assertEqual(next_nonces[ALICE.address], 1)
+
     # ---- Invalid chain refused -----------------------------------------
     def test_invalid_chain_raises(self):
         ledger = Ledger(BOOTSTRAP, CHAIN_ID)

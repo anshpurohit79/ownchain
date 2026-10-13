@@ -211,7 +211,7 @@ The public API consists of:
 - `iter_balances()`
 - `iter_next_nonces()`
 
-Both lookup methods return zero for an absent valid address. Invalid address arguments are rejected rather than silently treated as unknown.
+Both lookup methods return zero for an absent valid address. An invalid or non-string address argument is rejected with the built-in `ValueError` rather than silently treated as unknown. See the exception policy in §8.
 
 The iterators yield `(address, value)` pairs sorted by address. They expose no underlying mutable dictionaries. Sorting is explicit; insertion order must never determine the future canonical state representation.
 
@@ -223,7 +223,7 @@ Equality returns `NotImplemented` for objects of unsupported types. The class is
 
 ## 7. Canonical state and zero-value rules
 
-**Zero values are never stored in either balances or next nonces.**
+Zero values are never stored in either balances or next nonces — neither in the mutable working mappings during replay nor in the returned `LedgerState`. `Ledger._process_transaction` removes a sender's working-balance entry as soon as an ordinary transfer reduces it to zero, so the working mapping stays canonical throughout replay rather than being cleaned up only at `LedgerState` construction. The next-nonce working entry is never removed, so replay continuity is preserved even when a balance reaches zero.
 
 The canonical balance lookup rule is:
 

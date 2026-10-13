@@ -62,6 +62,7 @@ import base64
 import hashlib
 import json
 
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from core.exceptions import InvalidSignatureError, InvalidTransactionError
@@ -311,6 +312,10 @@ class SignedTransaction:
             "signature",
         }
         keys = set(record.keys())
+        if any(not isinstance(key, str) for key in keys):
+            raise InvalidTransactionError(
+                f"record keys must all be strings, got keys {list(record.keys())!r}"
+            )
         if keys != required:
             missing = sorted(required - keys)
             unexpected = sorted(keys - required)
@@ -401,9 +406,7 @@ class SignedTransaction:
             Ed25519PublicKey.from_public_bytes(self._public_key_bytes).verify(
                 self._signature_bytes, self.signing_bytes()
             )
-        except InvalidTransactionError:
-            raise
-        except Exception as exc:
+        except InvalidSignature as exc:
             raise InvalidSignatureError("signature verification failed") from exc
 
     def __repr__(self) -> str:

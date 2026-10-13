@@ -72,7 +72,7 @@ class LedgerState:
     it is only a well-formed snapshot of the outcome of some replay.
     """
 
-    __hash__ = None  # mutable-content value object: deliberately unhashable
+    __hash__ = None  # deliberately unhashable: no canonical state-hash format is defined yet
 
     def __init__(
         self,
@@ -149,15 +149,16 @@ class LedgerState:
     def balance(self, address: str) -> int:
         """Return the balance for *address* (0 if absent).
 
-        An invalid address argument raises ``ValueError``; a non-string raises
-        ``TypeError`` implicitly via ``is_valid_address`` returning False and
-        the explicit ``ValueError`` below.
+        An invalid or non-string *address* raises ``ValueError``.
         """
         self._check_address(address)
         return self._balances.get(address, 0)
 
     def next_nonce(self, address: str) -> int:
-        """Return the next expected nonce for *address* (0 if absent)."""
+        """Return the next expected nonce for *address* (0 if absent).
+
+        An invalid or non-string *address* raises ``ValueError``.
+        """
         self._check_address(address)
         return self._next_nonces.get(address, 0)
 
@@ -260,6 +261,10 @@ def _process_transaction(
         # zero balance must NOT be deleted here; leave balances[sender] as-is.
         return
     balances[sender] = balance - amount
+    if balances[sender] == 0:
+        # Preserve canonical working balances: an ordinary transfer that
+        # reduces the sender to zero omits their entry entirely.
+        del balances[sender]
     balances[recipient] = balances.get(recipient, 0) + amount
 
 
@@ -273,7 +278,7 @@ class Ledger:
     def __init__(
         self,
         initial_balances: Mapping[str, int],
-        chain_id: str = "ownchain-devnet-1",
+        chain_id: str,
     ):
         if not isinstance(initial_balances, Mapping):
             raise TypeError(

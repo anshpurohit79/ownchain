@@ -21,8 +21,8 @@ class InvalidNonceError(Exception):
     """Raised when a transaction nonce is structurally valid but violates the
     account's expected-nonce continuity rule.
 
-    Reserved for the later ledger stage that enforces nonce continuity against
-    account state. Structural/format problems in a serialized record belong to
+    Enforced by the ledger during deterministic replay (see ``core.ledger``).
+    Structural/format problems in a serialized record belong to
     ``InvalidTransactionError``.
     """
 
@@ -31,5 +31,6 @@ class WrongChainError(Exception):
     """Raised when a transaction's ``chain_id`` does not match the chain being
     processed.
 
-    Reserved for the later ledger stage that binds a replay to one chain id.
+    Enforced by the ledger during deterministic replay, which binds every
+    replay to one configured chain id (see ``core.ledger``).
     """
