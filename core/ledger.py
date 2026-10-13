@@ -319,24 +319,32 @@ class Ledger:
         On any failure nothing is returned and the working state is discarded;
         the original configuration and any previously returned state are
         unchanged.
+
+        Replay is defined in terms of ``apply_block``: after the fixed, empty
+        genesis block (whose state is exactly ``LedgerState(bootstrap, {})``),
+        each non-genesis block is folded onto the running state via
+        ``apply_block``. ``_process_transaction`` therefore remains the single
+        transaction authority, reached through block validation. Because
+        ``Chain.validate`` and ``apply_block`` enforce the same structural
+        rules, ``InvalidBlockError`` cannot escape replay of a validated chain.
         """
         if not chain.validate():
             raise InvalidChainError(
                 "cannot replay an invalid Chain (Chain.validate() returned False)"
             )
 
-        # Fresh working copies on every call: balances seeded from the
-        # bootstrap snapshot, next-nonces starting empty.
-        balances: Dict[str, int] = dict(self._initial_balances)
-        next_nonces: Dict[str, int] = {}
+        # The state immediately after the fixed, empty genesis block is the
+        # bootstrap balances with no recorded next nonces. A fresh copy is used
+        # on every call so repeated replays are independent and deterministic.
+        state = LedgerState(dict(self._initial_balances), {})
 
-        for block in chain.blocks:
-            for record in block.transactions:
-                _process_transaction(
-                    record, balances, next_nonces, self._chain_id
-                )
+        blocks = chain.blocks
+        prev_block = blocks[0]
+        for block in blocks[1:]:
+            state = self.apply_block(block, prev_block, state)
+            prev_block = block
 
-        return LedgerState(balances, next_nonces)
+        return state
     # ------------------------------------------------------------------
     # Stateful block validation (milestone 7)
     # ------------------------------------------------------------------

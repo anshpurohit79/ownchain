@@ -921,3 +921,64 @@ class TestApplyBlockFullBalanceAndSelfTransfer(unittest.TestCase):
         block = self._block([sign(ALICE, ALICE.address, 11, nonce=0)])
         with self.assertRaises(InsufficientFundsError):
             self.ledger.apply_block(block, self.genesis, self.prior)
+
+class TestReplayDelegatesToApplyBlock(unittest.TestCase):
+    """Replay must route non-genesis blocks through apply_block().
+
+    The key new proof is the *equivalence* between replay's result and a manual
+    fold of apply_block() over the non-genesis blocks; existing classes already
+    establish replay's transaction/atomicity behavior, so this class targets the
+    delegation contract only.
+    """
+
+    def setUp(self):
+        self.ledger = Ledger(BOOTSTRAP, CHAIN_ID)
+
+    def _manual_fold(self, chain):
+        """Fold apply_block() over chain.blocks[1:] from the genesis state."""
+        state = LedgerState(dict(BOOTSTRAP), {})
+        prev = chain.blocks[0]
+        for block in chain.blocks[1:]:
+            state = self.ledger.apply_block(block, prev, state)
+            prev = block
+        return state
+
+    def test_replay_equals_manual_apply_block_fold(self):
+        chain = build_chain(HAPPY_TXS)
+        self.assertEqual(
+            self.ledger.replay(chain),
+            self._manual_fold(chain),
+        )
+
+    def test_two_equivalent_chains_replay_to_equal_states(self):
+        # Independently constructed, logically identical chains must agree.
+        chain_a = build_chain(HAPPY_TXS)
+        chain_b = build_chain(HAPPY_TXS)
+        self.assertIsNot(chain_a, chain_b)
+        self.assertEqual(
+            self.ledger.replay(chain_a),
+            self.ledger.replay(chain_b),
+        )
+
+    def test_genesis_only_chain_returns_bootstrap_state(self):
+        # No non-genesis blocks: replay yields exactly the bootstrap balances
+        # with an empty next-nonce mapping (the state after empty genesis).
+        chain = Chain(genesis_block())
+        state = self.ledger.replay(chain)
+        self.assertEqual(state, LedgerState(BOOTSTRAP, {}))
+        self.assertEqual(
+            list(state.iter_next_nonces()),
+            list(LedgerState(BOOTSTRAP, {}).iter_next_nonces()),
+        )
+
+    def test_generator_container_chain_raises_invalid_chain_error(self):
+        # A post-construction generator substituted into a block's transaction
+        # container is rejected structurally (Chain.validate returns False),
+        # so replay raises InvalidChainError rather than silently skipping the
+        # generator's transactions.
+        chain = build_chain(HAPPY_TXS)
+        chain._blocks[1].transactions = (
+            t for t in chain._blocks[1].transactions
+        )
+        with self.assertRaises(InvalidChainError):
+            self.ledger.replay(chain)
