@@ -224,3 +224,143 @@ class TestChainValidateReturnStrictBoolean(unittest.TestCase):
         b1.block_hash = b1.calculate_hash()
         self.assertFalse(chain.validate())
         self.assertIsInstance(chain.validate(), bool)
+
+
+class TestChainIndexMustBeExactInteger(unittest.TestCase):
+    """Indices must be genuine ints, not bools or floats.
+
+    ``bool`` is a subclass of ``int`` (``True == 1``, ``False == 0``) and
+    ``1.0 == 1``, so equality-based index checks are unsound. Every index is
+    now required to be a real ``int`` via ``is_exact_int``.
+    """
+
+    def test_genesis_rejects_boolean_false_index(self):
+        with self.assertRaises(ValueError):
+            Chain(Block(index=False, timestamp=GENESIS_TIMESTAMP,
+                        prev_hash=GENESIS_PREV_HASH, transactions=[]))
+
+    def test_genesis_rejects_boolean_true_index(self):
+        with self.assertRaises(ValueError):
+            Chain(Block(index=True, timestamp=GENESIS_TIMESTAMP,
+                        prev_hash=GENESIS_PREV_HASH, transactions=[]))
+
+    def test_genesis_rejects_float_zero_index(self):
+        with self.assertRaises(ValueError):
+            Chain(Block(index=0.0, timestamp=GENESIS_TIMESTAMP,
+                        prev_hash=GENESIS_PREV_HASH, transactions=[]))
+
+    def test_genesis_rejects_non_int_index(self):
+        with self.assertRaises(ValueError):
+            Chain(Block(index="0", timestamp=GENESIS_TIMESTAMP,
+                        prev_hash=GENESIS_PREV_HASH, transactions=[]))
+
+    def test_validate_rejects_boolean_true_index_after_genesis(self):
+        chain = Chain(genesis_block())
+        chain.append(timestamp="2021-01-02T00:00:00Z", transactions=[{"a": 1}])
+        block = chain.blocks[1]
+        block.index = True
+        block.block_hash = block.calculate_hash()  # restore self-verification
+        self.assertTrue(block.verify())
+        self.assertFalse(chain.validate())
+
+    def test_validate_rejects_boolean_false_index_at_genesis(self):
+        chain = Chain(genesis_block())
+        genesis = chain.blocks[0]
+        genesis.index = False
+        genesis.block_hash = genesis.calculate_hash()
+        self.assertTrue(genesis.verify())
+        self.assertFalse(chain.validate())
+
+    def test_validate_rejects_float_index_after_genesis(self):
+        chain = Chain(genesis_block())
+        chain.append(timestamp="2021-01-02T00:00:00Z", transactions=[{"a": 1}])
+        block = chain.blocks[1]
+        block.index = 1.0
+        block.block_hash = block.calculate_hash()
+        self.assertTrue(block.verify())
+        self.assertFalse(chain.validate())
+
+    def test_validate_accepts_integer_indices(self):
+        chain = Chain(genesis_block())
+        chain.append(timestamp="2021-01-02T00:00:00Z", transactions=[{"a": 1}])
+        chain.append(timestamp="2021-01-03T00:00:00Z", transactions=[{"a": 2}])
+        self.assertTrue(chain.validate())
+
+    def test_append_produces_exact_integer_indices(self):
+        chain = Chain(genesis_block())
+        chain.append(timestamp="2021-01-02T00:00:00Z", transactions=[])
+        chain.append(timestamp="2021-01-03T00:00:00Z", transactions=[])
+        for block in chain.blocks:
+            self.assertIs(type(block.index), int)
+
+
+class TestChainTransactionContainerMustBeList(unittest.TestCase):
+    """``Block.transactions`` must be a plain list.
+
+    ``Block.__init__`` normalizes its input to a list, so a non-list container
+    can only appear via post-construction mutation of the public attribute. A
+    generator reproduces its hash inside ``to_dict`` (which calls
+    ``list(...)``) and is then consumed, silently dropping every transaction,
+    so the container type must be checked *before* ``verify()``.
+    """
+
+    def test_genesis_constructor_rejects_generator_container(self):
+        # Regression guard: a generator reaching genesis.transactions (only
+        # possible via post-construction mutation) must be rejected WITHOUT
+        # being consumed. The constructor rejects on container type before any
+        # empty-list comparison or hashing could iterate it.
+        genesis = genesis_block()
+        gen = (t for t in [{"sender": "alice", "amount": 5}])
+        genesis.transactions = gen  # post-construction substitution
+        with self.assertRaises(ValueError):
+            Chain(genesis)
+        # The generator was never consumed, so it still yields its one item.
+        self.assertEqual(list(gen), [{"sender": "alice", "amount": 5}])
+
+    def test_genesis_constructor_rejects_list_subclass_container(self):
+        class MyList(list):
+            pass
+
+        genesis = genesis_block()
+        genesis.transactions = MyList()  # equals [] but is not a plain list
+        with self.assertRaises(ValueError):
+            Chain(genesis)
+
+    def test_validate_rejects_generator_container_after_genesis(self):
+        chain = Chain(genesis_block())
+        chain.append(timestamp="2021-01-02T00:00:00Z", transactions=[{"a": 1}])
+        block = chain.blocks[1]
+        block.transactions = (t for t in [{"a": 1}])
+        self.assertFalse(chain.validate())
+
+    def test_validate_rejects_generator_without_consuming_it(self):
+        # Decisive ordering assertion: the container check runs before verify(),
+        # so a generator is rejected while still intact (never silently skipped).
+        chain = Chain(genesis_block())
+        chain.append(timestamp="2021-01-02T00:00:00Z", transactions=[{"a": 1}])
+        block = chain.blocks[1]
+        block.transactions = (t for t in [{"a": 1}])
+        self.assertFalse(chain.validate())
+        self.assertEqual(len(list(block.transactions)), 1)
+
+    def test_validate_rejects_generator_container_at_genesis(self):
+        chain = Chain(genesis_block())
+        chain.blocks[0].transactions = (t for t in [])
+        self.assertFalse(chain.validate())
+
+    def test_validate_rejects_list_subclass_container_after_genesis(self):
+        class MyList(list):
+            pass
+
+        chain = Chain(genesis_block())
+        chain.append(timestamp="2021-01-02T00:00:00Z", transactions=[{"a": 1}])
+        block = chain.blocks[1]
+        block.transactions = MyList([{"a": 1}])
+        block.block_hash = block.calculate_hash()
+        self.assertTrue(block.verify())
+        self.assertFalse(chain.validate())
+
+    def test_validate_accepts_list_container(self):
+        chain = Chain(genesis_block())
+        chain.append(timestamp="2021-01-02T00:00:00Z", transactions=[{"a": 1}])
+        self.assertTrue(chain.validate())

@@ -6,9 +6,13 @@ Invariants (enforced by validate()):
   1. Genesis rules: first block matches the fixed genesis spec
      (index=0, timestamp="2021-01-01T00:00:00Z",
       prev_hash="0"*64, transactions=[]).
-  2. Sequential indices: blocks[i].index == i for every i.
-  3. Self-verification: blocks[i].verify() is True for every i.
-  4. Hash links: blocks[i].prev_hash == blocks[i-1].block_hash
+  2. Sequential exact-int indices: blocks[i].index == i for every i, where
+     each index is a genuine int (a bool or float index is rejected).
+  3. Plain-list transaction container: blocks[i].transactions is a plain
+     ``list`` (a generator or list subclass is rejected before hashing, so a
+     generator is never silently consumed and its transactions skipped).
+  4. Self-verification: blocks[i].verify() is True for every i.
+  5. Hash links: blocks[i].prev_hash == blocks[i-1].block_hash
      for every i >= 1, using each block's STORED hash snapshot.
 
 Key design point: link checks compare a block's `prev_hash` field to the
@@ -21,6 +25,7 @@ deliberately a set of independent boolean checks, not a single property.
 from typing import List
 
 from core.block import Block, genesis_block
+from core.validation import is_exact_int
 
 GENESIS_TIMESTAMP = "2021-01-01T00:00:00Z"
 GENESIS_PREV_HASH = "0" * 64
@@ -38,9 +43,10 @@ class Chain:
     # ------------------------------------------------------------------
     def _validate_genesis(self, genesis: Block) -> None:
         """Raise ValueError if the genesis block violates the fixed spec."""
-        if genesis.index != 0:
+        if not is_exact_int(genesis.index) or genesis.index != 0:
             raise ValueError(
-                f"Genesis index must be 0, got {genesis.index!r}"
+                f"Genesis index must be the exact integer 0, "
+                f"got {genesis.index!r}"
             )
         if genesis.timestamp != GENESIS_TIMESTAMP:
             raise ValueError(
@@ -51,7 +57,7 @@ class Chain:
             raise ValueError(
                 "Genesis prev_hash must be 64 zero characters"
             )
-        if genesis.transactions != []:
+        if type(genesis.transactions) is not list or genesis.transactions != []:
             raise ValueError(
                 "Genesis transactions must be an empty list"
             )
@@ -98,10 +104,14 @@ class Chain:
         """Return True if every chain invariant holds, else False.
 
         Rules (all must hold):
-          1. Genesis rules: index=0, fixed timestamp,
-             prev_hash="0"*64, empty transactions, and genesis.verify() is True.
-          2. Sequential indices: blocks[i].index == i.
-          3. Self-verification: blocks[i].verify() is True for every i.
+          1. Genesis rules: index=0 (a genuine int), fixed timestamp,
+             prev_hash="0"*64, a plain empty-list transaction container,
+             and genesis.verify() is True.
+          2. Sequential exact-int indices: blocks[i].index == i, where each
+             index is a genuine int (a bool or float index is rejected).
+          3. Plain-list transaction container and self-verification:
+             blocks[i].transactions is a plain list (checked before hashing,
+             so a generator is never consumed) and blocks[i].verify() is True.
           4. Hash links: blocks[i].prev_hash == blocks[i-1].block_hash
              for every i >= 1, using the PREVIOUS block's stored hash.
         """
@@ -113,9 +123,11 @@ class Chain:
             return False
         first = blocks[0]
         if (
-            first.index != 0
+            not is_exact_int(first.index)
+            or first.index != 0
             or first.timestamp != GENESIS_TIMESTAMP
             or first.prev_hash != GENESIS_PREV_HASH
+            or type(first.transactions) is not list
             or first.transactions != []
             or not first.verify()
         ):
@@ -123,7 +135,9 @@ class Chain:
 
         # Rules 2 and 3 plus the first link (if any).
         for i in range(1, n):
-            if blocks[i].index != i:
+            if not is_exact_int(blocks[i].index) or blocks[i].index != i:
+                return False
+            if type(blocks[i].transactions) is not list:
                 return False
             if not blocks[i].verify():
                 return False
