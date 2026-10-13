@@ -1,0 +1,21 @@
+# Python environments
+.venv/
+venv/
+
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+
+# Private keys and wallet secrets
+*.pem
+*.key
+*.seed
+*.p12
+*.pfx
