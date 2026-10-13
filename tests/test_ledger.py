@@ -726,3 +726,198 @@ class TestApplyBlockStateTransition(unittest.TestCase):
         self.assertEqual(list(self.prior.iter_balances()), before_balances)
         self.assertEqual(list(self.prior.iter_next_nonces()), before_nonces)
         self.assertEqual(self.prior.balance(ALICE.address), 10)
+
+
+class TestApplyBlockTransactionFailures(unittest.TestCase):
+    """A transaction failure inside a candidate block must raise the exact
+    exception and leave the supplied prior LedgerState unchanged."""
+
+    def setUp(self):
+        self.ledger = Ledger(BOOTSTRAP, CHAIN_ID)
+        self.genesis = genesis_block()
+        self.prior = LedgerState(BOOTSTRAP, {})
+        self._prior_balances = list(self.prior.iter_balances())
+        self._prior_nonces = list(self.prior.iter_next_nonces())
+
+    def _block(self, transactions):
+        return Block(
+            index=1,
+            timestamp="2021-01-02T00:00:00Z",
+            prev_hash=self.genesis.block_hash,
+            transactions=transactions,
+        )
+
+    def _assert_prior_unchanged(self):
+        self.assertEqual(list(self.prior.iter_balances()), self._prior_balances)
+        self.assertEqual(list(self.prior.iter_next_nonces()), self._prior_nonces)
+
+    def test_amount_altered_after_signing_rejected(self):
+        tx = sign(ALICE, BOB.address, 2, nonce=0)
+        tampered = dict(tx)
+        tampered["amount"] = 5
+        block = self._block([tampered])
+        with self.assertRaises(InvalidSignatureError):
+            self.ledger.apply_block(block, self.genesis, self.prior)
+        self._assert_prior_unchanged()
+
+    def test_malformed_record_rejected(self):
+        block = self._block([{"sender": ALICE.address}])
+        with self.assertRaises(InvalidTransactionError):
+            self.ledger.apply_block(block, self.genesis, self.prior)
+        self._assert_prior_unchanged()
+
+    def test_wrong_chain_id_rejected(self):
+        tx = sign(ALICE, BOB.address, 2, nonce=0, chain_id=OTHER_CHAIN_ID)
+        block = self._block([tx])
+        with self.assertRaises(WrongChainError):
+            self.ledger.apply_block(block, self.genesis, self.prior)
+        self._assert_prior_unchanged()
+
+
+class TestApplyBlockNonceAndFunds(unittest.TestCase):
+    """Nonce continuity and balance checks enforced at the block boundary."""
+
+    def setUp(self):
+        self.ledger = Ledger(BOOTSTRAP, CHAIN_ID)
+        self.genesis = genesis_block()
+        self.prior = LedgerState(BOOTSTRAP, {})
+        self._prior_balances = list(self.prior.iter_balances())
+        self._prior_nonces = list(self.prior.iter_next_nonces())
+
+    def _block(self, transactions):
+        return Block(
+            index=1,
+            timestamp="2021-01-02T00:00:00Z",
+            prev_hash=self.genesis.block_hash,
+            transactions=transactions,
+        )
+
+    def _assert_prior_unchanged(self):
+        self.assertEqual(list(self.prior.iter_balances()), self._prior_balances)
+        self.assertEqual(list(self.prior.iter_next_nonces()), self._prior_nonces)
+
+    def test_stale_duplicate_nonce_rejected(self):
+        tx = sign(ALICE, BOB.address, 1, nonce=0)
+        block = self._block([tx, dict(tx)])
+        with self.assertRaises(InvalidNonceError):
+            self.ledger.apply_block(block, self.genesis, self.prior)
+        self._assert_prior_unchanged()
+
+    def test_skipped_nonce_rejected(self):
+        block = self._block([sign(ALICE, BOB.address, 1, nonce=1)])
+        with self.assertRaises(InvalidNonceError):
+            self.ledger.apply_block(block, self.genesis, self.prior)
+        self._assert_prior_unchanged()
+
+    def test_out_of_order_nonce_rejected(self):
+        block = self._block([
+            sign(ALICE, BOB.address, 1, nonce=1),
+            sign(ALICE, BOB.address, 1, nonce=0),
+        ])
+        with self.assertRaises(InvalidNonceError):
+            self.ledger.apply_block(block, self.genesis, self.prior)
+        self._assert_prior_unchanged()
+
+    def test_insufficient_funds_rejected(self):
+        block = self._block([sign(ALICE, BOB.address, 1000, nonce=0)])
+        with self.assertRaises(InsufficientFundsError):
+            self.ledger.apply_block(block, self.genesis, self.prior)
+        self._assert_prior_unchanged()
+
+
+class TestApplyBlockIntraBlockOrdering(unittest.TestCase):
+    """Transactions apply in list order; later ones see earlier successes."""
+
+    def setUp(self):
+        self.ledger = Ledger(BOOTSTRAP, CHAIN_ID)
+        self.genesis = genesis_block()
+        self.prior = LedgerState(BOOTSTRAP, {})
+        self._prior_balances = list(self.prior.iter_balances())
+        self._prior_nonces = list(self.prior.iter_next_nonces())
+
+    def _block(self, transactions):
+        return Block(
+            index=1,
+            timestamp="2021-01-02T00:00:00Z",
+            prev_hash=self.genesis.block_hash,
+            transactions=transactions,
+        )
+
+    def test_spend_funds_received_earlier_in_same_block(self):
+        # ALICE -> BOB, then BOB spends what he just received. Bob starts with 1
+        # (BOOTSTRAP); he can only send 5 because ALICE's transfer lands first.
+        txs = [
+            sign(ALICE, BOB.address, 5, nonce=0),
+            sign(BOB, CHARLIE.address, 5, nonce=0),
+        ]
+        result = self.ledger.apply_block(self._block(txs), self.genesis, self.prior)
+        self.assertEqual(result.balance(CHARLIE.address), 5)
+        self.assertEqual(result.balance(BOB.address), 1)  # 1 + 5 - 5
+        self.assertEqual(result.next_nonce(ALICE.address), 1)
+        self.assertEqual(result.next_nonce(BOB.address), 1)
+
+    def test_reversed_order_fails_insufficient_funds(self):
+        # Bob tries to spend 5 BEFORE receiving it; he only holds 1.
+        txs = [
+            sign(BOB, CHARLIE.address, 5, nonce=0),
+            sign(ALICE, BOB.address, 5, nonce=0),
+        ]
+        with self.assertRaises(InsufficientFundsError):
+            self.ledger.apply_block(self._block(txs), self.genesis, self.prior)
+
+    def test_early_valid_then_failing_transaction_returns_no_state(self):
+        # A valid transfer modifies the private working copies, then a second
+        # transaction fails. The block must fail atomically: nothing is returned
+        # and the supplied prior state is untouched by the earlier success.
+        txs = [
+            sign(ALICE, BOB.address, 2, nonce=0),        # succeeds on the copy
+            sign(ALICE, BOB.address, 2, nonce=2),        # skipped nonce -> fail
+        ]
+        block = self._block(txs)
+        with self.assertRaises(InvalidNonceError):
+            self.ledger.apply_block(block, self.genesis, self.prior)
+        # The earlier successful transfer must NOT have leaked into prior state.
+        self.assertEqual(list(self.prior.iter_balances()), self._prior_balances)
+        self.assertEqual(list(self.prior.iter_next_nonces()), self._prior_nonces)
+        self.assertEqual(self.prior.balance(ALICE.address), 10)
+        self.assertEqual(self.prior.next_nonce(ALICE.address), 0)
+
+
+class TestApplyBlockFullBalanceAndSelfTransfer(unittest.TestCase):
+    """Full-balance and self-transfer semantics observed through apply_block."""
+
+    def setUp(self):
+        self.ledger = Ledger(BOOTSTRAP, CHAIN_ID)
+        self.genesis = genesis_block()
+        self.prior = LedgerState(BOOTSTRAP, {})
+
+    def _block(self, transactions):
+        return Block(
+            index=1,
+            timestamp="2021-01-02T00:00:00Z",
+            prev_hash=self.genesis.block_hash,
+            transactions=transactions,
+        )
+
+    def test_ordinary_full_balance_transfer_removes_sender_entry(self):
+        # ALICE sends her entire balance of 10; her zero entry must be omitted
+        # and her nonce advances.
+        block = self._block([sign(ALICE, BOB.address, 10, nonce=0)])
+        result = self.ledger.apply_block(block, self.genesis, self.prior)
+        self.assertEqual(result.balance(ALICE.address), 0)
+        self.assertNotIn(ALICE.address, dict(result.iter_balances()))
+        self.assertEqual(result.balance(BOB.address), 11)  # 1 + 10
+        self.assertEqual(result.next_nonce(ALICE.address), 1)
+
+    def test_self_transfer_full_balance_preserves_balance_and_advances_nonce(self):
+        block = self._block([sign(ALICE, ALICE.address, 10, nonce=0)])
+        result = self.ledger.apply_block(block, self.genesis, self.prior)
+        # Balance unchanged; sender entry retained; nonce consumed exactly once.
+        self.assertEqual(result.balance(ALICE.address), 10)
+        self.assertIn(ALICE.address, dict(result.iter_balances()))
+        self.assertEqual(result.next_nonce(ALICE.address), 1)
+
+    def test_self_transfer_exceeding_balance_fails(self):
+        block = self._block([sign(ALICE, ALICE.address, 11, nonce=0)])
+        with self.assertRaises(InsufficientFundsError):
+            self.ledger.apply_block(block, self.genesis, self.prior)
