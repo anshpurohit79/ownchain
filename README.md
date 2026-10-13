@@ -11,7 +11,7 @@ The goal is to understand and implement the fundamental components rather than b
 ## Features
 
 - **Block integrity:** SHA-256 hashes of deterministic JSON representations of block contents.
-- **Chain validation:** Sequential block indices, previous-hash links, genesis rules, and per-block integrity checks.
+- **Chain validation:** Exact-integer sequential block indices (Boolean and floating-point substitutes are rejected), previous-hash links, genesis rules, and per-block integrity checks.
 - **Transaction model:** Validated transfers using positive integer amounts.
 - **Account-based ledger:** Ordered transaction replay, sufficient-funds validation, and deterministic balance calculations.
 - **Ed25519 signatures:** Wallet-generated digital signatures and public-key-based sender authorization.
@@ -21,6 +21,7 @@ The goal is to understand and implement the fundamental components rather than b
 - **Sequential per-account nonces:** Replay protection within the validated linear ledger history.
 - **Pure replay:** An immutable, canonical `LedgerState` returned by deterministic replay.
 - **Atomic failure behavior:** Balances and nonce state are never partially updated.
+- **Stateful block validation:** `Ledger.apply_block()` validates a candidate block against its predecessor and a supplied prior `LedgerState`, returning a new state without mutating the supplied one.
 - **Automated tests:** Standard-library `unittest` suites covering block, chain, transaction, wallet, signature, and ledger behavior.
 - **Architecture decision records:** Design choices and limitations documented in `docs/decisions/`.
 
@@ -36,7 +37,7 @@ The project separates the main responsibilities into independent components:
 | `core/signed_transaction.py` | Signed transaction representation, payload serialization, and signature verification |
 | `core/wallet.py` | Ed25519 key generation, address derivation, and transaction signing |
 | `core/ledger.py` | Transaction verification, nonce sequencing, balance validation, and deterministic replay |
-| `core/exceptions.py` | Shared errors for invalid chains, transactions, signatures, nonces, wrong chains, and insufficient funds |
+| `core/exceptions.py` | Shared errors for invalid chains, invalid blocks, transactions, signatures, nonces, wrong chains, and insufficient funds |
 | `core/validation.py` | Shared structural validators and constants for addresses, amounts, nonces, and chain IDs |
 
 Blocks store transactions as JSON-compatible dictionaries. The ledger reconstructs and validates signed transactions before applying transfers.
@@ -112,6 +113,8 @@ It does not yet implement:
 
 Initial ledger balances are supplied as trusted external state, so the chain does not yet determine the entire monetary state independently.
 
+- **Stateful block validation** (`Ledger.apply_block`) trusts a caller-supplied predecessor and prior `LedgerState`; it does not re-derive provenance and provides no consensus or fork-choice rule on its own.
+
 Digital signatures prove control of a private key; they do not establish trustworthiness. Hash links, signatures, and nonces alone do not provide a complete decentralized consensus system.
 
 **Do not use this prototype to store or transfer real funds.**
@@ -126,6 +129,7 @@ The `docs/decisions/` directory records the reasoning behind the initial archite
 - ADR 004 — Account-based ledger
 - ADR 005 — Wallets and digital signatures
 - ADR 006 — Transaction nonces and replay protection
+- ADR 007 — Stateful block validation
 
 ## Project roadmap
 
@@ -137,10 +141,9 @@ Completed milestones:
 - [x] Account-based ledger and balance checks
 - [x] Wallets, Ed25519 signatures, and transaction authorization
 - [x] Transaction nonces and replay protection (sequential per-account nonces, chain-ID-bound signatures, pure `LedgerState` replay)
+- [x] Stateful block validation (`Ledger.apply_block()` validates a candidate block against its predecessor and prior state, returning a new immutable `LedgerState` without mutating the supplied one; `Ledger.replay()` delegates through it)
 
-Next planned milestone:
-
-- [ ] Stateful block validation
+No single next milestone has been selected yet.
 
 Further work will explore issuance, mining, networking, consensus, security testing, and performance evaluation.
 

@@ -181,10 +181,6 @@ class TestLedgerStateAPI(unittest.TestCase):
         self.assertNotEqual(self.state, "x")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestLedgerConstruction(unittest.TestCase):
     def test_accepts_valid_configuration(self):
         ledger = Ledger({ALICE.address: 10, BOB.address: 0}, CHAIN_ID)
@@ -982,3 +978,7 @@ class TestReplayDelegatesToApplyBlock(unittest.TestCase):
         )
         with self.assertRaises(InvalidChainError):
             self.ledger.replay(chain)
+
+
+if __name__ == "__main__":
+    unittest.main()
