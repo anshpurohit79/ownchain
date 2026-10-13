@@ -56,28 +56,47 @@ the account being debited, while keeping the educational scope minimal.
 
     sender, recipient, amount, public_key
 
-  The `signature` field is excluded from the payload being signed.
+  The `signature` field is excluded from the payload being signed. Within
+  the payload, `public_key` is encoded as canonical UNPADDED base64url,
+  identical to the `public_key` serialization field, so signing and
+  verification always use byte-identical payloads.
 
 - Full payload JSON is sorted by key, uses compact separators, and UTF-8.
 - `amount` is a strictly positive integer (`bool` rejected as an integer
   subclass).
-- Public key encoding: UNPADDED base64url, decodes to 32 bytes.
-- Signature encoding: UNPADDED base64url, decodes to 64 bytes.
+- Public key encoding: canonical UNPADDED base64url, decodes to 32 bytes.
+- Signature encoding: canonical UNPADDED base64url, decodes to 64 bytes.
 - Sender and recipient: exactly 40 lowercase hex characters.
+- Strict canonical base64url decoding: `decode_base64url` re-encodes the
+  decoded bytes and rejects any input that is not exactly the canonical
+  unpadded representation. This rejects padding, invalid characters,
+  non-significant trailing-bit variants that the lenient standard-library
+  decoder would otherwise accept, and any other non-canonical form.
 
 ## Verification
 
-`SignedTransaction.verify()`:
+Two verification entry points are provided with distinct, documented behavior:
+
+`SignedTransaction.verify_strict()` (primary, precise contract):
 
 1. Derives the address from the transaction's embedded public key.
 2. Checks the derived address equals `sender`; mismatch raises
    `InvalidTransactionError`.
 3. Verifies the signature against the embedded public key and the canonical
-   payload; invalid signature raises `InvalidSignatureError`.
+   payload; an invalid signature raises `InvalidSignatureError`.
+4. Returns `None` on success.
 
-Malformed data or address mismatch raises `InvalidTransactionError`.
-Structurally valid records with invalid signatures raise
-`InvalidSignatureError`.
+`SignedTransaction.verify()` (Boolean convenience wrapper):
+
+- Returns `True` only when `verify_strict()` succeeds.
+- Catches `InvalidTransactionError` and `InvalidSignatureError` and reports
+  them as `False`. Use `verify_strict()` when the specific failure reason
+  must be distinguished by exception type.
+
+Error ownership: malformed data or a sender/address mismatch raises
+`InvalidTransactionError`; a structurally valid record whose signature does
+not verify raises `InvalidSignatureError`. The ledger preserves this
+distinction.
 
 ## Ledger integration
 

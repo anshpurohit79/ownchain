@@ -11,8 +11,9 @@ The signature is over a canonical payload containing exactly:
 
     sender, recipient, amount, public_key
 
-The signature itself is excluded from the payload so the record is never
-self-referential.
+Within that payload, ``public_key`` is encoded as canonical UNPADDED
+base64url, identical to the ``public_key`` serialization field. The signature
+itself is excluded from the payload so the record is never self-referential.
 
 Canonical encodings
 -------------------
@@ -74,6 +75,13 @@ def decode_base64url(value: object, expected_len: int) -> bytes:
         raise InvalidTransactionError(
             f"expected {expected_len} bytes, got {len(raw)} bytes"
         )
+    # Reject non-canonical encodings: re-encoding the decoded bytes must
+    # reproduce the exact input. This catches trailing-bit variants that
+    # decode to the same bytes but are not the canonical unpadded form.
+    if encode_base64url(raw) != value:
+        raise InvalidTransactionError(
+            "field is not the canonical unpadded base64url representation"
+        )
     return raw
 
 
@@ -83,14 +91,16 @@ def canonical_payload(
     """Deterministic UTF-8 JSON bytes for the signed payload.
 
     Sorted keys and compact separators; contains only the four
-    authorization-relevant fields, never the signature.
+    authorization-relevant fields (sender, recipient, integer amount, and
+    the public key encoded as canonical UNPADDED base64url), never the
+    signature.
     """
     return json.dumps(
         {
             "sender": sender,
             "recipient": recipient,
             "amount": amount,
-            "public_key": public_key_bytes.hex(),
+            "public_key": encode_base64url(public_key_bytes),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -203,6 +213,14 @@ class SignedTransaction:
 
     # ---- Verification -------------------------------------------------
     def verify(self) -> bool:
+        """Boolean convenience wrapper.
+
+        Returns ``True`` only when the record is structurally valid, the
+        embedded public key derives ``sender``, and the signature verifies.
+        Any ``InvalidTransactionError`` or ``InvalidSignatureError`` is
+        caught and reported as ``False``. Use :meth:`verify_strict` when the
+        specific failure reason must be distinguished by exception type.
+        """
         try:
             self.verify_strict()
         except (InvalidTransactionError, InvalidSignatureError):
@@ -210,7 +228,18 @@ class SignedTransaction:
         return True
 
     def verify_strict(self) -> None:
-        """Verify address correspondence then signature; raise on failure."""
+        """Strict verification with a precise exception contract.
+
+        - Malformed records or a public-key/sender address mismatch raise
+          ``InvalidTransactionError``.
+        - A well-formed record whose signature does not verify raises
+          ``InvalidSignatureError``.
+        - Returns ``None`` on success.
+
+        Order of checks: first derive the address from the embedded public
+        key and compare it to ``sender`` (authorization binding), then verify
+        the Ed25519 signature over the canonical payload using that key.
+        """
         derived = hashlib.sha256(self._public_key_bytes).digest()[:20].hex()
         if derived != self._sender:
             raise InvalidTransactionError(

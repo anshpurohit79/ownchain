@@ -1,5 +1,7 @@
 """Tests for the SignedTransaction component. Standard library unittest only."""
 
+import base64
+import json
 import unittest
 
 from core.signed_transaction import (
@@ -69,6 +71,36 @@ class TestBase64urlRoundTrip(unittest.TestCase):
         enc = encode_base64url(bytes(16))
         with self.assertRaises(InvalidTransactionError):
             decode_base64url(enc, 32)
+
+    def test_rejects_noncanonical_trailing_bits(self):
+        # A base64url string can carry non-significant trailing bits. The
+        # lenient stdlib decoder accepts such input and yields the same raw
+        # bytes, but re-encoding produces a different (canonical) string.
+        # Our strict decoder must reject the non-canonical form.
+        raw = bytes(range(32))
+        canonical = encode_base64url(raw)
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        noncanonical = None
+        for ch in alphabet:
+            candidate = canonical[:-1] + ch
+            padded = candidate + "=" * (-len(candidate) % 4)
+            try:
+                decoded = base64.urlsafe_b64decode(padded)
+            except Exception:
+                continue
+            if decoded == raw and candidate != canonical:
+                noncanonical = candidate
+                break
+        # Sanity: such a variant exists for this input (verified empirically).
+        self.assertIsNotNone(noncanonical)
+        # The lenient decoder accepts it and maps to the same bytes.
+        self.assertEqual(
+            base64.urlsafe_b64decode(noncanonical + "=" * (-len(noncanonical) % 4)),
+            raw,
+        )
+        # Our strict decoder rejects it as non-canonical.
+        with self.assertRaises(InvalidTransactionError):
+            decode_base64url(noncanonical, 32)
 
 
 class TestConstructionValidation(unittest.TestCase):
@@ -243,3 +275,46 @@ class TestSerialization(unittest.TestCase):
         self.assertNotIn("signature", payload)
         self.assertIn("sender", payload)
         self.assertIn("public_key", payload)
+
+    def test_payload_is_exact_canonical_representation(self):
+        # The signed payload must be exactly sorted, compact UTF-8 JSON of
+        # sender, recipient, integer amount, and base64url-encoded public
+        # key, and nothing else. This pins the representation so signing and
+        # verification can never drift apart.
+        wallet = self.wallet
+        recipient = self.wallet.address
+        amount = 5
+        expected = json.dumps(
+            {
+                "sender": wallet.address,
+                "recipient": recipient,
+                "amount": amount,
+                "public_key": encode_base64url(wallet.public_key_bytes),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        actual = canonical_payload(
+            sender=wallet.address,
+            recipient=recipient,
+            amount=amount,
+            public_key_bytes=wallet.public_key_bytes,
+        )
+        self.assertEqual(actual, expected)
+
+    def test_signer_and_verifier_use_identical_payload_bytes(self):
+        # The payload a wallet signs must equal the payload a record
+        # verifies. Both funnel through canonical_payload(...).
+        wallet = Wallet.generate()
+        tx = Transaction(wallet.address, wallet.address, 9)
+        signed = wallet.sign_transaction(tx)
+        self.assertEqual(
+            signed.payload_bytes(),
+            canonical_payload(
+                sender=wallet.address,
+                recipient=wallet.address,
+                amount=9,
+                public_key_bytes=wallet.public_key_bytes,
+            ),
+        )
+        self.assertTrue(signed.verify())
