@@ -5,6 +5,17 @@ class InvalidChainError(Exception):
     """Raised when the supplied Chain does not pass Chain.validate()."""
 
 
+class InvalidBlockError(Exception):
+    """Raised when a candidate block fails structural validation against its
+    predecessor: a non-integer or non-contiguous index, a block hash that does
+    not match its own contents, or a broken previous-hash link.
+
+    The per-block counterpart to ``InvalidChainError``; raised by the ledger
+    when validating a detached candidate block against a supplied prior state
+    (see ``core.ledger``).
+    """
+
+
 class InvalidTransactionError(Exception):
     """Raised when a transaction record is malformed or invalid."""
 
