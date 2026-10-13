@@ -280,6 +280,8 @@ The self-transfer implementation must not use an early return that skips the non
 
 ### Failure ordering and error semantics
 
+Keep API-argument errors distinct from protocol-validation failures. APIs that validate configuration, state-construction arguments, or lookup arguments use built-in `TypeError` for incorrect argument types and `ValueError` for invalid values, as specified by their contracts. Malformed signed-transaction records and invalid chain histories use the OwnChain domain exceptions defined below. Each failure should retain its documented exception type; unexpected implementation errors must not be disguised as protocol-validation failures.
+
 Preserve clear distinctions between failure causes:
 
 - `InvalidChainError`: structural chain validation fails.
