@@ -10,6 +10,7 @@ from core.block import Block, genesis_block
 from core.chain import Chain
 from core.exceptions import (
     InsufficientFundsError,
+    InvalidBlockError,
     InvalidChainError,
     InvalidNonceError,
     InvalidSignatureError,
@@ -533,3 +534,195 @@ class TestReplayAtomicityAndInvariants(unittest.TestCase):
         ledger.replay(other)
         self.assertEqual(list(state1.iter_balances()), snapshot_balances)
         self.assertEqual(list(state1.iter_next_nonces()), snapshot_nonces)
+
+
+
+class _NaughtyVerifyBlock(Block):
+    """A Block whose verify() raises a non-TypeError/ValueError exception,
+    proving apply_block does not swallow arbitrary errors."""
+
+    def verify(self):
+        raise RecursionError("boom")
+
+
+class TestApplyBlockStructure(unittest.TestCase):
+    """Structural validation of a candidate block against its predecessor."""
+
+    def setUp(self):
+        self.ledger = Ledger(BOOTSTRAP, CHAIN_ID)
+        self.genesis = genesis_block()
+        self.prior = LedgerState(BOOTSTRAP, {})
+
+    def _block(self, index=1, prev_hash=None, transactions=None,
+               timestamp="2021-01-02T00:00:00Z"):
+        return Block(
+            index=index,
+            timestamp=timestamp,
+            prev_hash=self.genesis.block_hash if prev_hash is None else prev_hash,
+            transactions=[] if transactions is None else transactions,
+        )
+
+    def test_valid_block_passes_structure(self):
+        block = self._block(transactions=[sign(ALICE, BOB.address, 1, nonce=0)])
+        result = self.ledger.apply_block(block, self.genesis, self.prior)
+        self.assertIsInstance(result, LedgerState)
+
+    def test_boolean_true_candidate_index_rejected(self):
+        block = self._block(index=True)  # would equal 0 + 1 under == semantics
+        block.block_hash = block.calculate_hash()
+        with self.assertRaises(InvalidBlockError):
+            self.ledger.apply_block(block, self.genesis, self.prior)
+
+    def test_float_candidate_index_rejected(self):
+        block = self._block(index=1.0)
+        block.block_hash = block.calculate_hash()
+        with self.assertRaises(InvalidBlockError):
+            self.ledger.apply_block(block, self.genesis, self.prior)
+
+    def test_non_integer_predecessor_index_rejected(self):
+        # True + 1 == 2 is a plausible int; it must not be trusted.
+        bad_prev = self._block(index=True)
+        bad_prev.block_hash = bad_prev.calculate_hash()
+        candidate = Block(
+            index=2,
+            timestamp="2021-01-03T00:00:00Z",
+            prev_hash=bad_prev.block_hash,
+            transactions=[],
+        )
+        with self.assertRaises(InvalidBlockError):
+            self.ledger.apply_block(candidate, bad_prev, self.prior)
+
+    def test_wrong_candidate_index_rejected(self):
+        block = self._block(index=5)
+        block.block_hash = block.calculate_hash()
+        with self.assertRaises(InvalidBlockError):
+            self.ledger.apply_block(block, self.genesis, self.prior)
+
+    def test_skipped_index_rejected(self):
+        block = self._block(index=2)  # genesis is 0, so index 2 skips 1
+        block.block_hash = block.calculate_hash()
+        with self.assertRaises(InvalidBlockError):
+            self.ledger.apply_block(block, self.genesis, self.prior)
+
+    def test_duplicate_index_rejected(self):
+        # A genuine duplicate: predecessor and candidate both claim index 5.
+        # prev_hash is linked to prev's (recomputed) hash, so the ONLY failing
+        # rule is "candidate.index == prev_block.index + 1" (5 != 5 + 1).
+        prev = self._block(index=0, timestamp="2020-01-01T00:00:00Z")
+        prev.index = 5
+        prev.block_hash = prev.calculate_hash()
+        block = self._block(index=5, prev_hash=prev.block_hash)
+        block.block_hash = block.calculate_hash()
+        self.assertTrue(block.verify())
+        self.assertEqual(block.prev_hash, prev.block_hash)
+        with self.assertRaises(InvalidBlockError):
+            self.ledger.apply_block(block, prev, self.prior)
+
+    def test_broken_prev_hash_link_rejected(self):
+        block = self._block(index=1, prev_hash="1" * 64)
+        block.block_hash = block.calculate_hash()
+        with self.assertRaises(InvalidBlockError):
+            self.ledger.apply_block(block, self.genesis, self.prior)
+
+    def test_stale_block_hash_rejected(self):
+        block = self._block(index=1)
+        block.timestamp = "2021-01-02T23:59:59Z"  # stale stored snapshot
+        with self.assertRaises(InvalidBlockError):
+            self.ledger.apply_block(block, self.genesis, self.prior)
+
+    def test_genesis_used_as_candidate_rejected(self):
+        with self.assertRaises(InvalidBlockError):
+            self.ledger.apply_block(genesis_block(), self.genesis, self.prior)
+
+    def test_generator_container_rejected_before_consumption(self):
+        block = self._block(transactions=[sign(ALICE, BOB.address, 1, nonce=0)])
+        gen = (t for t in block.transactions)
+        block.transactions = gen
+        with self.assertRaises(InvalidBlockError):
+            self.ledger.apply_block(block, self.genesis, self.prior)
+        # Rejected on type BEFORE verify() could consume the generator.
+        self.assertEqual(len(list(gen)), 1)
+
+    def test_non_serializable_nan_contents_translate_to_invalid_block(self):
+        block = self._block(index=1)
+        block.transactions = [float("nan")]  # json allow_nan=False -> ValueError
+        with self.assertRaises(InvalidBlockError):
+            self.ledger.apply_block(block, self.genesis, self.prior)
+
+    def test_unserializable_object_translate_to_invalid_block(self):
+        block = self._block(index=1)
+        block.transactions = [{1, 2}]  # a set is not JSON-serializable
+        with self.assertRaises(InvalidBlockError):
+            self.ledger.apply_block(block, self.genesis, self.prior)
+
+    def test_unexpected_exception_propagates_unchanged(self):
+        # verify() raising RecursionError (a RuntimeError subclass) must NOT be
+        # translated into InvalidBlockError.
+        bad = _NaughtyVerifyBlock(
+            index=1,
+            timestamp="2021-01-02T00:00:00Z",
+            prev_hash=self.genesis.block_hash,
+            transactions=[],
+        )
+        with self.assertRaises(RecursionError):
+            self.ledger.apply_block(bad, self.genesis, self.prior)
+
+    def test_non_block_candidate_raises_type_error(self):
+        with self.assertRaises(TypeError):
+            self.ledger.apply_block("not a block", self.genesis, self.prior)
+
+    def test_non_block_predecessor_raises_type_error(self):
+        with self.assertRaises(TypeError):
+            self.ledger.apply_block(self._block(), 123, self.prior)
+
+    def test_non_state_prior_raises_type_error(self):
+        with self.assertRaises(TypeError):
+            self.ledger.apply_block(
+                self._block(), self.genesis, {ALICE.address: 1}
+            )
+
+
+class TestApplyBlockStateTransition(unittest.TestCase):
+    """State transition and atomicity of apply_block."""
+
+    def setUp(self):
+        self.ledger = Ledger(BOOTSTRAP, CHAIN_ID)
+        self.genesis = genesis_block()
+        self.prior = LedgerState(BOOTSTRAP, {})
+
+    def _block(self, transactions):
+        return Block(
+            index=1,
+            timestamp="2021-01-02T00:00:00Z",
+            prev_hash=self.genesis.block_hash,
+            transactions=transactions,
+        )
+
+    def test_valid_block_changes_balances_and_nonces(self):
+        block = self._block([sign(ALICE, BOB.address, 2, nonce=0)])
+        result = self.ledger.apply_block(block, self.genesis, self.prior)
+        self.assertEqual(result.balance(ALICE.address), 8)
+        self.assertEqual(result.balance(BOB.address), 3)
+        self.assertEqual(result.next_nonce(ALICE.address), 1)
+        self.assertEqual(result.next_nonce(BOB.address), 0)
+
+    def test_empty_block_returns_equal_but_distinct_state(self):
+        block = self._block([])
+        result = self.ledger.apply_block(block, self.genesis, self.prior)
+        self.assertEqual(result, self.prior)
+        self.assertIsNot(result, self.prior)
+
+    def test_repeated_application_is_deterministic(self):
+        block = self._block([sign(ALICE, BOB.address, 2, nonce=0)])
+        first = self.ledger.apply_block(block, self.genesis, self.prior)
+        second = self.ledger.apply_block(block, self.genesis, self.prior)
+        self.assertEqual(first, second)
+
+    def test_prior_state_unchanged_after_success(self):
+        block = self._block([sign(ALICE, BOB.address, 2, nonce=0)])
+        before_balances = list(self.prior.iter_balances())
+        before_nonces = list(self.prior.iter_next_nonces())
+        self.ledger.apply_block(block, self.genesis, self.prior)
+        self.assertEqual(list(self.prior.iter_balances()), before_balances)
+        self.assertEqual(list(self.prior.iter_next_nonces()), before_nonces)
+        self.assertEqual(self.prior.balance(ALICE.address), 10)

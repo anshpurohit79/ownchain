@@ -43,8 +43,10 @@ rule, not durable global replay protection.
 
 from typing import Dict, Iterator, Mapping, Optional, Tuple
 
+from core.block import Block
 from core.exceptions import (
     InsufficientFundsError,
+    InvalidBlockError,
     InvalidChainError,
     InvalidNonceError,
     InvalidSignatureError,
@@ -333,5 +335,158 @@ class Ledger:
                 _process_transaction(
                     record, balances, next_nonces, self._chain_id
                 )
+
+        return LedgerState(balances, next_nonces)
+    # ------------------------------------------------------------------
+    # Stateful block validation (milestone 7)
+    # ------------------------------------------------------------------
+    def _check_block_transition(self, block: Block, prev_block: Block) -> None:
+        """Raise ``InvalidBlockError`` if *block* is not a valid continuation
+        of *prev_block*, ignoring ledger state.
+
+        Checks run cheapest and most structural first, so a malformed block
+        never pays for hashing:
+
+        1. Both indices must be genuine ints (``bool`` is an ``int`` subclass
+           and ``1.0 == 1``, so equality-based checks are unsound). This also
+           guarantees ``prev_block.index + 1`` is well-defined below.
+        2. The candidate's transaction container must be a real ``list`` --
+           checked BEFORE hashing so a generator (which ``Block.to_dict``
+           materialises and exhausts) is rejected without being consumed.
+        3. The candidate must not be genesis (index 0); genesis is built and
+           validated only by ``Chain``.
+        4. The candidate must pass its own hash verification. A
+           ``TypeError``/``ValueError`` from the single ``verify()`` call
+           (non-canonical serialization) is translated into
+           ``InvalidBlockError`` with its cause preserved; any other exception
+           propagates unchanged so genuine bugs are never masked.
+        5. The candidate's index must be exactly ``prev_block.index + 1``.
+        6. The candidate's ``prev_hash`` must equal the predecessor's STORED
+           ``block_hash`` snapshot (the same link rule as ``Chain.validate``).
+
+        The predecessor is a trusted, previously accepted block and is NOT
+        re-verified here, matching how ``Chain.validate`` trusts earlier
+        positions.
+        """
+        if not is_exact_int(block.index):
+            raise InvalidBlockError(
+                f"candidate block.index must be an int, got {block.index!r}"
+            )
+        if not is_exact_int(prev_block.index):
+            raise InvalidBlockError(
+                f"prev_block.index must be an int, got {prev_block.index!r}"
+            )
+        if type(block.transactions) is not list:
+            raise InvalidBlockError(
+                "candidate block.transactions must be a list, got "
+                f"{type(block.transactions).__name__}"
+            )
+        if block.index == 0:
+            raise InvalidBlockError(
+                "genesis (index 0) must not be validated as a candidate block"
+            )
+        try:
+            verified = block.verify()
+        except (TypeError, ValueError) as exc:
+            raise InvalidBlockError(
+                "candidate block contents cannot be canonically serialized"
+            ) from exc
+        if not verified:
+            raise InvalidBlockError(
+                "candidate block fails its own hash verification"
+            )
+        if block.index != prev_block.index + 1:
+            raise InvalidBlockError(
+                f"candidate index {block.index} does not follow "
+                f"predecessor index {prev_block.index}"
+            )
+        if block.prev_hash != prev_block.block_hash:
+            raise InvalidBlockError(
+                "candidate prev_hash does not match the predecessor's "
+                "block_hash"
+            )
+
+    def _apply_block(
+        self,
+        block: Block,
+        balances: Dict[str, int],
+        next_nonces: Dict[str, int],
+    ) -> None:
+        """Apply *block*'s transactions in list order to the working mappings.
+
+        The single transaction authority ``_process_transaction`` is reused
+        verbatim; no transaction-validation rule is duplicated here. Because it
+        mutates the supplied mappings in sequence, a later transaction observes
+        an earlier successful one in the same block. Any failure propagates and
+        the caller discards the mutated working mappings.
+        """
+        for record in block.transactions:
+            _process_transaction(
+                record, balances, next_nonces, self._chain_id
+            )
+
+    def apply_block(
+        self,
+        block: Block,
+        prev_block: Block,
+        prior_state: LedgerState,
+    ) -> LedgerState:
+        """Validate a candidate *block* against its predecessor and prior state.
+
+        Runs the structural checks in ``_check_block_transition`` and then
+        applies the block's transactions -- in list order, via the shared
+        ``_process_transaction`` rule -- to a fresh copy of *prior_state*.
+        Returns a NEW ``LedgerState`` only after every transaction succeeds.
+
+        Atomicity: ``prior_state`` is only ever read (via its public
+        iterators) and is never mutated, on success or failure. If any check or
+        transaction fails the working copy is discarded, an exception is
+        raised, and nothing is returned. This method does not append or accept
+        the block into any ``Chain``; it only computes the next state.
+
+        Precondition (trusted inputs): *prev_block* must be a previously
+        accepted block and *prior_state* the ``LedgerState`` immediately
+        following it. ``apply_block`` trusts both and cannot prove their
+        history -- it does not re-derive *prior_state* from a chain, and a
+        well-formed but wrong *prior_state* would yield a wrong (but
+        structurally valid) result.
+
+        Raises:
+            TypeError: a wrong argument type was supplied.
+            InvalidBlockError: the candidate is not a valid continuation of
+                *prev_block* (see ``_check_block_transition``).
+            InvalidTransactionError / InvalidSignatureError / WrongChainError /
+                InvalidNonceError / InsufficientFundsError: a transaction in
+                the block is invalid (propagated unchanged from
+                ``_process_transaction``).
+        """
+        if not isinstance(block, Block):
+            raise TypeError(
+                f"block must be a Block, got {type(block).__name__}"
+            )
+        if not isinstance(prev_block, Block):
+            raise TypeError(
+                f"prev_block must be a Block, got {type(prev_block).__name__}"
+            )
+        if not isinstance(prior_state, LedgerState):
+            raise TypeError(
+                "prior_state must be a LedgerState, got "
+                f"{type(prior_state).__name__}"
+            )
+
+        # All structural checks precede any state work.
+        self._check_block_transition(block, prev_block)
+
+        # Copy prior state via public read-only interfaces only. The iterators
+        # omit zeros, reproducing exactly the canonical working form that
+        # _process_transaction maintains; prior_state itself has no mutators.
+        balances: Dict[str, int] = {
+            addr: bal for addr, bal in prior_state.iter_balances()
+        }
+        next_nonces: Dict[str, int] = {
+            addr: n for addr, n in prior_state.iter_next_nonces()
+        }
+
+        self._apply_block(block, balances, next_nonces)
 
         return LedgerState(balances, next_nonces)
