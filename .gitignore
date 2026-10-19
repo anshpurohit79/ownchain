@@ -1,0 +1,11 @@
+# Rust
+# Cargo.lock is intentionally tracked (this is an application, not a library).
+/target
+*.rs.bk
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json

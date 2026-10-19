@@ -1,0 +1,18 @@
+[package]
+name = "ownchain"
+version = "0.1.0"
+edition = "2021"
+description = "OwnChain — scaffold only; protocol and implementation TBD"
+publish = false
+
+[lib]
+name = "ownchain"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ownchain"
+path = "src/main.rs"
+
+# Intentionally no [dependencies] yet. Protocol dependencies
+# (consensus, cryptography, networking) will be added deliberately
+# once the protocol specification (docs/protocol-v1.md) is decided.
