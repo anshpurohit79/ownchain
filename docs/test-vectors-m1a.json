@@ -1,0 +1,238 @@
+{
+  "spec": "OwnChain protocol v1, milestone M1-A",
+  "generator": "tools/gen_vectors.py (Python hashlib.blake2b, independent of the Rust implementation)",
+  "hash": "BLAKE2b-256, 32-byte output, no salt, no personalisation",
+  "domain_prefixes": {
+    "chain_id": "OwnChain/<network-name>/v1",
+    "tx": "OwnChain/Tx/v1",
+    "tx_leaf": "OwnChain/TxLeaf/v1",
+    "tx_node": "OwnChain/TxNode/v1",
+    "tx_empty": "OwnChain/TxEmpty/v1",
+    "block": "OwnChain/Block/v1"
+  },
+  "chain_ids": {
+    "devnet": "0459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc",
+    "testnet": "8ba087ef6031654d96f608d75e144642a0750c26e84cb39637caee484e3c4de1"
+  },
+  "empty_tree_root": "fd16146c2f34c74d29527832237269497a38619743bd4636411c6347cc41a602",
+  "transactions": {
+    "tx_empty": {
+      "bytes_hex": "",
+      "len": 0,
+      "tx_id": "c66af197ffb5cdd3eaa4cad5be63a51a73a1b83478e4fd2eb2b6ddea072699fc"
+    },
+    "tx_a": {
+      "bytes_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "len": 32,
+      "tx_id": "9f08bd74238f87a73e9bbcbe7a6f503486a8e11287071dc2f5a009772a263dca"
+    },
+    "tx_b": {
+      "bytes_hex": "4f776e436861696e2074657374207472616e73616374696f6e2042",
+      "len": 27,
+      "tx_id": "7232ec1855679afefd854dfa55d504ede6055f6d45f54f6b46bf1cc98982cd5c"
+    },
+    "tx_c": {
+      "bytes_hex": "ffffffffffffffff6363",
+      "len": 10,
+      "tx_id": "7ef35101a2bd2818c4addda3170a73b4a428614e53e97857b9c1e2a72ec148ff"
+    },
+    "tx_d": {
+      "bytes_hex": "4f776e436861696e2074657374207472616e73616374696f6e2044",
+      "len": 27,
+      "tx_id": "b48a2a0e5fb4d16f934d9d3d6666aa0df83c4f5c5121aa2869896ca2122b000a"
+    }
+  },
+  "merkle": {
+    "0_transactions": {
+      "tx_names": [],
+      "tx_ids": [],
+      "leaves": [],
+      "root": "fd16146c2f34c74d29527832237269497a38619743bd4636411c6347cc41a602"
+    },
+    "1_transactions": {
+      "tx_names": [
+        "tx_a"
+      ],
+      "tx_ids": [
+        "9f08bd74238f87a73e9bbcbe7a6f503486a8e11287071dc2f5a009772a263dca"
+      ],
+      "leaves": [
+        "3bf57d7b6c859dfb98eab7cb6c6d18be40b79c6c6fe71305f0299419e89b0a48"
+      ],
+      "root": "3bf57d7b6c859dfb98eab7cb6c6d18be40b79c6c6fe71305f0299419e89b0a48"
+    },
+    "2_transactions": {
+      "tx_names": [
+        "tx_a",
+        "tx_b"
+      ],
+      "tx_ids": [
+        "9f08bd74238f87a73e9bbcbe7a6f503486a8e11287071dc2f5a009772a263dca",
+        "7232ec1855679afefd854dfa55d504ede6055f6d45f54f6b46bf1cc98982cd5c"
+      ],
+      "leaves": [
+        "3bf57d7b6c859dfb98eab7cb6c6d18be40b79c6c6fe71305f0299419e89b0a48",
+        "568f1bd0a207d35f8a088ff7f4990b296779dccb35bee9650d301302a1bff3a9"
+      ],
+      "root": "5fa88a4c6e55a40aec4e91300144d9e6f5660f79d8dc1a9885e9ee91750caa1c",
+      "level_1_inner_node": "5fa88a4c6e55a40aec4e91300144d9e6f5660f79d8dc1a9885e9ee91750caa1c"
+    },
+    "3_transactions": {
+      "tx_names": [
+        "tx_a",
+        "tx_b",
+        "tx_c"
+      ],
+      "tx_ids": [
+        "9f08bd74238f87a73e9bbcbe7a6f503486a8e11287071dc2f5a009772a263dca",
+        "7232ec1855679afefd854dfa55d504ede6055f6d45f54f6b46bf1cc98982cd5c",
+        "7ef35101a2bd2818c4addda3170a73b4a428614e53e97857b9c1e2a72ec148ff"
+      ],
+      "leaves": [
+        "3bf57d7b6c859dfb98eab7cb6c6d18be40b79c6c6fe71305f0299419e89b0a48",
+        "568f1bd0a207d35f8a088ff7f4990b296779dccb35bee9650d301302a1bff3a9",
+        "e65f15aa15d0d5f49d92a7da2ffb4f0a738377f324032795d908eb6857bf591e"
+      ],
+      "root": "6105247f4a9fb766919c49833e356d7dff1c9e011e70383818c6c924e231e7a5",
+      "level_1_inner_nodes": [
+        "5fa88a4c6e55a40aec4e91300144d9e6f5660f79d8dc1a9885e9ee91750caa1c",
+        "569fcde11b8d357b05030a1cabc343faac74d9d0e59ad31077ae72ab2febe3d1"
+      ]
+    },
+    "4_transactions": {
+      "tx_names": [
+        "tx_a",
+        "tx_b",
+        "tx_c",
+        "tx_d"
+      ],
+      "tx_ids": [
+        "9f08bd74238f87a73e9bbcbe7a6f503486a8e11287071dc2f5a009772a263dca",
+        "7232ec1855679afefd854dfa55d504ede6055f6d45f54f6b46bf1cc98982cd5c",
+        "7ef35101a2bd2818c4addda3170a73b4a428614e53e97857b9c1e2a72ec148ff",
+        "b48a2a0e5fb4d16f934d9d3d6666aa0df83c4f5c5121aa2869896ca2122b000a"
+      ],
+      "leaves": [
+        "3bf57d7b6c859dfb98eab7cb6c6d18be40b79c6c6fe71305f0299419e89b0a48",
+        "568f1bd0a207d35f8a088ff7f4990b296779dccb35bee9650d301302a1bff3a9",
+        "e65f15aa15d0d5f49d92a7da2ffb4f0a738377f324032795d908eb6857bf591e",
+        "20b8148be41bf6841e8f312257311183cb42deaeb5c73751f4659f5ab785d1a9"
+      ],
+      "root": "9e91003c79c9e41f3b7ce5352a94ed16a33b24e1c6b9aee03432b76ccc6bc58d"
+    }
+  },
+  "headers": {
+    "all_zero": {
+      "note": "version=1, every hash field zero, height/timestamp/difficulty/nonce zero",
+      "header_bytes_hex": "0100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "header_len": 170,
+      "block_id": "a4a65e7b5170c940d383a4c570f1cc5b9d17567c3a2d3180cafad255d9274e2b",
+      "fields": {
+        "version": 1,
+        "chain_id": "0000000000000000000000000000000000000000000000000000000000000000",
+        "height": 0,
+        "parent_block_id": "0000000000000000000000000000000000000000000000000000000000000000",
+        "transaction_root": "0000000000000000000000000000000000000000000000000000000000000000",
+        "orchard_commitment_root": "0000000000000000000000000000000000000000000000000000000000000000",
+        "timestamp": 0,
+        "difficulty": 0,
+        "nonce": 0
+      }
+    },
+    "devnet_genesis": {
+      "note": "spec 6.4 genesis constants with the devnet chain ID and the empty tx root",
+      "header_bytes_hex": "01000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc00000000000000000000000000000000000000000000000000000000000000000000000000000000fd16146c2f34c74d29527832237269497a38619743bd4636411c6347cc41a602000000000000000000000000000000000000000000000000000000000000000000afd66a00000000010000000000000000000000000000000000000000000000",
+      "header_len": 170,
+      "block_id": "2e8e7008f8f68ff8b891bc615407aead64474d1793a2b21d0de15c9137da900b",
+      "fields": {
+        "version": 1,
+        "chain_id": "0459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc",
+        "height": 0,
+        "parent_block_id": "0000000000000000000000000000000000000000000000000000000000000000",
+        "transaction_root": "fd16146c2f34c74d29527832237269497a38619743bd4636411c6347cc41a602",
+        "orchard_commitment_root": "0000000000000000000000000000000000000000000000000000000000000000",
+        "timestamp": 1792454400,
+        "difficulty": 1,
+        "nonce": 0
+      }
+    },
+    "mixed_fields": {
+      "note": "exercises u16 version, u64 height, u128 difficulty, u64 nonce and all four 32-byte hashes",
+      "header_bytes_hex": "01000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc0100000000000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f3bf57d7b6c859dfb98eab7cb6c6d18be40b79c6c6fe71305f0299419e89b0a48202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f01afd66a00000000393000000000000001000000000000000700000000000080",
+      "header_len": 170,
+      "block_id": "2c479c981dc89ef99b81ddff08b49cecb453b692eeb0c2e808798e2e39c3c2e4",
+      "fields": {
+        "version": 1,
+        "chain_id": "0459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc",
+        "height": 1,
+        "parent_block_id": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "transaction_root": "3bf57d7b6c859dfb98eab7cb6c6d18be40b79c6c6fe71305f0299419e89b0a48",
+        "orchard_commitment_root": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+        "timestamp": 1792454401,
+        "difficulty": 18446744073709563961,
+        "nonce": 9223372036854775815
+      }
+    },
+    "max_values": {
+      "note": "every integer field at its maximum value",
+      "header_bytes_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "header_len": 170,
+      "block_id": "67de8425f9720c6bfe48071a95a2c2afd632b8525a37b7e679e2f0f0aebceaca",
+      "fields": {
+        "version": 65535,
+        "chain_id": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "height": 18446744073709551615,
+        "parent_block_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "transaction_root": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "orchard_commitment_root": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "timestamp": 18446744073709551615,
+        "difficulty": 340282366920938463463374607431768211455,
+        "nonce": 18446744073709551615
+      }
+    }
+  },
+  "blocks": {
+    "no_transactions": {
+      "note": "header only plus tx_count = 0",
+      "tx_count": 0,
+      "canonical_bytes_hex": "01000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc00000000000000000000000000000000000000000000000000000000000000000000000000000000fd16146c2f34c74d29527832237269497a38619743bd4636411c6347cc41a602000000000000000000000000000000000000000000000000000000000000000000afd66a0000000001000000000000000000000000000000000000000000000000000000",
+      "canonical_len": 174,
+      "block_id": "2e8e7008f8f68ff8b891bc615407aead64474d1793a2b21d0de15c9137da900b"
+    },
+    "one_transaction": {
+      "note": "one transaction, exercising the tx_length prefix",
+      "tx_count": 1,
+      "canonical_bytes_hex": "01000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc0100000000000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f3bf57d7b6c859dfb98eab7cb6c6d18be40b79c6c6fe71305f0299419e89b0a48202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f01afd66a000000003930000000000000010000000000000007000000000000800100000020000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "canonical_len": 210,
+      "block_id": "2c479c981dc89ef99b81ddff08b49cecb453b692eeb0c2e808798e2e39c3c2e4"
+    },
+    "two_transactions": {
+      "note": "two transactions",
+      "tx_count": 2,
+      "canonical_bytes_hex": "01000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc0100000000000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f3bf57d7b6c859dfb98eab7cb6c6d18be40b79c6c6fe71305f0299419e89b0a48202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f01afd66a000000003930000000000000010000000000000007000000000000800200000020000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f1b0000004f776e436861696e2074657374207472616e73616374696f6e2042",
+      "canonical_len": 241,
+      "block_id": "2c479c981dc89ef99b81ddff08b49cecb453b692eeb0c2e808798e2e39c3c2e4"
+    },
+    "three_transactions": {
+      "note": "three transactions",
+      "tx_count": 3,
+      "canonical_bytes_hex": "01000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc0100000000000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f3bf57d7b6c859dfb98eab7cb6c6d18be40b79c6c6fe71305f0299419e89b0a48202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f01afd66a000000003930000000000000010000000000000007000000000000800300000020000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f1b0000004f776e436861696e2074657374207472616e73616374696f6e20420a000000ffffffffffffffff6363",
+      "canonical_len": 255,
+      "block_id": "2c479c981dc89ef99b81ddff08b49cecb453b692eeb0c2e808798e2e39c3c2e4"
+    },
+    "empty_transaction": {
+      "note": "one transaction whose canonical bytes are empty",
+      "tx_count": 1,
+      "canonical_bytes_hex": "01000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc0100000000000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f3bf57d7b6c859dfb98eab7cb6c6d18be40b79c6c6fe71305f0299419e89b0a48202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f01afd66a000000003930000000000000010000000000000007000000000000800100000000000000",
+      "canonical_len": 178,
+      "block_id": "2c479c981dc89ef99b81ddff08b49cecb453b692eeb0c2e808798e2e39c3c2e4"
+    },
+    "four_transactions": {
+      "note": "four transactions, two complete Merkle levels",
+      "tx_count": 4,
+      "canonical_bytes_hex": "01000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc0100000000000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f3bf57d7b6c859dfb98eab7cb6c6d18be40b79c6c6fe71305f0299419e89b0a48202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f01afd66a000000003930000000000000010000000000000007000000000000800400000020000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f1b0000004f776e436861696e2074657374207472616e73616374696f6e20420a000000ffffffffffffffff63631b0000004f776e436861696e2074657374207472616e73616374696f6e2044",
+      "canonical_len": 286,
+      "block_id": "2c479c981dc89ef99b81ddff08b49cecb453b692eeb0c2e808798e2e39c3c2e4"
+    }
+  }
+}

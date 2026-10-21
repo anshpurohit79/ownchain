@@ -2,7 +2,7 @@
 name = "ownchain"
 version = "0.1.0"
 edition = "2021"
-description = "OwnChain — scaffold only; protocol and implementation TBD"
+description = "OwnChain — canonical encoding, hashing and Merkle commitments for protocol v1"
 publish = false
 
 [lib]
@@ -13,6 +13,15 @@ path = "src/lib.rs"
 name = "ownchain"
 path = "src/main.rs"
 
-# Intentionally no [dependencies] yet. Protocol dependencies
-# (consensus, cryptography, networking) will be added deliberately
-# once the protocol specification (docs/protocol-v1.md) is decided.
+# Protocol dependencies are added deliberately, one milestone at a time.
+#
+# M1-A (canonical encoding / hashing / Merkle roots):
+#   blake2 = RustCrypto pure-Rust BLAKE2b implementation, used for all
+#   BLAKE2b-256 protocol hashing (chain IDs, transaction IDs, block IDs,
+#   Merkle leaves and inner nodes).
+[dependencies]
+blake2 = { version = "0.11.0", default-features = false }
+
+# Test-only dependency used to express golden vectors as hex text.
+[dev-dependencies]
+hex = "0.4.3"

@@ -114,6 +114,16 @@ All fixed-width integers are little-endian. No platform-dependent struct layout 
 
 Transaction IDs are BLAKE2b-256 over `"OwnChain/Tx/v1" || canonical_transaction_bytes`. The transaction Merkle tree is domain-separated: leaves use `"OwnChain/TxLeaf/v1"`, inner nodes use `"OwnChain/TxNode/v1"`, odd final nodes are duplicated, and the empty-tree root is BLAKE2b-256 of `"OwnChain/TxEmpty/v1"`. Publish test vectors for empty, one-, two-, and three-transaction blocks.
 
+The Merkle construction is pinned exactly as follows. Let `tx_id_i` be the 32-byte transaction ID of the *i*-th transaction in block order, and let `||` denote byte concatenation.
+
+- **Leaf:** `leaf_i = BLAKE2b-256(UTF8("OwnChain/TxLeaf/v1") || tx_id_i)`.
+- **Inner node:** `node(l, r) = BLAKE2b-256(UTF8("OwnChain/TxNode/v1") || l || r)`.
+- **Empty tree:** the root of a block with zero transactions is `BLAKE2b-256(UTF8("OwnChain/TxEmpty/v1"))`, with no operands.
+- **Odd-node duplication:** if a level contains an odd number of nodes, the final node `x` is duplicated, i.e. the next level contains `node(x, x)`. This applies at every level, not only the leaf level.
+- **Root:** the tree is reduced level by level until a single node remains; that node is the `transaction_root` written into the header.
+
+Every hash above is BLAKE2b with a 32-byte output digest and no key. The domain prefix is always hashed as the *raw UTF-8 bytes* of the literal, with no length prefix, terminator, or separator; the `tx_id` operand is the raw 32-byte digest, not its hex text. These vectors are published in `docs/test-vectors-m1a.json` and are generated independently of the Rust implementation by `tools/gen_vectors.py`.
+
 ### 6.3 Limits and ordering
 
 - Maximum canonical serialized block size: 2,000,000 bytes, including the 170-byte header, transaction count, each transaction-length field, coinbase, transactions, proofs, and authorizing data. Excludes outer peer-to-peer transport framing.
@@ -222,6 +232,7 @@ These are **gated deliverables**, not permission to change the architecture casu
 
 ## 13. Change log
 
+- 2026-10-22 (M1-A): pinned the transaction Merkle leaf construction as `BLAKE2b-256(UTF8("OwnChain/TxLeaf/v1") || tx_id_bytes)`, clarifying in §6.2 that the leaf operand is the raw 32-byte transaction ID (not its hex text), that the domain prefix is hashed as raw UTF-8 bytes with no length prefix or terminator, and that odd-node duplication applies at every tree level. Published the corresponding golden vectors in `docs/test-vectors-m1a.json`, generated independently of the Rust implementation.
 - v1 baseline drafted 2026-10-20; consolidated technical review revision 2026-10-20: Rust; RandomX algorithm v1 with pinned reference release/configuration; 120-second target; exact lagged CryptoNote/Monero-style retarget; corrected Orchard V2 (post-NU6.2) shielded payments; libp2p transport; no premine/founder mint authority; 10 OWN starting subsidy with 1,051,200-block halvings; canonical block serialization and explicit transport limit; experimental-network-only status.
 
 ## Primary references
