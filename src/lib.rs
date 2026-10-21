@@ -12,6 +12,7 @@
 
 pub mod block;
 pub mod chain;
+pub mod difficulty;
 pub mod error;
 pub mod genesis;
 pub mod hash;
