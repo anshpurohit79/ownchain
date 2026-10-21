@@ -40,6 +40,53 @@ pub struct Block {
 }
 
 impl Block {
+    /// Returns the size of the canonical serialization of this block, in bytes,
+    /// without allocating it.
+    ///
+    /// Fails with the same errors as [`Block::to_bytes`] when the block
+    /// exceeds a consensus limit.
+    pub fn canonical_size(&self) -> Result<usize, EncodeError> {
+        // The transaction count is encoded in a fixed-width `u32` field, so a
+        // block carrying more than `u32::MAX` transactions cannot be encoded.
+        // This cannot happen in practice, but the check is kept so that
+        // `canonical_size` and `to_bytes` agree on every input.
+        u32::try_from(self.transactions.len())
+            .map_err(|_| EncodeError::TooManyTransactions { count: u32::MAX })?;
+
+        let mut size = HEADER_LEN + TX_COUNT_LEN;
+        for tx in &self.transactions {
+            size += TX_LENGTH_LEN + tx.len();
+        }
+
+        if size > MAX_BLOCK_SIZE {
+            return Err(EncodeError::BlockTooLarge {
+                actual: size,
+                limit: MAX_BLOCK_SIZE,
+            });
+        }
+
+        for tx in &self.transactions {
+            if tx.len() > MAX_TRANSACTION_SIZE {
+                return Err(EncodeError::TransactionTooLarge {
+                    actual: tx.len(),
+                    limit: MAX_TRANSACTION_SIZE,
+                });
+            }
+        }
+
+        debug_assert_eq!(
+            size,
+            HEADER_LEN
+                + TX_COUNT_LEN
+                + self
+                    .transactions
+                    .iter()
+                    .map(|tx| TX_LENGTH_LEN + tx.len())
+                    .sum::<usize>()
+        );
+        Ok(size)
+    }
+
     /// Serializes the block into its canonical byte form.
     ///
     /// Fails if the encoding exceeds [`MAX_BLOCK_SIZE`] or if any transaction
