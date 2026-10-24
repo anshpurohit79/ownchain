@@ -141,6 +141,24 @@ pub enum ValidationError {
         /// The root carried by the header.
         declared: Hash,
     },
+    /// The block's difficulty is zero.
+    ZeroDifficulty,
+    /// Proof of work could not be verified because the required key block was not provided.
+    MissingKeyBlock {
+        /// The candidate block height.
+        height: u64,
+        /// The required key block height.
+        key_height: u64,
+    },
+    /// The proof-of-work hash exceeds the target for the declared difficulty.
+    HashAboveTarget {
+        /// The computed RandomX hash.
+        hash: Hash,
+        /// The target threshold for the declared difficulty.
+        target: crate::difficulty::U256,
+    },
+    /// RandomX proof-of-work calculation failed.
+    Randomx(crate::randomx::RandomxError),
     /// The block's canonical serialization could not be produced.
     Encoding(crate::error::EncodeError),
 }
@@ -217,6 +235,19 @@ impl fmt::Display for ValidationError {
                     "orchard commitment root mismatch: computed {computed}, declared {declared}"
                 )
             }
+            ValidationError::ZeroDifficulty => {
+                write!(f, "block difficulty must be non-zero")
+            }
+            ValidationError::MissingKeyBlock { height, key_height } => {
+                write!(
+                    f,
+                    "missing key block for height {height}: requires key block at height {key_height}"
+                )
+            }
+            ValidationError::HashAboveTarget { hash, target } => {
+                write!(f, "proof-of-work hash {hash} exceeds target {target:?}")
+            }
+            ValidationError::Randomx(e) => write!(f, "RandomX error: {e}"),
             ValidationError::Encoding(e) => write!(f, "encoding error: {e}"),
         }
     }
@@ -227,6 +258,12 @@ impl std::error::Error for ValidationError {}
 impl From<crate::error::EncodeError> for ValidationError {
     fn from(e: crate::error::EncodeError) -> Self {
         ValidationError::Encoding(e)
+    }
+}
+
+impl From<crate::randomx::RandomxError> for ValidationError {
+    fn from(e: crate::randomx::RandomxError) -> Self {
+        ValidationError::Randomx(e)
     }
 }
 
@@ -253,16 +290,27 @@ pub struct ValidationContext<'a> {
     /// block or against the selected chain", so the accepted set has to be
     /// part of the context.
     pub accepted_transaction_ids: &'a [Hash],
+    /// The key block ID for proof-of-work verification.
+    pub key_block_id: Option<Hash>,
+    /// The RandomX execution mode (Light or Fast).
+    pub randomx_mode: crate::randomx::RandomxMode,
 }
 
 impl<'a> ValidationContext<'a> {
     /// Creates a context for a candidate that builds on the given parent.
     pub fn new(chain_id: Hash, parent: &'a Block, ancestor_timestamps: &'a [u64]) -> Self {
+        let key_block_id = if parent.header.height == 0 {
+            Some(parent.block_id())
+        } else {
+            None
+        };
         ValidationContext {
             chain_id,
             parent: Some(parent),
             ancestor_timestamps,
             accepted_transaction_ids: &[],
+            key_block_id,
+            randomx_mode: crate::randomx::RandomxMode::Light,
         }
     }
 
@@ -273,17 +321,27 @@ impl<'a> ValidationContext<'a> {
             parent: None,
             ancestor_timestamps: &[],
             accepted_transaction_ids: &[],
+            key_block_id: None,
+            randomx_mode: crate::randomx::RandomxMode::Light,
         }
     }
 
     /// Returns a copy of this context that also knows the transaction IDs
     /// already accepted on the selected chain.
-    ///
-    /// This is how the chain state supplies the "duplicate IDs against the
-    /// selected chain" check of §6.3 without the validation function having
-    /// to reach into the chain state itself.
     pub fn with_accepted_transaction_ids(mut self, ids: &'a [Hash]) -> Self {
         self.accepted_transaction_ids = ids;
+        self
+    }
+
+    /// Supplies the key block ID for proof-of-work verification.
+    pub fn with_key_block_id(mut self, id: Hash) -> Self {
+        self.key_block_id = Some(id);
+        self
+    }
+
+    /// Sets the RandomX validation mode (Light or Fast).
+    pub fn with_randomx_mode(mut self, mode: crate::randomx::RandomxMode) -> Self {
+        self.randomx_mode = mode;
         self
     }
 }
@@ -317,6 +375,7 @@ pub fn validate_block(
     validate_transactions(block, context)?;
     validate_orchard_root(block)?;
     validate_timestamp(block, context)?;
+    validate_pow(block, context)?;
     Ok(())
 }
 
@@ -691,4 +750,57 @@ pub fn upper_median(timestamps: &[u64]) -> Option<u64> {
     let mut sorted = timestamps.to_vec();
     sorted.sort_unstable();
     Some(sorted[sorted.len() / 2])
+}
+
+/// Validates the proof-of-work of a candidate block.
+///
+/// §6.4: The genesis block is a fixed protocol constant and never goes
+/// through RandomX validation.
+///
+/// For any block at height > 0:
+/// 1. The key block ID must be provided in `context.key_block_id`, or derived
+///    from the canonical genesis block if `key_height(height) == 0`.
+/// 2. The RandomX hash over the 170-byte canonical header bytes is computed.
+/// 3. The 256-bit hash (little-endian) must be less than or equal to the
+///    proof-of-work target T(d) = floor((2^256 - 1) / difficulty).
+fn validate_pow(block: &Block, context: &ValidationContext<'_>) -> Result<(), ValidationError> {
+    if block.header.height == 0 {
+        // §6.4: Genesis skips RandomX validation
+        return Ok(());
+    }
+
+    if block.header.difficulty == 0 {
+        return Err(ValidationError::ZeroDifficulty);
+    }
+
+    let kh = crate::randomx::key_height(block.header.height);
+    let key_id = context
+        .key_block_id
+        .or_else(|| {
+            if kh == 0 {
+                Some(crate::genesis::genesis_block(context.chain_id).block_id())
+            } else {
+                None
+            }
+        })
+        .ok_or(ValidationError::MissingKeyBlock {
+            height: block.header.height,
+            key_height: kh,
+        })?;
+
+    let header_bytes = block.header.to_bytes();
+    let hash =
+        crate::randomx::randomx_hash(key_id.as_bytes(), &header_bytes, context.randomx_mode)?;
+
+    let target = crate::randomx::pow_target(block.header.difficulty)
+        .ok_or(ValidationError::ZeroDifficulty)?;
+    let h = crate::difficulty::U256::from_le_bytes(hash);
+    if h > target {
+        return Err(ValidationError::HashAboveTarget {
+            hash: Hash::new(hash),
+            target,
+        });
+    }
+
+    Ok(())
 }

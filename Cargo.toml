@@ -23,6 +23,11 @@ path = "src/main.rs"
 blake2 = { version = "0.11.0", default-features = false }
 orchard = "0.16.0"
 
+# M1-C2 build dependency: compiles the vendored RandomX v1.2.3 native library
+# from source via cmake. Requires cmake and a C++ compiler on the build host.
+[build-dependencies]
+cmake = "0.1"
+
 # Test-only dependency used to express golden vectors as hex text.
 [dev-dependencies]
 hex = "0.4.3"

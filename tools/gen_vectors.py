@@ -49,6 +49,16 @@ def empty_root() -> bytes:
     return h(DOMAIN_TX_EMPTY, b"")
 
 
+# The canonical empty Orchard note commitment tree root (§6.3, §6.4).
+# This root is produced by the pinned `orchard = 0.16.0` crate
+# (orchard::tree::Anchor::empty_tree()). Python does not compute this root
+# independently; it relies on the pinned upstream crate constant.
+ORCHARD_EMPTY_ROOT_HEX = (
+    "ae2935f1dfd8a24aed7c70df7de3a668eb7a49b1319880dde2bbd9031ae5d82f"
+)
+ORCHARD_EMPTY_ROOT = bytes.fromhex(ORCHARD_EMPTY_ROOT_HEX)
+
+
 def tx_root(tids):
     if not tids:
         return empty_root()
@@ -204,12 +214,14 @@ def main():
     )
 
     # Genesis-like devnet header (spec 6.4 constants).
+    # Uses the canonical empty Orchard commitment-tree root from the pinned
+    # orchard crate (§6.4). Python relies on the pinned crate constant.
     genesis_header = serialize_header(
         chain_id_bytes=devnet,
         height=0,
         parent=b"\x00" * 32,
         tx_root_bytes=empty_root(),
-        orchard_root=b"\x00" * 32,
+        orchard_root=ORCHARD_EMPTY_ROOT,
         timestamp=1792454400,
         difficulty=1,
         nonce=0,
@@ -224,7 +236,7 @@ def main():
             "height": 0,
             "parent_block_id": "0" * 64,
             "transaction_root": hexs(empty_root()),
-            "orchard_commitment_root": "0" * 64,
+            "orchard_commitment_root": ORCHARD_EMPTY_ROOT_HEX,
             "timestamp": 1792454400,
             "difficulty": 1,
             "nonce": 0,

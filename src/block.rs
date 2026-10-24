@@ -65,7 +65,9 @@ impl Block {
             });
         }
 
-        for tx in &self.transactions {
+        // §6.3: Non-coinbase transactions are limited to 1,000,000 bytes.
+        // The coinbase at index 0 is bounded only by the 2,000,000-byte block size.
+        for tx in self.transactions.iter().skip(1) {
             if tx.len() > MAX_TRANSACTION_SIZE {
                 return Err(EncodeError::TransactionTooLarge {
                     actual: tx.len(),
@@ -107,7 +109,9 @@ impl Block {
             });
         }
 
-        for tx in &self.transactions {
+        // §6.3: Non-coinbase transactions are limited to 1,000,000 bytes.
+        // The coinbase at index 0 is bounded only by the 2,000,000-byte block size.
+        for tx in self.transactions.iter().skip(1) {
             if tx.len() > MAX_TRANSACTION_SIZE {
                 return Err(EncodeError::TransactionTooLarge {
                     actual: tx.len(),
@@ -159,9 +163,10 @@ impl Block {
         }
 
         let mut transactions = Vec::with_capacity(count);
-        for _ in 0..count {
+        for index in 0..count {
             let len = read_u32(bytes, &mut o)? as usize;
-            if len > MAX_TRANSACTION_SIZE {
+            // §6.3: Non-coinbase transactions (index > 0) are limited to 1,000,000 bytes.
+            if index > 0 && len > MAX_TRANSACTION_SIZE {
                 return Err(EncodeError::TransactionTooLarge {
                     actual: len,
                     limit: MAX_TRANSACTION_SIZE,

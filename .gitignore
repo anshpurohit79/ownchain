@@ -3,6 +3,12 @@
 /target
 *.rs.bk
 
+# Build artifacts
+*.exe
+*.obj
+*.pdb
+vendor/randomx/build/
+
 # OS / editor
 .DS_Store
 Thumbs.db

@@ -96,6 +96,16 @@ impl U256 {
         U256([0, 0, 0, 0])
     }
 
+    /// Constructs a `U256` from four little-endian `u64` limbs.
+    pub const fn from_limbs(limbs: [u64; 4]) -> Self {
+        U256(limbs)
+    }
+
+    /// Returns the four little-endian `u64` limbs.
+    pub const fn limbs(&self) -> [u64; 4] {
+        self.0
+    }
+
     /// Converts a `u128` into a `U256`.
     pub const fn from_u128(value: u128) -> Self {
         U256([value as u64, (value >> 64) as u64, 0, 0])
@@ -172,6 +182,135 @@ impl U256 {
             return None;
         }
         Some((self.0[1] as u128) << 64 | (self.0[0] as u128))
+    }
+
+    /// Returns `true` if all limbs are zero.
+    pub const fn is_zero(self) -> bool {
+        self.0[0] == 0 && self.0[1] == 0 && self.0[2] == 0 && self.0[3] == 0
+    }
+
+    /// Constructs a `U256` from 32 little-endian bytes.
+    pub const fn from_le_bytes(bytes: [u8; 32]) -> Self {
+        let mut limbs = [0u64; 4];
+        let mut i = 0;
+        while i < 4 {
+            limbs[i] = (bytes[i * 8] as u64)
+                | ((bytes[i * 8 + 1] as u64) << 8)
+                | ((bytes[i * 8 + 2] as u64) << 16)
+                | ((bytes[i * 8 + 3] as u64) << 24)
+                | ((bytes[i * 8 + 4] as u64) << 32)
+                | ((bytes[i * 8 + 5] as u64) << 40)
+                | ((bytes[i * 8 + 6] as u64) << 48)
+                | ((bytes[i * 8 + 7] as u64) << 56);
+            i += 1;
+        }
+        U256(limbs)
+    }
+
+    /// Returns the value as 32 little-endian bytes.
+    pub const fn to_le_bytes(self) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        let mut i = 0;
+        while i < 4 {
+            let limb = self.0[i];
+            bytes[i * 8] = limb as u8;
+            bytes[i * 8 + 1] = (limb >> 8) as u8;
+            bytes[i * 8 + 2] = (limb >> 16) as u8;
+            bytes[i * 8 + 3] = (limb >> 24) as u8;
+            bytes[i * 8 + 4] = (limb >> 32) as u8;
+            bytes[i * 8 + 5] = (limb >> 40) as u8;
+            bytes[i * 8 + 6] = (limb >> 48) as u8;
+            bytes[i * 8 + 7] = (limb >> 56) as u8;
+            i += 1;
+        }
+        bytes
+    }
+
+    /// Checked division by another `U256` using binary long division.
+    /// Returns `None` if the divisor is zero.
+    ///
+    /// The quotient is the exact floor of the mathematical division and the
+    /// final remainder is less than the divisor. Shifting the 256-bit
+    /// remainder left by one can produce a 257th carry bit out of the
+    /// most-significant limb; that bit is retained. When it is set the true
+    /// remainder is at least `2^256`, which is greater than any non-zero
+    /// `u256` divisor, so a subtraction is forced and performed with wrapping
+    /// arithmetic so the implicit `2^256` term is not lost.
+    pub fn checked_div(self, divisor: Self) -> Option<Self> {
+        if divisor.is_zero() {
+            return None;
+        }
+        let mut remainder = Self::zero();
+        let mut quotient = Self::zero();
+        for i in (0..256).rev() {
+            // Capture every carry out of a limb before overwriting it. c3 is
+            // the 257th bit: the carry out of the most-significant limb.
+            let c0 = (remainder.0[0] >> 63) & 1;
+            let c1 = (remainder.0[1] >> 63) & 1;
+            let c2 = (remainder.0[2] >> 63) & 1;
+            let c3 = (remainder.0[3] >> 63) & 1;
+
+            // remainder = (remainder << 1) | bit_i, across all four limbs.
+            let bit = (self.0[i / 64] >> (i % 64)) & 1;
+            remainder.0[0] = (remainder.0[0] << 1) | bit;
+            remainder.0[1] = (remainder.0[1] << 1) | c0;
+            remainder.0[2] = (remainder.0[2] << 1) | c1;
+            remainder.0[3] = (remainder.0[3] << 1) | c2;
+
+            // The true remainder is now (c3 as u256) * 2^256 + remainder.
+            // Any non-zero divisor is < 2^256, so when c3 == 1 the true
+            // remainder is at least 2^256 and is therefore >= divisor.
+            let subtract = c3 != 0 || remainder >= divisor;
+            if subtract {
+                if c3 != 0 {
+                    // true remainder = 2^256 + remainder; subtracting divisor
+                    // yields 2^256 + remainder - divisor, which fits in 256
+                    // bits because the loop invariant keeps remainder < divisor
+                    // whenever c3 == 1. Store it via wrapping subtraction so
+                    // the implicit 2^256 term is not lost.
+                    let mut borrow = 0u64;
+                    let mut next = [0u64; 4];
+                    for (slot, (r, d)) in next
+                        .iter_mut()
+                        .zip(remainder.0.iter().zip(divisor.0.iter()))
+                    {
+                        let (diff, overflow) = r.overflowing_sub(*d);
+                        let (diff, overflow2) = diff.overflowing_sub(borrow);
+                        borrow = u64::from(overflow || overflow2);
+                        *slot = diff;
+                    }
+                    debug_assert_eq!(borrow, 1, "the borrow of 1 cancels the 257th carry bit c3");
+                    remainder = U256(next);
+                } else {
+                    remainder = remainder
+                        .checked_sub(divisor)
+                        .expect("remainder >= divisor");
+                }
+                quotient.0[i / 64] |= 1 << (i % 64);
+            }
+        }
+        Some(quotient)
+    }
+}
+
+// Numeric comparison compares from the most significant limb (index 3) down.
+// The derived PartialOrd/Ord would compare from limb 0 (least significant),
+// which is wrong for little-endian limb storage.
+impl PartialOrd for U256 {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for U256 {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        for i in (0..4).rev() {
+            match self.0[i].cmp(&other.0[i]) {
+                core::cmp::Ordering::Equal => {}
+                other_ordering => return other_ordering,
+            }
+        }
+        core::cmp::Ordering::Equal
     }
 }
 

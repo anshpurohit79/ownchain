@@ -114,6 +114,94 @@ fn u256_checked_div_u64() {
 }
 
 #[test]
+fn u256_checked_div_identities() {
+    let m = U256::from_limbs([u64::MAX, u64::MAX, u64::MAX, u64::MAX]);
+
+    // Division by zero
+    assert_eq!(m.checked_div(U256::zero()), None);
+    assert_eq!(U256::zero().checked_div(U256::zero()), None);
+    assert_eq!(U256::from_u128(42).checked_div(U256::zero()), None);
+
+    // Identity 1: M / 1 = M
+    let d1 = U256::from_limbs([1, 0, 0, 0]);
+    assert_eq!(
+        m.checked_div(d1),
+        Some(U256::from_limbs([u64::MAX, u64::MAX, u64::MAX, u64::MAX]))
+    );
+
+    // Identity 2: M / 2 = floor(M / 2)
+    let d2 = U256::from_limbs([2, 0, 0, 0]);
+    assert_eq!(
+        m.checked_div(d2),
+        Some(U256::from_limbs([
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            0x7fff_ffff_ffff_ffff
+        ]))
+    );
+
+    // Identity 3: M / 2^64 = 2^192 - 1
+    let d_2_64 = U256::from_limbs([0, 1, 0, 0]);
+    assert_eq!(
+        m.checked_div(d_2_64),
+        Some(U256::from_limbs([u64::MAX, u64::MAX, u64::MAX, 0]))
+    );
+
+    // Identity 4: M / (2^63 + 1) = 0x1fffffffffffffffc0000000000000007fffffffffffffff0
+    let d_2_63_plus_1 = U256::from_limbs([0x8000_0000_0000_0001, 0, 0, 0]);
+    assert_eq!(
+        m.checked_div(d_2_63_plus_1),
+        Some(U256::from_limbs([
+            0xffff_ffff_ffff_fff0,
+            7,
+            0xffff_ffff_ffff_fffc,
+            1
+        ]))
+    );
+
+    // Identity 5: M / (2^64 - 1) = 2^192 + 2^128 + 2^64 + 1
+    let d_2_64_minus_1 = U256::from_limbs([u64::MAX, 0, 0, 0]);
+    assert_eq!(
+        m.checked_div(d_2_64_minus_1),
+        Some(U256::from_limbs([1, 1, 1, 1]))
+    );
+
+    // Identity 6: M / (2^128 - 1) = 2^128 + 1
+    let d_2_128_minus_1 = U256::from_limbs([u64::MAX, u64::MAX, 0, 0]);
+    assert_eq!(
+        m.checked_div(d_2_128_minus_1),
+        Some(U256::from_limbs([1, 0, 1, 0]))
+    );
+
+    // Divisor equal to dividend: M / M = 1
+    assert_eq!(m.checked_div(m), Some(U256::from_limbs([1, 0, 0, 0])));
+
+    // Divisor greater than dividend: 100 / 200 = 0
+    let n100 = U256::from_limbs([100, 0, 0, 0]);
+    let d200 = U256::from_limbs([200, 0, 0, 0]);
+    assert_eq!(n100.checked_div(d200), Some(U256::zero()));
+
+    // Dividend with highest bit set: 2^255 / 2 = 2^254
+    let n_2_255 = U256::from_limbs([0, 0, 0, 0x8000_0000_0000_0000]);
+    assert_eq!(
+        n_2_255.checked_div(d2),
+        Some(U256::from_limbs([0, 0, 0, 0x4000_0000_0000_0000]))
+    );
+
+    // Divisors with highest bit set: M / (2^255 + 3) = 1
+    let d_high = U256::from_limbs([3, 0, 0, 0x8000_0000_0000_0000]);
+    assert_eq!(m.checked_div(d_high), Some(U256::from_limbs([1, 0, 0, 0])));
+
+    // Multi-limb carry: M / (2^64 + 1) = (2^64 - 1)*2^128 + (2^64 - 1)
+    let d_2_64_plus_1 = U256::from_limbs([1, 1, 0, 0]);
+    assert_eq!(
+        m.checked_div(d_2_64_plus_1),
+        Some(U256::from_limbs([u64::MAX, 0, u64::MAX, 0]))
+    );
+}
+
+#[test]
 fn u256_to_u128_checked_bounds() {
     assert_eq!(
         U256::from_u128(u128::MAX).to_u128_checked(),

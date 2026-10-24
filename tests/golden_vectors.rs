@@ -16,6 +16,7 @@ use ownchain::error::EncodeError;
 use ownchain::hash::{self, Hash};
 use ownchain::header::{Header, HEADER_LEN};
 use ownchain::merkle;
+use ownchain::orchard_root::empty_commitment_root;
 
 mod vectors;
 use vectors::*;
@@ -187,7 +188,7 @@ fn header_devnet_genesis_matches_golden_vector() {
         height: 0,
         parent_block_id: Hash::ZERO,
         transaction_root: hash_of(EMPTY_ROOT),
-        orchard_commitment_root: Hash::ZERO,
+        orchard_commitment_root: empty_commitment_root(),
         timestamp: 1_792_454_400,
         difficulty: 1,
         nonce: 0,
@@ -300,7 +301,7 @@ fn block_no_transactions_matches_golden_vector() {
         height: 0,
         parent_block_id: Hash::ZERO,
         transaction_root: hash_of(EMPTY_ROOT),
-        orchard_commitment_root: Hash::ZERO,
+        orchard_commitment_root: empty_commitment_root(),
         timestamp: 1_792_454_400,
         difficulty: 1,
         nonce: 0,
@@ -418,9 +419,13 @@ fn block_rejects_oversized_encoding() {
 
 #[test]
 fn block_rejects_oversized_transaction() {
+    // §6.3: Non-coinbase transactions are limited to 1,000,000 bytes.
     let block = Block {
         header: mixed_header(),
-        transactions: vec![vec![0u8; MAX_TRANSACTION_SIZE + 1]],
+        transactions: vec![
+            vec![0u8; 32],                       // coinbase (index 0)
+            vec![0u8; MAX_TRANSACTION_SIZE + 1], // non-coinbase (index 1)
+        ],
     };
     assert_eq!(
         block.to_bytes(),
@@ -523,14 +528,82 @@ fn block_accepts_transaction_at_exactly_the_per_transaction_limit() {
 }
 
 #[test]
-fn block_rejects_transaction_length_above_per_transaction_limit() {
-    let mut bytes = hex_bytes(BLOCK_ONE_TX_HEX);
-    bytes[174..178].copy_from_slice(&(MAX_TRANSACTION_SIZE as u32 + 1).to_le_bytes());
+fn block_rejects_non_coinbase_transaction_length_above_per_transaction_limit() {
+    // Transaction 1 (non-coinbase) length prefix is at offset 210..214 in BLOCK_TWO_TX_HEX
+    let mut bytes = hex_bytes(BLOCK_TWO_TX_HEX);
+    bytes[210..214].copy_from_slice(&(MAX_TRANSACTION_SIZE as u32 + 1).to_le_bytes());
     assert_eq!(
         Block::from_bytes(&bytes),
         Err(EncodeError::TransactionTooLarge {
             actual: MAX_TRANSACTION_SIZE + 1,
             limit: MAX_TRANSACTION_SIZE,
+        })
+    );
+}
+
+#[test]
+fn block_accepts_coinbase_larger_than_per_tx_limit() {
+    // §6.3: The 1,000,000-byte limit applies to non-coinbase transactions.
+    // The coinbase (index 0) is bounded only by the 2,000,000-byte block cap.
+    let coinbase_len = MAX_TRANSACTION_SIZE + 50_000; // 1,050,000 bytes
+    let block = Block {
+        header: mixed_header(),
+        transactions: vec![vec![0xAAu8; coinbase_len]],
+    };
+    let expected_size = HEADER_LEN + TX_COUNT_LEN + TX_LENGTH_LEN + coinbase_len;
+    assert_eq!(block.canonical_size(), Ok(expected_size));
+    let bytes = block.to_bytes().expect("encodes oversized coinbase");
+    assert_eq!(bytes.len(), expected_size);
+    let decoded = Block::from_bytes(&bytes).expect("decodes oversized coinbase");
+    assert_eq!(decoded, block);
+}
+
+#[test]
+fn block_rejects_non_coinbase_exceeding_per_tx_limit() {
+    let block = Block {
+        header: mixed_header(),
+        transactions: vec![
+            vec![0xAAu8; 32],                       // coinbase
+            vec![0xBBu8; MAX_TRANSACTION_SIZE + 1], // non-coinbase exceeds limit
+        ],
+    };
+    assert_eq!(
+        block.canonical_size(),
+        Err(EncodeError::TransactionTooLarge {
+            actual: MAX_TRANSACTION_SIZE + 1,
+            limit: MAX_TRANSACTION_SIZE,
+        })
+    );
+    assert_eq!(
+        block.to_bytes(),
+        Err(EncodeError::TransactionTooLarge {
+            actual: MAX_TRANSACTION_SIZE + 1,
+            limit: MAX_TRANSACTION_SIZE,
+        })
+    );
+}
+
+#[test]
+fn block_rejects_coinbase_exceeding_block_limit() {
+    // Coinbase so large that the entire block exceeds 2,000,000 bytes
+    let coinbase_len = MAX_BLOCK_SIZE;
+    let block = Block {
+        header: mixed_header(),
+        transactions: vec![vec![0xAAu8; coinbase_len]],
+    };
+    let actual_size = HEADER_LEN + TX_COUNT_LEN + TX_LENGTH_LEN + coinbase_len;
+    assert_eq!(
+        block.canonical_size(),
+        Err(EncodeError::BlockTooLarge {
+            actual: actual_size,
+            limit: MAX_BLOCK_SIZE,
+        })
+    );
+    assert_eq!(
+        block.to_bytes(),
+        Err(EncodeError::BlockTooLarge {
+            actual: actual_size,
+            limit: MAX_BLOCK_SIZE,
         })
     );
 }

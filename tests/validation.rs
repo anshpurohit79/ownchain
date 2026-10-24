@@ -925,3 +925,159 @@ fn accepted_transaction_ids_are_tracked() {
         .accepted_transaction_ids()
         .contains(&hash::transaction_id(&tx)));
 }
+
+// ============================================================================
+// Proof-of-work validation tests (M1-C2 integration)
+// ============================================================================
+
+#[test]
+fn pow_valid_proof_of_work_passes_validation() {
+    let id = chain_id();
+    let genesis = genesis::genesis_block(id);
+    let block = make_block(
+        id,
+        &genesis,
+        genesis::GENESIS_TIMESTAMP + 10,
+        vec![coinbase(id, 1)],
+    );
+    let context = ValidationContext::new(id, &genesis, &[genesis::GENESIS_TIMESTAMP]);
+    assert_eq!(validate_block(&block, &context), Ok(()));
+}
+
+#[test]
+fn pow_hash_above_target_fails_validation() {
+    let id = chain_id();
+    let genesis = genesis::genesis_block(id);
+    let mut block = make_block(
+        id,
+        &genesis,
+        genesis::GENESIS_TIMESTAMP + 10,
+        vec![coinbase(id, 1)],
+    );
+    // Setting difficulty to u128::MAX sets target to 2^128 + 1.
+    // An un-mined block with nonce 0 will exceed this target with overwhelming probability.
+    block.header.difficulty = u128::MAX;
+
+    let context = ValidationContext::new(id, &genesis, &[genesis::GENESIS_TIMESTAMP]);
+    let result = validate_block(&block, &context);
+    assert!(
+        matches!(result, Err(ValidationError::HashAboveTarget { .. })),
+        "expected HashAboveTarget, got {result:?}"
+    );
+}
+
+#[test]
+fn pow_incorrect_key_block_id_fails_validation() {
+    let id = chain_id();
+    let genesis = genesis::genesis_block(id);
+    let mut block = make_block(
+        id,
+        &genesis,
+        genesis::GENESIS_TIMESTAMP + 10,
+        vec![coinbase(id, 1)],
+    );
+    // Use difficulty 100 so target is ~ 2^249
+    block.header.difficulty = 100;
+
+    // Mine a nonce that succeeds under the correct key (genesis)
+    let key_correct = genesis.block_id();
+    let mut mined = false;
+    for nonce in 0..10_000u64 {
+        block.header.nonce = nonce;
+        let header_bytes = block.header.to_bytes();
+        let hash = ownchain::randomx::randomx_hash(
+            key_correct.as_bytes(),
+            &header_bytes,
+            ownchain::randomx::RandomxMode::Light,
+        )
+        .unwrap();
+        if ownchain::randomx::check_pow_target(&hash, block.header.difficulty).unwrap() {
+            mined = true;
+            break;
+        }
+    }
+    assert!(
+        mined,
+        "mining a low difficulty block should succeed quickly"
+    );
+
+    // Validates under the correct key
+    let context_correct = ValidationContext::new(id, &genesis, &[genesis::GENESIS_TIMESTAMP])
+        .with_key_block_id(key_correct);
+    assert_eq!(validate_block(&block, &context_correct), Ok(()));
+
+    // Fails under an incorrect key block ID
+    let wrong_key = Hash::new([0xEE; 32]);
+    let context_wrong = ValidationContext::new(id, &genesis, &[genesis::GENESIS_TIMESTAMP])
+        .with_key_block_id(wrong_key);
+    let result = validate_block(&block, &context_wrong);
+    assert!(
+        matches!(result, Err(ValidationError::HashAboveTarget { .. })),
+        "validation under incorrect key block ID should produce an invalid hash above target"
+    );
+}
+
+#[test]
+fn pow_genesis_rules_remain_enforced() {
+    let id = chain_id();
+    let mut genesis = genesis::genesis_block(id);
+
+    // Non-zero nonce on genesis must fail
+    genesis.header.nonce = 1;
+    let context = ValidationContext::genesis(id);
+    assert!(matches!(
+        validate_block(&genesis, &context),
+        Err(ValidationError::InvalidGenesis { .. })
+    ));
+
+    // Non-zero difficulty != 1 on genesis must fail
+    genesis.header.nonce = 0;
+    genesis.header.difficulty = 2;
+    assert!(matches!(
+        validate_block(&genesis, &context),
+        Err(ValidationError::InvalidGenesis { .. })
+    ));
+
+    // Difficulty 0 on genesis must fail
+    genesis.header.difficulty = 0;
+    assert!(matches!(
+        validate_block(&genesis, &context),
+        Err(ValidationError::InvalidGenesis { .. })
+    ));
+}
+
+#[test]
+fn pow_context_without_required_ancestor_history_fails_cleanly() {
+    let id = chain_id();
+    let genesis = genesis::genesis_block(id);
+
+    // Construct a parent block at height 2111
+    let mut parent = make_block(
+        id,
+        &genesis,
+        genesis::GENESIS_TIMESTAMP + 50,
+        vec![coinbase(id, 2111)],
+    );
+    parent.header.height = 2111;
+
+    // Construct a candidate block at height 2112 building on parent at 2111
+    let block = make_block(
+        id,
+        &parent,
+        genesis::GENESIS_TIMESTAMP + 100,
+        vec![coinbase(id, 2112)],
+    );
+
+    // Context without key_block_id at height 2112 (kh = 2048) must fail cleanly with MissingKeyBlock
+    let mut context = ValidationContext::new(id, &parent, &[genesis::GENESIS_TIMESTAMP + 50]);
+    context.key_block_id = None; // ensure no key block is provided
+
+    let result = validate_block(&block, &context);
+    assert_eq!(
+        result,
+        Err(ValidationError::MissingKeyBlock {
+            height: 2112,
+            key_height: 2048,
+        })
+    );
+}

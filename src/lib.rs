@@ -19,6 +19,7 @@ pub mod hash;
 pub mod header;
 pub mod merkle;
 pub mod orchard_root;
+pub mod randomx;
 pub mod tx;
 pub mod validation;
 

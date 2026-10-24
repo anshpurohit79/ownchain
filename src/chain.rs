@@ -147,11 +147,19 @@ impl ChainState {
     /// ready to accept.
     pub fn validate(&self, block: &Block) -> Result<(), ValidationError> {
         let timestamps = self.ancestor_timestamps();
-        let context = match self.tip() {
+        let mut context = match self.tip() {
             Some(parent) => ValidationContext::new(self.chain_id, parent, &timestamps),
             None => ValidationContext::genesis(self.chain_id),
         }
         .with_accepted_transaction_ids(&self.accepted_transaction_ids);
+
+        if block.header.height > 0 {
+            let kh = crate::randomx::key_height(block.header.height);
+            if let Some(key_block) = self.block_at(kh) {
+                context = context.with_key_block_id(key_block.block_id());
+            }
+        }
+
         validate_block(block, &context)
     }
 
