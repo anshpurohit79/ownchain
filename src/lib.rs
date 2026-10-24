@@ -6,9 +6,13 @@
 //! Milestone M1-B: structural block validation and the accepted-chain
 //! state, with atomic acceptance.
 //!
-//! Design decisions live in `docs/protocol-v1.md`. Nothing in this crate
-//! implements mining, wallets, networking, difficulty adjustment or the
-//! Orchard bundle proof; those belong to later milestones.
+//! Milestone M1-C1: Monero-style difficulty adjustment arithmetic.
+//!
+//! Milestone M1-C2: RandomX proof-of-work integration and network difficulty
+//! consensus enforcement.
+//!
+//! Design decisions live in `docs/protocol-v1.md`. Wallets, p2p networking,
+//! mempool, and Orchard bundle cryptographic proofs belong to later milestones.
 
 pub mod block;
 pub mod chain;

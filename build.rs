@@ -1,6 +1,7 @@
 fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let target_vendor = std::env::var("CARGO_CFG_TARGET_VENDOR").unwrap_or_default();
 
     // 1. Configure & build the vendored RandomX library with cmake.
     let mut config = cmake::Config::new("./vendor/randomx");
@@ -54,6 +55,28 @@ fn main() {
     //     the standard C library (libc), so advapi32 must not be linked.
     if target_os == "windows" {
         println!("cargo:rustc-link-lib=advapi32");
+    }
+
+    // C++ runtime linking:
+    //
+    // RandomX is written in C++ and compiled into a static library.
+    // When linking the static library into Rust test and binary targets:
+    //   * MSVC (`target_env == "msvc"`): The compiler and CRT supply the relevant
+    //     C++ runtime symbols without needing an external GNU runtime library.
+    //   * Apple (`target_vendor == "apple"` or `target_os == "macos"` / `target_os == "ios"`):
+    //     Clang/LLVM uses libc++, so link `c++`.
+    //   * Android: Clang/LLVM uses libc++, so link `c++`.
+    //   * Linux / GNU / MinGW: GCC/libstdc++ is used, so link `stdc++`.
+    if target_env == "msvc" {
+        // MSVC supplies the runtime; no additional GNU C++ runtime needed.
+    } else if target_vendor == "apple"
+        || target_os == "macos"
+        || target_os == "ios"
+        || target_os == "android"
+    {
+        println!("cargo:rustc-link-lib=c++");
+    } else {
+        println!("cargo:rustc-link-lib=stdc++");
     }
 
     // 2. Re-run build script when the source or CMake config changes.

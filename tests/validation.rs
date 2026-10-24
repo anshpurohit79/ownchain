@@ -958,7 +958,8 @@ fn pow_hash_above_target_fails_validation() {
     // An un-mined block with nonce 0 will exceed this target with overwhelming probability.
     block.header.difficulty = u128::MAX;
 
-    let context = ValidationContext::new(id, &genesis, &[genesis::GENESIS_TIMESTAMP]);
+    let context = ValidationContext::new(id, &genesis, &[genesis::GENESIS_TIMESTAMP])
+        .with_expected_difficulty(u128::MAX);
     let result = validate_block(&block, &context);
     assert!(
         matches!(result, Err(ValidationError::HashAboveTarget { .. })),
@@ -1003,13 +1004,15 @@ fn pow_incorrect_key_block_id_fails_validation() {
 
     // Validates under the correct key
     let context_correct = ValidationContext::new(id, &genesis, &[genesis::GENESIS_TIMESTAMP])
-        .with_key_block_id(key_correct);
+        .with_key_block_id(key_correct)
+        .with_expected_difficulty(100);
     assert_eq!(validate_block(&block, &context_correct), Ok(()));
 
     // Fails under an incorrect key block ID
     let wrong_key = Hash::new([0xEE; 32]);
     let context_wrong = ValidationContext::new(id, &genesis, &[genesis::GENESIS_TIMESTAMP])
-        .with_key_block_id(wrong_key);
+        .with_key_block_id(wrong_key)
+        .with_expected_difficulty(100);
     let result = validate_block(&block, &context_wrong);
     assert!(
         matches!(result, Err(ValidationError::HashAboveTarget { .. })),
@@ -1069,7 +1072,8 @@ fn pow_context_without_required_ancestor_history_fails_cleanly() {
     );
 
     // Context without key_block_id at height 2112 (kh = 2048) must fail cleanly with MissingKeyBlock
-    let mut context = ValidationContext::new(id, &parent, &[genesis::GENESIS_TIMESTAMP + 50]);
+    let mut context = ValidationContext::new(id, &parent, &[genesis::GENESIS_TIMESTAMP + 50])
+        .with_expected_difficulty(1);
     context.key_block_id = None; // ensure no key block is provided
 
     let result = validate_block(&block, &context);
@@ -1080,4 +1084,242 @@ fn pow_context_without_required_ancestor_history_fails_cleanly() {
             key_height: 2048,
         })
     );
+}
+
+// ============================================================================
+// Network-computed expected difficulty enforcement tests
+// ============================================================================
+
+#[test]
+fn difficulty_startup_boundaries_and_first_retarget_height() {
+    let id = chain_id();
+    let genesis = genesis::genesis_block(id);
+    let mut state = ChainState::from_genesis(&genesis).expect("genesis is valid");
+
+    // Genesis cumulative work is zero (§4)
+    assert_eq!(state.cumulative_work(), ownchain::difficulty::U256::zero());
+    assert_eq!(state.len(), 1);
+    assert_eq!(state.tip_height(), Some(0));
+
+    // Height 1: expected difficulty is 1 (§4.1: fewer than 2 samples after 15-block lag)
+    assert_eq!(state.expected_difficulty_for_next_block(), Ok(1));
+
+    // Candidate at height 1 declaring difficulty 2 must be rejected
+    let mut bad_diff_block = make_block(
+        id,
+        &genesis,
+        genesis::GENESIS_TIMESTAMP + 10,
+        vec![coinbase(id, 1)],
+    );
+    bad_diff_block.header.difficulty = 2;
+    assert_eq!(
+        state.apply_block(&bad_diff_block),
+        Err(ChainError::Invalid(ValidationError::DifficultyMismatch {
+            found: 2,
+            expected: 1,
+        }))
+    );
+    // State is untouched
+    assert_eq!(state.len(), 1);
+    assert_eq!(state.cumulative_work(), ownchain::difficulty::U256::zero());
+
+    // Candidate at height 1 declaring difficulty 0 must be rejected
+    bad_diff_block.header.difficulty = 0;
+    assert_eq!(
+        state.apply_block(&bad_diff_block),
+        Err(ChainError::Invalid(ValidationError::ZeroDifficulty))
+    );
+
+    // Honest block 1 at difficulty 1 passes
+    let block1 = make_block(
+        id,
+        &genesis,
+        genesis::GENESIS_TIMESTAMP + 10,
+        vec![coinbase(id, 1)],
+    );
+    state.apply_block(&block1).expect("block 1 is accepted");
+    assert_eq!(state.len(), 2);
+    assert_eq!(state.tip_height(), Some(1));
+    assert_eq!(
+        state.cumulative_work(),
+        ownchain::difficulty::U256::from_u128(1)
+    );
+
+    // Mine/apply blocks 2 through 16 at 10-second intervals (fast blocks).
+    // For all heights <= 16, h - 16 <= 0, so fewer than 2 samples exist.
+    // Expected difficulty must remain 1 throughout the lag window.
+    for h in 2..=16u64 {
+        assert_eq!(state.expected_difficulty_for_next_block(), Ok(1));
+        let parent = state.tip().unwrap().clone();
+        let blk = make_block(
+            id,
+            &parent,
+            genesis::GENESIS_TIMESTAMP + 10 * h,
+            vec![coinbase(id, h)],
+        );
+        state.apply_block(&blk).expect("startup block is accepted");
+        assert_eq!(
+            state.cumulative_work(),
+            ownchain::difficulty::U256::from_u128(h as u128)
+        );
+    }
+
+    assert_eq!(state.len(), 17);
+    assert_eq!(state.tip_height(), Some(16));
+    assert_eq!(
+        state.cumulative_work(),
+        ownchain::difficulty::U256::from_u128(16)
+    );
+
+    // Height 17: FIRST RETARGET HEIGHT!
+    // Window: max(0, 17 - 735)..=17 - 16 => heights 0..=1 (2 samples: genesis and block 1).
+    // time_span = timestamp[1] - timestamp[0] = 10s (fast blocks!).
+    // total_work = C_1 - C_0 = 1 - 0 = 1.
+    // expected difficulty = ceil(1 * 120 / 10) = 12.
+    let expected_diff_17 = state
+        .expected_difficulty_for_next_block()
+        .expect("expected difficulty at 17");
+    assert_eq!(expected_diff_17, 12);
+
+    let parent_16 = state.tip().unwrap().clone();
+
+    // Attacker test: Miner attempts to submit candidate at height 17 declaring difficulty 1
+    // (attempting to keep difficulty at 1 after expected difficulty has risen to 12).
+    let attacker_block = make_block(
+        id,
+        &parent_16,
+        genesis::GENESIS_TIMESTAMP + 170,
+        vec![coinbase(id, 17)],
+    );
+    assert_eq!(attacker_block.header.difficulty, 1);
+    let attack_err = state.apply_block(&attacker_block);
+    assert_eq!(
+        attack_err,
+        Err(ChainError::Invalid(ValidationError::DifficultyMismatch {
+            found: 1,
+            expected: 12,
+        }))
+    );
+    // Atomicity check: ChainState was not mutated
+    assert_eq!(state.len(), 17);
+    assert_eq!(state.tip_height(), Some(16));
+    assert_eq!(
+        state.cumulative_work(),
+        ownchain::difficulty::U256::from_u128(16)
+    );
+
+    // Incorrect declared difficulty test (e.g. 13 instead of 12)
+    let mut wrong_diff_block = make_block(
+        id,
+        &parent_16,
+        genesis::GENESIS_TIMESTAMP + 170,
+        vec![coinbase(id, 17)],
+    );
+    wrong_diff_block.header.difficulty = 13;
+    assert_eq!(
+        state.apply_block(&wrong_diff_block),
+        Err(ChainError::Invalid(ValidationError::DifficultyMismatch {
+            found: 13,
+            expected: 12,
+        }))
+    );
+
+    // Honest miner: declares expected difficulty 12 and mines valid PoW
+    let mut honest_block = make_block(
+        id,
+        &parent_16,
+        genesis::GENESIS_TIMESTAMP + 170,
+        vec![coinbase(id, 17)],
+    );
+    honest_block.header.difficulty = 12;
+
+    // Mine nonce targeting difficulty 12 under key block (genesis at height 0)
+    let key_id = genesis.block_id();
+    let mut mined = false;
+    for nonce in 0..10_000u64 {
+        honest_block.header.nonce = nonce;
+        let header_bytes = honest_block.header.to_bytes();
+        let hash = ownchain::randomx::randomx_hash(
+            key_id.as_bytes(),
+            &header_bytes,
+            ownchain::randomx::RandomxMode::Light,
+        )
+        .unwrap();
+        if ownchain::randomx::check_pow_target(&hash, 12).unwrap() {
+            mined = true;
+            break;
+        }
+    }
+    assert!(
+        mined,
+        "mining difficulty 12 should succeed within 10,000 hashes"
+    );
+
+    // Block 17 is validated and accepted!
+    state
+        .apply_block(&honest_block)
+        .expect("honest block 17 accepted");
+    assert_eq!(state.len(), 18);
+    assert_eq!(state.tip_height(), Some(17));
+    // Cumulative work increases by validated expected difficulty 12: 16 + 12 = 28
+    assert_eq!(
+        state.cumulative_work(),
+        ownchain::difficulty::U256::from_u128(28)
+    );
+}
+
+#[test]
+fn missing_expected_difficulty_fails_on_standalone_context() {
+    let id = chain_id();
+    let genesis = genesis::genesis_block(id);
+
+    // Block at height 17
+    let mut parent = make_block(
+        id,
+        &genesis,
+        genesis::GENESIS_TIMESTAMP + 10,
+        vec![coinbase(id, 16)],
+    );
+    parent.header.height = 16;
+    let block = make_block(
+        id,
+        &parent,
+        genesis::GENESIS_TIMESTAMP + 20,
+        vec![coinbase(id, 17)],
+    );
+
+    // Standalone ValidationContext with parent height 16 defaults expected_difficulty to None
+    let context = ValidationContext::new(id, &parent, &[genesis::GENESIS_TIMESTAMP + 10]);
+    assert_eq!(context.expected_difficulty, None);
+
+    let result = validate_block(&block, &context);
+    assert_eq!(
+        result,
+        Err(ValidationError::MissingExpectedDifficulty { height: 17 })
+    );
+}
+
+#[test]
+fn rejected_block_does_not_mutate_cumulative_work_or_difficulty_history() {
+    let id = chain_id();
+    let genesis = genesis::genesis_block(id);
+    let mut state = ChainState::from_genesis(&genesis).expect("genesis is valid");
+
+    let initial_work = state.cumulative_work();
+    let initial_samples_len = state.difficulty_samples().len();
+    let initial_cw_len = state.cumulative_work_history().len();
+
+    // Create an invalid block (timestamp below median)
+    let bad_block = make_block(
+        id,
+        &genesis,
+        genesis::GENESIS_TIMESTAMP, // not greater than median
+        vec![coinbase(id, 1)],
+    );
+    assert!(state.apply_block(&bad_block).is_err());
+
+    // Cumulative work and difficulty history must remain untouched
+    assert_eq!(state.cumulative_work(), initial_work);
+    assert_eq!(state.difficulty_samples().len(), initial_samples_len);
+    assert_eq!(state.cumulative_work_history().len(), initial_cw_len);
 }

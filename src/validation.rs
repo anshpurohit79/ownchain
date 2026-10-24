@@ -1,18 +1,19 @@
-//! Structural validation of candidate blocks.
+//! Consensus validation of candidate blocks.
 //!
-//! This module implements the *structural* subset of the OwnChain v1
-//! validation rules defined in `docs/protocol-v1.md`:
+//! This module implements consensus validation rules defined in `docs/protocol-v1.md`:
 //!
-//! * §6.1 — canonical header fields and the canonical block encoding.
-//! * §6.2 — the transaction Merkle commitment.
-//! * §6.3 — the block and transaction size caps and the coinbase rule.
-//! * §6.4 — the genesis shape.
-//! * §7.0 — the canonical transaction outer envelope.
-//! * §4 — the upper-median timestamp rule.
+//! * §6.1 — canonical header fields and canonical block encoding.
+//! * §6.2 — transaction Merkle commitment.
+//! * §6.3 — block and transaction size caps and coinbase rule.
+//! * §6.4 — genesis shape.
+//! * §7.0 — canonical transaction outer envelope.
+//! * §4 — upper-median timestamp rule.
+//! * §4, §4.1 — network-computed expected difficulty enforcement.
+//! * §4, §4.1 — RandomX proof-of-work verification against the validated target.
 //!
-//! Everything that requires a full Orchard V2 bundle, RandomX proof of
-//! work, the difficulty retarget or fork choice is explicitly **out of
-//! scope** for this milestone (see §12, the Orchard compatibility gate).
+//! Everything that requires full Orchard V2 bundle verification, nullifier
+//! set spending, fee formula checking and pool-value accounting is deferred
+//! to the Orchard compatibility gate (§12).
 //! This module never invents a rule the specification does not state; in
 //! particular it does not implement the "two hours ahead of local time"
 //! deferral rule, because §4 explicitly classifies that as a local-clock
@@ -143,6 +144,20 @@ pub enum ValidationError {
     },
     /// The block's difficulty is zero.
     ZeroDifficulty,
+    /// The block's declared difficulty does not match the network-computed expected difficulty.
+    DifficultyMismatch {
+        /// The difficulty declared in the candidate block.
+        found: u128,
+        /// The network-computed expected difficulty.
+        expected: u128,
+    },
+    /// Expected difficulty was not provided in the validation context.
+    MissingExpectedDifficulty {
+        /// The candidate block height.
+        height: u64,
+    },
+    /// Difficulty adjustment calculation failed.
+    InvalidDifficulty(crate::difficulty::DifficultyError),
     /// Proof of work could not be verified because the required key block was not provided.
     MissingKeyBlock {
         /// The candidate block height.
@@ -238,6 +253,21 @@ impl fmt::Display for ValidationError {
             ValidationError::ZeroDifficulty => {
                 write!(f, "block difficulty must be non-zero")
             }
+            ValidationError::DifficultyMismatch { found, expected } => {
+                write!(
+                    f,
+                    "block difficulty mismatch: declared {found}, expected {expected}"
+                )
+            }
+            ValidationError::MissingExpectedDifficulty { height } => {
+                write!(
+                    f,
+                    "missing expected difficulty for block at height {height}"
+                )
+            }
+            ValidationError::InvalidDifficulty(e) => {
+                write!(f, "invalid difficulty calculation: {e}")
+            }
             ValidationError::MissingKeyBlock { height, key_height } => {
                 write!(
                     f,
@@ -264,6 +294,12 @@ impl From<crate::error::EncodeError> for ValidationError {
 impl From<crate::randomx::RandomxError> for ValidationError {
     fn from(e: crate::randomx::RandomxError) -> Self {
         ValidationError::Randomx(e)
+    }
+}
+
+impl From<crate::difficulty::DifficultyError> for ValidationError {
+    fn from(e: crate::difficulty::DifficultyError) -> Self {
+        ValidationError::InvalidDifficulty(e)
     }
 }
 
@@ -294,6 +330,8 @@ pub struct ValidationContext<'a> {
     pub key_block_id: Option<Hash>,
     /// The RandomX execution mode (Light or Fast).
     pub randomx_mode: crate::randomx::RandomxMode,
+    /// The network-computed expected difficulty.
+    pub expected_difficulty: Option<u128>,
 }
 
 impl<'a> ValidationContext<'a> {
@@ -304,6 +342,14 @@ impl<'a> ValidationContext<'a> {
         } else {
             None
         };
+        // §4.1: For any block at height 1..=16 (building on parent at height < 16),
+        // fewer than 2 samples remain after applying the 15-block lag, so expected
+        // difficulty is unconditionally 1.
+        let expected_difficulty = if parent.header.height < 16 {
+            Some(1)
+        } else {
+            None
+        };
         ValidationContext {
             chain_id,
             parent: Some(parent),
@@ -311,6 +357,7 @@ impl<'a> ValidationContext<'a> {
             accepted_transaction_ids: &[],
             key_block_id,
             randomx_mode: crate::randomx::RandomxMode::Light,
+            expected_difficulty,
         }
     }
 
@@ -323,6 +370,7 @@ impl<'a> ValidationContext<'a> {
             accepted_transaction_ids: &[],
             key_block_id: None,
             randomx_mode: crate::randomx::RandomxMode::Light,
+            expected_difficulty: Some(crate::genesis::GENESIS_DIFFICULTY),
         }
     }
 
@@ -344,25 +392,31 @@ impl<'a> ValidationContext<'a> {
         self.randomx_mode = mode;
         self
     }
+
+    /// Supplies the network-computed expected difficulty.
+    pub fn with_expected_difficulty(mut self, difficulty: u128) -> Self {
+        self.expected_difficulty = Some(difficulty);
+        self
+    }
 }
 
-/// Validates a candidate block structurally against the given context.
+/// Validates a candidate block against consensus rules.
 ///
-/// This performs the checks of `docs/protocol-v1.md` §6.1–§6.4, §7.0 and
-/// §4 that are implementable without an Orchard bundle:
+/// This performs the consensus checks of `docs/protocol-v1.md` §4, §4.1,
+/// §6.1–§6.4 and §7.0:
 ///
 /// 1. header `version` and `chain_id` (§6.1);
-/// 2. genesis shape, or the height/parent linkage to the parent block (§6.1);
-/// 3. canonical block and transaction size limits (§6.3);
-/// 4. the transaction Merkle root (§6.2) and duplicate transaction IDs (§6.3);
-/// 5. the transaction envelopes, the coinbase position and the coinbase
-///    height (§7.0, §7.1);
-/// 6. the Orchard commitment root (§6.3, §6.4);
-/// 7. the upper-median timestamp rule (§4).
+/// 2. genesis shape, or height/parent linkage to parent block (§6.1);
+/// 3. declared difficulty against network-computed expected difficulty (§4, §4.1);
+/// 4. canonical block and transaction size limits (§6.3);
+/// 5. transaction Merkle root (§6.2) and duplicate transaction IDs (§6.3);
+/// 6. transaction envelopes, coinbase position and coinbase height (§7.0, §7.1);
+/// 7. Orchard commitment root (§6.3, §6.4);
+/// 8. upper-median timestamp rule (§4);
+/// 9. RandomX proof of work against the validated target (§4, §4.1).
 ///
-/// Proof of work, difficulty retargeting, fork choice, the Orchard bundle
-/// proof, the nullifier set, the fee formula and the pool-value accounting
-/// are **not** checked here; they belong to later milestones.
+/// Orchard V2 bundle cryptographic proof verification and value-balance accounting
+/// are deferred to the Orchard compatibility gate (§12).
 ///
 /// The function is pure: it never mutates any state. A caller may therefore
 /// validate first and only then commit the block, which is what
@@ -372,6 +426,7 @@ pub fn validate_block(
     context: &ValidationContext<'_>,
 ) -> Result<(), ValidationError> {
     validate_header(block, context)?;
+    validate_difficulty(block, context)?;
     validate_transactions(block, context)?;
     validate_orchard_root(block)?;
     validate_timestamp(block, context)?;
@@ -752,6 +807,44 @@ pub fn upper_median(timestamps: &[u64]) -> Option<u64> {
     Some(sorted[sorted.len() / 2])
 }
 
+/// Validates the block difficulty against the network-computed expected difficulty.
+///
+/// §4: "Difficulty must be the network-computed expected value, not a miner-selected value."
+/// §6.4: Genesis difficulty is fixed at 1 and validated in `validate_genesis`.
+fn validate_difficulty(
+    block: &Block,
+    context: &ValidationContext<'_>,
+) -> Result<(), ValidationError> {
+    if block.header.height == 0 {
+        // Genesis difficulty is validated in validate_genesis against GENESIS_DIFFICULTY.
+        return Ok(());
+    }
+
+    if block.header.difficulty == 0 {
+        return Err(ValidationError::ZeroDifficulty);
+    }
+
+    let expected =
+        context
+            .expected_difficulty
+            .ok_or(ValidationError::MissingExpectedDifficulty {
+                height: block.header.height,
+            })?;
+
+    if expected == 0 {
+        return Err(ValidationError::ZeroDifficulty);
+    }
+
+    if block.header.difficulty != expected {
+        return Err(ValidationError::DifficultyMismatch {
+            found: block.header.difficulty,
+            expected,
+        });
+    }
+
+    Ok(())
+}
+
 /// Validates the proof-of-work of a candidate block.
 ///
 /// §6.4: The genesis block is a fixed protocol constant and never goes
@@ -760,17 +853,32 @@ pub fn upper_median(timestamps: &[u64]) -> Option<u64> {
 /// For any block at height > 0:
 /// 1. The key block ID must be provided in `context.key_block_id`, or derived
 ///    from the canonical genesis block if `key_height(height) == 0`.
-/// 2. The RandomX hash over the 170-byte canonical header bytes is computed.
-/// 3. The 256-bit hash (little-endian) must be less than or equal to the
-///    proof-of-work target T(d) = floor((2^256 - 1) / difficulty).
+/// 2. The block difficulty must match the validated expected difficulty.
+/// 3. The RandomX hash over the 170-byte canonical header bytes is computed.
+/// 4. The 256-bit hash (little-endian) must be less than or equal to the
+///    proof-of-work target T(d) = floor((2^256 - 1) / expected_difficulty).
 fn validate_pow(block: &Block, context: &ValidationContext<'_>) -> Result<(), ValidationError> {
     if block.header.height == 0 {
         // §6.4: Genesis skips RandomX validation
         return Ok(());
     }
 
-    if block.header.difficulty == 0 {
+    let expected_diff =
+        context
+            .expected_difficulty
+            .ok_or(ValidationError::MissingExpectedDifficulty {
+                height: block.header.height,
+            })?;
+
+    if expected_diff == 0 {
         return Err(ValidationError::ZeroDifficulty);
+    }
+
+    if block.header.difficulty != expected_diff {
+        return Err(ValidationError::DifficultyMismatch {
+            found: block.header.difficulty,
+            expected: expected_diff,
+        });
     }
 
     let kh = crate::randomx::key_height(block.header.height);
@@ -792,8 +900,8 @@ fn validate_pow(block: &Block, context: &ValidationContext<'_>) -> Result<(), Va
     let hash =
         crate::randomx::randomx_hash(key_id.as_bytes(), &header_bytes, context.randomx_mode)?;
 
-    let target = crate::randomx::pow_target(block.header.difficulty)
-        .ok_or(ValidationError::ZeroDifficulty)?;
+    let target =
+        crate::randomx::pow_target(expected_diff).ok_or(ValidationError::ZeroDifficulty)?;
     let h = crate::difficulty::U256::from_le_bytes(hash);
     if h > target {
         return Err(ValidationError::HashAboveTarget {

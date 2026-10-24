@@ -8,13 +8,12 @@
 //! construction: [`ChainState::apply_block`] validates the candidate
 //! block **completely** before it touches any state. A rejected block
 //! therefore cannot mutate the accepted chain in any way — the tip, the
-//! accepted block list and the timestamp window are all left exactly as
-//! they were.
+//! accepted block list, cumulative work and the timestamp window are all
+//! left exactly as they were.
 //!
-//! This milestone covers structural validation only. RandomX proof of
-//! work, difficulty retargeting, fork choice and Orchard transaction
-//! integration are out of scope and are *not* implemented here; the
-//! validation performed is what §6.1–§6.3 requires, nothing more.
+//! RandomX proof of work, difficulty retargeting, and consensus validation
+//! are fully enforced against accepted state. Orchard transaction proof
+//! verification, mempool and p2p networking are deferred to later milestones.
 
 use crate::block::Block;
 use crate::error::EncodeError;
@@ -75,6 +74,10 @@ pub struct ChainState {
     /// so that the state stays `Eq` and `Debug`-comparable and so that a
     /// membership test is a binary search.
     accepted_transaction_ids: Vec<Hash>,
+    /// Cumulative accepted work through each block height.
+    cumulative_work: Vec<crate::difficulty::U256>,
+    /// Difficulty samples for every accepted block.
+    difficulty_samples: Vec<crate::difficulty::DifficultySample>,
 }
 
 impl ChainState {
@@ -86,6 +89,8 @@ impl ChainState {
             chain_id,
             blocks: Vec::new(),
             accepted_transaction_ids: Vec::new(),
+            cumulative_work: Vec::new(),
+            difficulty_samples: Vec::new(),
         }
     }
 
@@ -158,6 +163,16 @@ impl ChainState {
             if let Some(key_block) = self.block_at(kh) {
                 context = context.with_key_block_id(key_block.block_id());
             }
+
+            // Expected height according to accepted tip
+            let expected_height = match self.tip() {
+                Some(parent) => parent.header.height + 1,
+                None => 0,
+            };
+
+            // Derive expected difficulty from accepted ancestor history:
+            let expected_difficulty = self.expected_difficulty(expected_height)?;
+            context = context.with_expected_difficulty(expected_difficulty);
         }
 
         validate_block(block, &context)
@@ -167,11 +182,12 @@ impl ChainState {
     ///
     /// The candidate is validated in full against the current state
     /// *before* any state is modified. If validation fails, the error is
-    /// returned and the chain state — the accepted block list, the tip and
-    /// the timestamp window — is left exactly as it was.
+    /// returned and the chain state — the accepted block list, cumulative
+    /// work, difficulty history, the tip and the timestamp window — is left
+    /// exactly as it was.
     ///
-    /// The only state change on success is the append of the accepted
-    /// block.
+    /// The only state change on success is the atomic append of the accepted
+    /// block, its cumulative work, and its difficulty sample.
     pub fn apply_block(&mut self, block: &Block) -> Result<(), ChainError> {
         // Validate first. Nothing below this line may mutate `self` until
         // every check has passed, so a rejected block cannot leave partial
@@ -182,13 +198,37 @@ impl ChainState {
         // cannot mutate state either.
         block.to_bytes()?;
 
-        // The block is accepted: extend the accepted-chain state.
+        // Calculate next cumulative work before mutating state:
+        let next_cumulative_work = if block.header.height == 0 {
+            // §4: Genesis contributes zero work.
+            crate::difficulty::U256::zero()
+        } else {
+            let prev_work = self
+                .cumulative_work
+                .last()
+                .copied()
+                .unwrap_or_else(crate::difficulty::U256::zero);
+            prev_work
+                .checked_add(crate::difficulty::U256::from_u128(block.header.difficulty))
+                .ok_or(ValidationError::from(
+                    crate::difficulty::DifficultyError::CumulativeWorkOverflow,
+                ))?
+        };
+
+        // All checks succeeded. The block is accepted: atomically extend chain state.
         for id in block.transaction_ids() {
             if self.accepted_transaction_ids.binary_search(&id).is_err() {
                 self.accepted_transaction_ids.push(id);
             }
         }
         self.accepted_transaction_ids.sort_unstable();
+        self.cumulative_work.push(next_cumulative_work);
+        self.difficulty_samples
+            .push(crate::difficulty::DifficultySample {
+                height: block.header.height,
+                timestamp: block.header.timestamp,
+                difficulty: block.header.difficulty,
+            });
         self.blocks.push(block.clone());
         Ok(())
     }
@@ -198,6 +238,53 @@ impl ChainState {
     /// The IDs are sorted and deduplicated.
     pub fn accepted_transaction_ids(&self) -> &[Hash] {
         &self.accepted_transaction_ids
+    }
+
+    /// Returns the cumulative work through the current tip block.
+    ///
+    /// Per `docs/protocol-v1.md` §4, genesis contributes zero work.
+    /// Returns zero if the chain is empty.
+    pub fn cumulative_work(&self) -> crate::difficulty::U256 {
+        self.cumulative_work
+            .last()
+            .copied()
+            .unwrap_or_else(crate::difficulty::U256::zero)
+    }
+
+    /// Returns the cumulative work through the block at the given height, if accepted.
+    pub fn cumulative_work_at(&self, height: u64) -> Option<crate::difficulty::U256> {
+        self.cumulative_work
+            .get(usize::try_from(height).ok()?)
+            .copied()
+    }
+
+    /// Returns the cumulative work history for all accepted blocks.
+    pub fn cumulative_work_history(&self) -> &[crate::difficulty::U256] {
+        &self.cumulative_work
+    }
+
+    /// Returns the difficulty samples for all accepted blocks.
+    pub fn difficulty_samples(&self) -> &[crate::difficulty::DifficultySample] {
+        &self.difficulty_samples
+    }
+
+    /// Computes the network-computed expected difficulty for a block extending
+    /// the current tip, according to `docs/protocol-v1.md` §4.1.
+    pub fn expected_difficulty_for_next_block(&self) -> Result<u128, ValidationError> {
+        let next_height = match self.tip() {
+            Some(tip) => tip.header.height + 1,
+            None => 0,
+        };
+        self.expected_difficulty(next_height)
+    }
+
+    /// Computes the network-computed expected difficulty for a block at `height`.
+    pub fn expected_difficulty(&self, height: u64) -> Result<u128, ValidationError> {
+        if height == 0 {
+            return Ok(crate::genesis::GENESIS_DIFFICULTY);
+        }
+        crate::difficulty::next_difficulty(height, &self.difficulty_samples, &self.cumulative_work)
+            .map_err(ValidationError::from)
     }
 
     /// Returns the timestamps of the last `TIMESTAMP_WINDOW` ancestor blocks,
