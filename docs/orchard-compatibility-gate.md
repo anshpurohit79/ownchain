@@ -1,26 +1,27 @@
-# OwnChain Milestone M1-D — Orchard V2 Compatibility Gate Report (with M1-D.1 Corrections)
+# OwnChain Milestone M1-D — Orchard V2 Compatibility Gate Report (with M1-D.2 Corrections)
 
 **Date:** 2026-10-25
-**Baseline Commit:** `032b283c1df5b4dd2483e8b8904a231984104245` (M1-D baseline)
-**Crate:** `orchard = 0.16.0` (pinned in `Cargo.lock`)  
+**Baseline Commit:** `4072f45fa4f4ef4493306ce7bce14dedc4faacf5` (M1-D.1 baseline)
+**Crate:** `orchard = 0.16.0` (pinned in `Cargo.lock`)
 **Status:** **PASS**
 
 ---
 
 ## 1. Executive Summary
 
-Milestone M1-D (with M1-D.1 corrections) proves that the pinned `orchard = 0.16.0` crate successfully satisfies all shielded payment cryptography requirements specified in `docs/protocol-v1.md` (§§3, 5, 6.3, 7, and 12).
+Milestone M1-D (incorporating M1-D.1 and M1-D.2 corrections) proves that the pinned `orchard = 0.16.0` crate successfully satisfies all shielded payment cryptography requirements specified in `docs/protocol-v1.md` (§§3, 5, 6.3, 7, and 12).
 
 An isolated, reproducible compatibility harness in `tests/orchard_compat.rs` demonstrates:
 - Correct zero-knowledge proof generation and verification using `OrchardCircuitVersion::FixedPostNu6_2`.
 - Canonical wire encoding and decoding in strict compliance with official ZIP-225 Section 7 component order.
 - Canonical CompactSize decoding rejecting non-minimal representations, truncation, and trailing data.
-- Domain-separated transaction authorization digest using unkeyed BLAKE2b-256 (`OwnChain/TxAuth/v1`) binding active `chain_id` and all consensus-relevant effects, including structured action effect digests (`OwnChain/ActionEffect/v1`).
+- Domain-separated transaction authorization digest using unkeyed BLAKE2b-256 (`OwnChain/TxAuth/v1`) binding active `chain_id` and all consensus-relevant effects, including structured action effect digests (`OwnChain/ActionEffect/v1`) over the **complete 820-byte canonical action description**.
+- Cryptographic proof that Halo2 circuit verification alone does **not** protect note ciphertexts from tampering, and that OwnChain's full action-effect digest is what binds note ciphertexts to spend authorization and binding signatures.
 - Consensus-recoverable output-only shielded coinbase notes under an all-zero outgoing viewing key (OVK).
 - Value-balance sign conventions (`valueBalanceOrchard = +fee_atoms` for transfer, `-payout_atoms` for coinbase) and ZIP-209 pool balance accounting.
 - Precise separation between crate-level cryptographic verifications, harness-only policy simulations, and future production `ChainState` consensus integration.
 
-No mocks or dummy proofs were used. All 13 compatibility tests pass in ~34 seconds alongside the full existing consensus test suite (144 total tests passing).
+No mocks or dummy proofs were used. All 14 compatibility tests pass in ~33 seconds alongside the full existing consensus test suite (145 total tests passing).
 
 ---
 
@@ -201,10 +202,20 @@ The decoder enforces Bitcoin/Zcash canonical CompactSize rules:
 
 The transaction authorization digest uses unkeyed BLAKE2b-256 (consistent with `src/hash.rs`) and binds the transaction to the active chain ID and all consensus-relevant effects:
 
-### 5.1 Action Effect Digest
-For each action $i \in [0, n\_actions-1]$:
-$$\text{action\_effect}_i = \text{BLAKE2b-256}(\text{UTF8("OwnChain/ActionEffect/v1")} \parallel cv\_net_i \parallel nullifier_i \parallel rk_i \parallel cmx_i)$$
-Input: $22 + 32 + 32 + 32 + 32 = 150$ bytes. Output: 32 bytes.
+### 5.1 Action Effect Digest over Complete 820-Byte Action Description
+For each action $i \in [0, n\_actions-1]$, the action effect digest binds all 7 fields of the canonical 820-byte action description in established ZIP-225 order:
+$$\text{action\_effect}_i = \text{BLAKE2b-256}(\text{UTF8("OwnChain/ActionEffect/v1")} \parallel cv\_net_i \parallel nullifier_i \parallel rk_i \parallel cmx_i \parallel epk_i \parallel enc\_ciphertext_i \parallel out\_ciphertext_i)$$
+Where:
+- Domain string: `OwnChain/ActionEffect/v1` (exactly 24 bytes).
+- Canonical action fields:
+  - `cv_net`: 32 bytes
+  - `nullifier`: 32 bytes
+  - `rk`: 32 bytes
+  - `cmx`: 32 bytes
+  - `epk`: 32 bytes (ephemeral public key)
+  - `enc_ciphertext`: 580 bytes (encrypted note, including value, diversifier, rcm, 512-byte memo, and 16-byte Poly1305 tag)
+  - `out_ciphertext`: 80 bytes (outgoing viewing key ciphertext)
+Total action-effect input to BLAKE2b-256: $24 + 820 = 844$ bytes (correcting the previous document's 22-byte calculation). Output: 32 bytes.
 
 ### 5.2 Transaction Authorization Digest (`sighash`)
 $$\text{sighash} = \text{BLAKE2b-256}(\text{UTF8("OwnChain/TxAuth/v1")} \parallel chain\_id \parallel tx\_type \parallel tx\_version \parallel payload\_prefix \parallel flags \parallel value\_balance \parallel anchor \parallel \text{action\_effect}_0 \parallel \dots \parallel \text{action\_effect}_{n-1})$$
@@ -228,10 +239,23 @@ The test suite systematically proves that mutating any committed field produces 
 6. Mutating `value_balance` $\to$ digest changes, authorization invalid.
 7. Mutating `anchor` $\to$ digest changes, authorization invalid.
 8. Mutating individual action-effect fields:
-   - Mutating `cv_net` $\to$ action effect changes, digest changes, authorization invalid.
-   - Mutating `nullifier` $\to$ action effect changes, digest changes, authorization invalid.
-   - Mutating `rk` $\to$ action effect changes, digest changes, authorization invalid.
-   - Mutating `cmx` $\to$ action effect changes, digest changes, authorization invalid.
+   - `cv_net` mutation $\to$ action effect changes, digest changes, authorization invalid.
+   - `nullifier` mutation $\to$ action effect changes, digest changes, authorization invalid.
+   - `rk` mutation $\to$ action effect changes, digest changes, authorization invalid.
+   - `cmx` mutation $\to$ action effect changes, digest changes, authorization invalid.
+   - `epk` mutation (valid-point mutation) $\to$ action effect changes, digest changes, authorization invalid.
+   - `enc_ciphertext` lead byte mutation $\to$ action effect changes, digest changes, authorization invalid.
+   - `enc_ciphertext` memo mutation (byte 100 within 52..564) $\to$ action effect changes, digest changes, authorization invalid.
+   - `enc_ciphertext` authentication tag mutation (byte 570 within 564..580) $\to$ action effect changes, digest changes, authorization invalid.
+   - `out_ciphertext` mutation (byte 10) $\to$ action effect changes, digest changes, authorization invalid.
+
+### 5.4 Proof Verification vs Authorization Binding (`test_ciphertexts_not_covered_by_halo2_proof_alone`)
+Orchard's Halo2 circuit proves relations over commitments, values, nullifiers, and spend authorizations, but note encryption (`epk`, `enc_ciphertext`, `out_ciphertext`) occurs outside the circuit.
+The harness demonstrates this concretely:
+1. Reconstructing an action with mutated `enc_ciphertext` and generating a bundle with the original proof results in `bundle.verify_proof(vk).is_ok()` (the Halo2 verifier alone accepts the bundle).
+2. However, because OwnChain commits all 820 bytes of the action description into `action_effect`, the mutated bundle has a distinct authorization digest.
+3. The original spend authorization signature and binding signature fail verification against the mutated digest, proving that authorization binding prevents ciphertext tampering where ZK proof verification alone cannot.
+4. Separately, non-canonical curve encodings for `epk` (`[0xff; 32]`) fail decompression and are rejected at point decoding by `Action::from_parts` with `ActionFromPartsError::InvalidEpk`.
 
 ---
 
@@ -248,9 +272,11 @@ The test suite rigorously classifies checks into their appropriate enforcement l
 | **Trailing Bytes** | `deserialize_bundle` fails with `TrailingBytes` | **Wire Codec** | Prevents unparsed data attachment. |
 | **Identity Authorization Key (`rk == 0`)** | `Action::from_parts` fails with `IdentityRk` | **Orchard Crate (Action Constructor)** | Rejects identity group element. |
 | **Non-Canonical Authorization Key** | `redpallas::VerificationKey::try_from` returns `Err` | **RedPallas / Crate** | Rejects invalid curve point decompression. |
+| **Non-Canonical Ephemeral Key (`epk = [0xff; 32]`)** | `Action::from_parts` fails with `InvalidEpk` | **Orchard Crate (Action Constructor)** | Rejects non-curve ephemeral keys. |
 | **Mismatched Authorization Key** | `rk.verify()` returns `Err` | **Orchard Crate (Signature)** | Signature verification failure. |
 | **Cross-Chain Replay (`chain_id` mismatch)** | Signatures and `BatchValidator` fail against testnet sighash | **Orchard Crate / OwnChain Digest** | Domain separation prevents cross-chain replay. |
-| **Mutated Effects / Digest Fields** | Signatures and binding verification fail on altered digest | **Orchard Crate / OwnChain Digest** | Any field change invalidates authorizations. |
+| **Ciphertext Tampering with Original Proof** | `verify_proof` passes, but signature and BVK reject mutated sighash | **OwnChain ActionEffect / Digest** | Proves proof verification alone does not protect ciphertexts. |
+| **Mutated Effects / Ciphertext Fields** | Signatures and binding verification fail on altered digest | **Orchard Crate / OwnChain Digest** | Any field change invalidates authorizations. |
 | **Incorrect Fee / Value Balance Sign** | Mutated `value_balance` alters expected BVK; `bvk.verify()` fails | **Orchard Crate (Value Commitment)** | BVK derivation commits to value balance. |
 | **Duplicate Nullifier** | Isolated crate verifier succeeds; harness simulation rejects | **Harness Simulation (Future `ChainState`)** | **CRATE DOES NOT ENFORCE.** The stateless crate verifier accepts duplicate nullifiers. Production tracking belongs to M1-E. |
 | **Stale / Unknown Historical Anchor** | Isolated crate verifier succeeds; harness simulation rejects | **Harness Simulation (Future `ChainState`)** | **CRATE DOES NOT ENFORCE.** The crate only validates internal anchor consistency. Production ancestor-root validation belongs to M1-E. |
@@ -278,11 +304,11 @@ All signed and verified test fixtures confirm protocol rules:
 - `git diff --check`: **Pass**
 
 ### Test Suite Execution
-- `cargo test --locked --all-targets`: **Pass** (144 total tests across 5 targets, 0 failed):
+- `cargo test --locked --all-targets`: **Pass** (145 total tests across 5 targets, 0 failed):
   - `ownchain` lib unittests: 8 passed
   - `difficulty`: 22 passed
   - `golden_vectors`: 37 passed
-  - `orchard_compat`: 13 passed
+  - `orchard_compat`: 14 passed
   - `randomx`: 9 passed
   - `validation`: 55 passed
 
@@ -290,7 +316,7 @@ All signed and verified test fixtures confirm protocol rules:
 
 ## 9. Remaining M1-E Work (Future Consensus Integration)
 
-Passing the M1-D/M1-D.1 compatibility gate proves that the pinned Orchard API can implement OwnChain's shielded rules. It does **not** integrate shielded transactions into production consensus. The following work remains for Milestone M1-E:
+Passing the M1-D/M1-D.1/M1-D.2 compatibility gate proves that the pinned Orchard API can implement OwnChain's shielded rules. It does **not** integrate shielded transactions into production consensus. The following work remains for Milestone M1-E:
 
 1. **Commitment Tree State Tracking in `ChainState`:** Implement an incremental depth-32 Sinsemilla/Orchard commitment tree that appends `action.cmx()` in block order and produces the canonical header `orchard_root`.
 2. **Historical Anchor Ring Buffer:** Maintain historical tree roots across ancestor blocks to validate transaction anchors during block validation and fork reorgs.

@@ -163,8 +163,8 @@ A transaction reveals its ID, inclusion height, time, serialized size, action co
 Every validating node must, at minimum:
 1. Enforce the canonical outer envelope, Orchard V2 bundle encoding, transaction size/action caps, and active chain ID. The Orchard spend-authorization digest must be domain-separated by `OwnChain/TxAuth/v1` and must commit to the active chain ID plus every consensus-relevant transaction effect (type/version, fee or coinbase height, Orchard value balance, anchor, action effect fields and flags). The exact effect-byte encoding is:
    - For each action $i \in [0, n\_actions-1]$, its 32-byte action-effect digest is:
-     $$\text{action\_effect}_i = \text{BLAKE2b-256}(\text{UTF8("OwnChain/ActionEffect/v1")} \parallel cv\_net_i \parallel nullifier_i \parallel rk_i \parallel cmx_i)$$
-     where $cv\_net$, $nullifier$, $rk$, and $cmx$ are the canonical 32-byte field representations.
+     $$\text{action\_effect}_i = \text{BLAKE2b-256}(\text{UTF8("OwnChain/ActionEffect/v1")} \parallel cv\_net_i \parallel nullifier_i \parallel rk_i \parallel cmx_i \parallel epk_i \parallel enc\_ciphertext_i \parallel out\_ciphertext_i)$$
+     where $cv\_net$, $nullifier$, $rk$, $cmx$, and $epk$ are canonical 32-byte field representations, $enc\_ciphertext$ is the 580-byte encrypted note ciphertext, and $out\_ciphertext$ is the 80-byte outgoing ciphertext, corresponding to the complete canonical 820-byte Orchard action description in ZIP-225 order ($24 + 820 = 844$ bytes total input to BLAKE2b-256).
    - The 32-byte transaction authorization digest is:
      $$\text{sighash} = \text{BLAKE2b-256}(\text{UTF8("OwnChain/TxAuth/v1")} \parallel chain\_id \parallel tx\_type \parallel tx\_version \parallel payload\_prefix \parallel flags \parallel value\_balance \parallel anchor \parallel \text{action\_effect}_0 \parallel \dots \parallel \text{action\_effect}_{n-1})$$
      where:

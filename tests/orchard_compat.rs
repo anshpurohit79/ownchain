@@ -513,13 +513,17 @@ pub fn deserialize_bundle(mut data: &[u8]) -> Result<Bundle<Authorized, i64>, Bu
 // Transaction Authorization Digest & Action Effects (§7.3)
 // ---------------------------------------------------------------------------
 
-/// Computes the 32-byte action effect digest for an Orchard action:
-/// `BLAKE2b-256("OwnChain/ActionEffect/v1" || cv_net || nullifier || rk || cmx)`
+/// Computes the 32-byte action effect digest for an Orchard action over the complete
+/// canonical 820-byte action description in ZIP-225 order:
+/// `BLAKE2b-256("OwnChain/ActionEffect/v1" || cv_net || nullifier || rk || cmx || epk || enc_ciphertext || out_ciphertext)`
 pub fn compute_action_effect(
     cv_net: &[u8; 32],
     nullifier: &[u8; 32],
     rk: &[u8; 32],
     cmx: &[u8; 32],
+    epk: &[u8; 32],
+    enc_ciphertext: &[u8; 580],
+    out_ciphertext: &[u8; 80],
 ) -> [u8; 32] {
     let mut hasher = Blake2b256::new();
     hasher.update(b"OwnChain/ActionEffect/v1");
@@ -527,9 +531,25 @@ pub fn compute_action_effect(
     hasher.update(nullifier);
     hasher.update(rk);
     hasher.update(cmx);
+    hasher.update(epk);
+    hasher.update(enc_ciphertext);
+    hasher.update(out_ciphertext);
     let mut out = [0u8; 32];
     out.copy_from_slice(&hasher.finalize());
     out
+}
+
+/// Computes the 32-byte action effect digest directly from an Orchard `Action`.
+pub fn compute_action_effect_from_action<A>(action: &Action<A>) -> [u8; 32] {
+    compute_action_effect(
+        &action.cv_net().to_bytes(),
+        &action.nullifier().to_bytes(),
+        &<[u8; 32]>::from(action.rk()),
+        &action.cmx().to_bytes(),
+        &action.encrypted_note().epk_bytes,
+        &action.encrypted_note().enc_ciphertext.0,
+        &action.encrypted_note().out_ciphertext,
+    )
 }
 
 /// Computes the domain-separated authorization digest for an OwnChain transaction:
@@ -622,13 +642,7 @@ fn get_fixtures() -> &'static TestFixtures {
             .unwrap()
             .0;
 
-        let cb_act = &cb_unauth.actions()[0];
-        let cb_action_effect = compute_action_effect(
-            &cb_act.cv_net().to_bytes(),
-            &cb_act.nullifier().to_bytes(),
-            &<[u8; 32]>::from(cb_act.rk()),
-            &cb_act.cmx().to_bytes(),
-        );
+        let cb_action_effect = compute_action_effect_from_action(&cb_unauth.actions()[0]);
         let cb_sighash = compute_tx_auth_digest(
             devnet_chain_id,
             0, // Coinbase
@@ -673,13 +687,7 @@ fn get_fixtures() -> &'static TestFixtures {
             .unwrap();
 
         let (tx_unauth, _) = tx_builder.build::<i64>(&mut rng).unwrap().unwrap();
-        let tx_act = &tx_unauth.actions()[0];
-        let tx_action_effect = compute_action_effect(
-            &tx_act.cv_net().to_bytes(),
-            &tx_act.nullifier().to_bytes(),
-            &<[u8; 32]>::from(tx_act.rk()),
-            &tx_act.cmx().to_bytes(),
-        );
+        let tx_action_effect = compute_action_effect_from_action(&tx_unauth.actions()[0]);
         let transfer_sighash = compute_tx_auth_digest(
             devnet_chain_id,
             1, // OrchardTransfer
@@ -983,12 +991,7 @@ fn test_negative_cross_chain_replay_rejected() {
     // Transaction was authorized on devnet
     assert_ne!(f.devnet_chain_id, f.testnet_chain_id);
 
-    let action_effect = compute_action_effect(
-        &action.cv_net().to_bytes(),
-        &action.nullifier().to_bytes(),
-        &<[u8; 32]>::from(action.rk()),
-        &action.cmx().to_bytes(),
-    );
+    let action_effect = compute_action_effect_from_action(action);
 
     // Compute sighash under testnet chain ID
     let testnet_sighash = compute_tx_auth_digest(
@@ -1266,12 +1269,7 @@ fn test_authorization_digest_mutations_and_invalidation() {
     let bundle = &f.transfer_bundle;
     let action = &bundle.actions()[0];
 
-    let action_effect = compute_action_effect(
-        &action.cv_net().to_bytes(),
-        &action.nullifier().to_bytes(),
-        &<[u8; 32]>::from(action.rk()),
-        &action.cmx().to_bytes(),
-    );
+    let action_effect = compute_action_effect_from_action(action);
 
     let baseline_sighash = compute_tx_auth_digest(
         f.devnet_chain_id,
@@ -1434,6 +1432,9 @@ fn test_authorization_digest_mutations_and_invalidation() {
         &action.nullifier().to_bytes(),
         &<[u8; 32]>::from(action.rk()),
         &action.cmx().to_bytes(),
+        &action.encrypted_note().epk_bytes,
+        &action.encrypted_note().enc_ciphertext.0,
+        &action.encrypted_note().out_ciphertext,
     );
     assert_ne!(action_effect, effect_mut_cv);
     let sig_mut_cv = compute_tx_auth_digest(
@@ -1460,6 +1461,9 @@ fn test_authorization_digest_mutations_and_invalidation() {
         &mut_nf,
         &<[u8; 32]>::from(action.rk()),
         &action.cmx().to_bytes(),
+        &action.encrypted_note().epk_bytes,
+        &action.encrypted_note().enc_ciphertext.0,
+        &action.encrypted_note().out_ciphertext,
     );
     assert_ne!(action_effect, effect_mut_nf);
     let sig_mut_nf = compute_tx_auth_digest(
@@ -1486,6 +1490,9 @@ fn test_authorization_digest_mutations_and_invalidation() {
         &action.nullifier().to_bytes(),
         &mut_rk,
         &action.cmx().to_bytes(),
+        &action.encrypted_note().epk_bytes,
+        &action.encrypted_note().enc_ciphertext.0,
+        &action.encrypted_note().out_ciphertext,
     );
     assert_ne!(action_effect, effect_mut_rk);
     let sig_mut_rk = compute_tx_auth_digest(
@@ -1512,6 +1519,9 @@ fn test_authorization_digest_mutations_and_invalidation() {
         &action.nullifier().to_bytes(),
         &<[u8; 32]>::from(action.rk()),
         &mut_cmx,
+        &action.encrypted_note().epk_bytes,
+        &action.encrypted_note().enc_ciphertext.0,
+        &action.encrypted_note().out_ciphertext,
     );
     assert_ne!(action_effect, effect_mut_cmx);
     let sig_mut_cmx = compute_tx_auth_digest(
@@ -1529,4 +1539,254 @@ fn test_authorization_digest_mutations_and_invalidation() {
         .rk()
         .verify(&sig_mut_cmx, action.authorization())
         .is_err());
+
+    // 8e. Mutate epk (valid-point mutation using coinbase action's epk)
+    let cb_epk = f.coinbase_bundle.actions()[0].encrypted_note().epk_bytes;
+    assert_ne!(cb_epk, action.encrypted_note().epk_bytes);
+    let effect_mut_epk = compute_action_effect(
+        &action.cv_net().to_bytes(),
+        &action.nullifier().to_bytes(),
+        &<[u8; 32]>::from(action.rk()),
+        &action.cmx().to_bytes(),
+        &cb_epk,
+        &action.encrypted_note().enc_ciphertext.0,
+        &action.encrypted_note().out_ciphertext,
+    );
+    assert_ne!(action_effect, effect_mut_epk);
+    let sig_mut_epk = compute_tx_auth_digest(
+        f.devnet_chain_id,
+        1,
+        1,
+        5_000,
+        bundle.flag_byte(),
+        *bundle.value_balance(),
+        bundle.anchor().to_bytes(),
+        &[effect_mut_epk],
+    );
+    assert_ne!(baseline_sighash, sig_mut_epk);
+    assert!(action
+        .rk()
+        .verify(&sig_mut_epk, action.authorization())
+        .is_err());
+
+    // 8f. Mutate enc_ciphertext (lead byte)
+    let mut mut_enc_lead = action.encrypted_note().enc_ciphertext.0;
+    mut_enc_lead[0] ^= 0xff;
+    let effect_mut_enc_lead = compute_action_effect(
+        &action.cv_net().to_bytes(),
+        &action.nullifier().to_bytes(),
+        &<[u8; 32]>::from(action.rk()),
+        &action.cmx().to_bytes(),
+        &action.encrypted_note().epk_bytes,
+        &mut_enc_lead,
+        &action.encrypted_note().out_ciphertext,
+    );
+    assert_ne!(action_effect, effect_mut_enc_lead);
+    let sig_mut_enc_lead = compute_tx_auth_digest(
+        f.devnet_chain_id,
+        1,
+        1,
+        5_000,
+        bundle.flag_byte(),
+        *bundle.value_balance(),
+        bundle.anchor().to_bytes(),
+        &[effect_mut_enc_lead],
+    );
+    assert_ne!(baseline_sighash, sig_mut_enc_lead);
+    assert!(action
+        .rk()
+        .verify(&sig_mut_enc_lead, action.authorization())
+        .is_err());
+
+    // 8g. Mutate enc_ciphertext memo portion (byte 100 within memo range 52..564)
+    let mut mut_enc_memo = action.encrypted_note().enc_ciphertext.0;
+    mut_enc_memo[100] ^= 0x55;
+    let effect_mut_enc_memo = compute_action_effect(
+        &action.cv_net().to_bytes(),
+        &action.nullifier().to_bytes(),
+        &<[u8; 32]>::from(action.rk()),
+        &action.cmx().to_bytes(),
+        &action.encrypted_note().epk_bytes,
+        &mut_enc_memo,
+        &action.encrypted_note().out_ciphertext,
+    );
+    assert_ne!(action_effect, effect_mut_enc_memo);
+    let sig_mut_enc_memo = compute_tx_auth_digest(
+        f.devnet_chain_id,
+        1,
+        1,
+        5_000,
+        bundle.flag_byte(),
+        *bundle.value_balance(),
+        bundle.anchor().to_bytes(),
+        &[effect_mut_enc_memo],
+    );
+    assert_ne!(baseline_sighash, sig_mut_enc_memo);
+    assert!(action
+        .rk()
+        .verify(&sig_mut_enc_memo, action.authorization())
+        .is_err());
+
+    // 8h. Mutate enc_ciphertext authentication tag portion (byte 570 within 564..580)
+    let mut mut_enc_tag = action.encrypted_note().enc_ciphertext.0;
+    mut_enc_tag[570] ^= 0xaa;
+    let effect_mut_enc_tag = compute_action_effect(
+        &action.cv_net().to_bytes(),
+        &action.nullifier().to_bytes(),
+        &<[u8; 32]>::from(action.rk()),
+        &action.cmx().to_bytes(),
+        &action.encrypted_note().epk_bytes,
+        &mut_enc_tag,
+        &action.encrypted_note().out_ciphertext,
+    );
+    assert_ne!(action_effect, effect_mut_enc_tag);
+    let sig_mut_enc_tag = compute_tx_auth_digest(
+        f.devnet_chain_id,
+        1,
+        1,
+        5_000,
+        bundle.flag_byte(),
+        *bundle.value_balance(),
+        bundle.anchor().to_bytes(),
+        &[effect_mut_enc_tag],
+    );
+    assert_ne!(baseline_sighash, sig_mut_enc_tag);
+    assert!(action
+        .rk()
+        .verify(&sig_mut_enc_tag, action.authorization())
+        .is_err());
+
+    // 8i. Mutate out_ciphertext (byte 10)
+    let mut mut_out = action.encrypted_note().out_ciphertext;
+    mut_out[10] ^= 0xff;
+    let effect_mut_out = compute_action_effect(
+        &action.cv_net().to_bytes(),
+        &action.nullifier().to_bytes(),
+        &<[u8; 32]>::from(action.rk()),
+        &action.cmx().to_bytes(),
+        &action.encrypted_note().epk_bytes,
+        &action.encrypted_note().enc_ciphertext.0,
+        &mut_out,
+    );
+    assert_ne!(action_effect, effect_mut_out);
+    let sig_mut_out = compute_tx_auth_digest(
+        f.devnet_chain_id,
+        1,
+        1,
+        5_000,
+        bundle.flag_byte(),
+        *bundle.value_balance(),
+        bundle.anchor().to_bytes(),
+        &[effect_mut_out],
+    );
+    assert_ne!(baseline_sighash, sig_mut_out);
+    assert!(action
+        .rk()
+        .verify(&sig_mut_out, action.authorization())
+        .is_err());
+}
+
+#[test]
+fn test_ciphertexts_not_covered_by_halo2_proof_alone() {
+    let f = get_fixtures();
+    let vk = get_verifying_key();
+    let bundle = &f.transfer_bundle;
+    let action = &bundle.actions()[0];
+
+    // 1. Reconstruct action with mutated enc_ciphertext (e.g. memo portion tampered)
+    let mut tampered_enc = action.encrypted_note().enc_ciphertext.0;
+    tampered_enc[100] ^= 0x42;
+    let tampered_note = TransmittedNoteCiphertext {
+        epk_bytes: action.encrypted_note().epk_bytes,
+        enc_ciphertext: NoteBytesData(tampered_enc),
+        out_ciphertext: action.encrypted_note().out_ciphertext,
+    };
+
+    let tampered_action = Action::from_parts(
+        *action.nullifier(),
+        action.rk().clone(),
+        *action.cmx(),
+        tampered_note,
+        action.cv_net().clone(),
+        action.authorization().clone(),
+    )
+    .expect("Action::from_parts succeeds with valid curve elements");
+
+    let tampered_bundle = Bundle::try_from_parts(
+        nonempty::NonEmpty::new(tampered_action),
+        *bundle.flags(),
+        *bundle.value_balance(),
+        *bundle.anchor(),
+        bundle.authorization().clone(),
+        bundle.bundle_version(),
+    )
+    .expect("Bundle::try_from_parts succeeds");
+
+    // 2. CRITICAL PROOF: Halo2 circuit proof verification alone DOES NOT detect ciphertext tampering!
+    // The Halo2 proof verifies the mathematical relations over commitments, values, and nullifiers,
+    // but the ciphertext encryption is external to the circuit.
+    assert!(
+        tampered_bundle.verify_proof(vk).is_ok(),
+        "Halo2 proof verification alone passes despite tampered ciphertext"
+    );
+
+    // 3. OwnChain's complete ActionEffect digest binds the ciphertext to authorization:
+    let tampered_effect = compute_action_effect_from_action(&tampered_bundle.actions()[0]);
+    let baseline_effect = compute_action_effect_from_action(action);
+    assert_ne!(
+        tampered_effect, baseline_effect,
+        "Mutating enc_ciphertext alters the 32-byte action effect digest"
+    );
+
+    let tampered_sighash = compute_tx_auth_digest(
+        f.devnet_chain_id,
+        1,
+        1,
+        5_000,
+        bundle.flag_byte(),
+        *bundle.value_balance(),
+        bundle.anchor().to_bytes(),
+        &[tampered_effect],
+    );
+    assert_ne!(tampered_sighash, f.transfer_sighash);
+
+    // 4. Therefore, the original spend authorization signature is cryptographically rejected
+    // against the tampered transaction authorization digest:
+    assert!(
+        action
+            .rk()
+            .verify(&tampered_sighash, action.authorization())
+            .is_err(),
+        "Spend authorization signature rejects tampered ciphertext digest"
+    );
+
+    // 5. And the binding signature is also rejected against the tampered digest:
+    assert!(
+        tampered_bundle
+            .binding_validating_key()
+            .verify(
+                &tampered_sighash,
+                bundle.authorization().binding_signature()
+            )
+            .is_err(),
+        "Binding signature rejects tampered ciphertext digest"
+    );
+
+    // 6. Separate check for invalid-point encoding for epk:
+    let invalid_epk_bytes = [0xff; 32];
+    let invalid_epk_note = TransmittedNoteCiphertext {
+        epk_bytes: invalid_epk_bytes,
+        enc_ciphertext: action.encrypted_note().enc_ciphertext,
+        out_ciphertext: action.encrypted_note().out_ciphertext,
+    };
+    let epk_err = Action::from_parts(
+        *action.nullifier(),
+        action.rk().clone(),
+        *action.cmx(),
+        invalid_epk_note,
+        action.cv_net().clone(),
+        action.authorization().clone(),
+    )
+    .unwrap_err();
+    assert_eq!(epk_err, ActionFromPartsError::InvalidEpk);
 }
