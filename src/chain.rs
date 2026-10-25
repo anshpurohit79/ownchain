@@ -11,9 +11,11 @@
 //! accepted block list, cumulative work and the timestamp window are all
 //! left exactly as they were.
 //!
-//! RandomX proof of work, difficulty retargeting, and consensus validation
-//! are fully enforced against accepted state. Orchard transaction proof
-//! verification, mempool and p2p networking are deferred to later milestones.
+//! RandomX proof of work, difficulty retargeting, consensus validation, and
+//! stateless Orchard transaction verification are fully enforced against
+//! candidate blocks. Stateful Orchard consensus accounting (historical anchors,
+//! nullifier double-spend tracking, commitment tree updates, and pool balance
+//! tracking) and p2p networking belong to subsequent milestones.
 
 use crate::block::Block;
 use crate::error::EncodeError;

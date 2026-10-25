@@ -3,7 +3,7 @@
 Experimental Rust implementation of the OwnChain v1 consensus and proof-of-work protocol baseline specified in [`docs/protocol-v1.md`](docs/protocol-v1.md).
 
 > [!NOTE]
-> **Experimental status:** This repository contains consensus primitives, chain-state verification, difficulty retargeting arithmetic, and RandomX proof-of-work integration. It is **not** a functioning peer-to-peer network, has no wallet or persistent database, does not verify cryptographic Orchard shielded proofs, and is **not** a production-ready cryptocurrency.
+> **Experimental status:** This repository contains consensus primitives, chain-state verification, difficulty retargeting arithmetic, RandomX proof-of-work integration, and consensus-integrated stateless Orchard shielded transaction verification. It is **not** a functioning peer-to-peer network, has no wallet or persistent database, does not enforce stateful Orchard anchor/nullifier checks, and is **not** a production-ready cryptocurrency.
 
 ---
 
@@ -31,13 +31,30 @@ Experimental Rust implementation of the OwnChain v1 consensus and proof-of-work 
    - **Network-computed expected difficulty enforcement:** Candidates must match the expected difficulty derived from accepted chain state; miner-selected difficulty is strictly rejected.
    - Cumulative work tracking across accepted blocks (genesis contributes zero work).
 
+5. **Production Orchard Stateless Codec & Cryptographic Verification (M1-E Stage 1):**
+   - Canonical ZIP-225 Orchard V2 bundle parsing and serialization in `src/orchard_tx.rs`.
+   - Strict CompactSize canonicality, bounded action count, proof length, and input size handling.
+   - Pinned `orchard = 0.16.0` with `OrchardCircuitVersion::FixedPostNu6_2` verifying key.
+   - Domain-separated action effect digest `OwnChain/ActionEffect/v1` and transaction authorization digest `OwnChain/TxAuth/v1`.
+   - Stateless cryptographic verification of Halo2 proofs, RedPallas spend authorization signatures, and RedPallas binding signatures.
+
+6. **Consensus-Integrated Stateless Orchard Verification (M1-E Stage 2):**
+   - **Block Validation Integration:** All candidate block transactions are validated through `validate_transaction_stateless` using the block's chain ID and pinned verifying key, returning structured `ValidationError::InvalidOrchardTransaction { index, error }`.
+   - **Per-Transaction Fee Enforcement (§4):** Checked arithmetic verification that declared fee equals $\max(1\,000,\, 1\,000 \times \text{action\_count} + \text{canonical\_tx\_size})$.
+   - **Aggregate Block Action Limit:** Early aggregate action counting against `MAX_ACTIONS_PER_BLOCK` (2,000 actions per block) to prevent proof verification resource exhaustion.
+   - **Atomic State Preservation:** `ChainState::apply_block` guarantees failure of any transaction rejects the candidate block without mutating accepted state.
+
 ---
 
 ## Current Boundaries and Limitations
 
-The following components belong to later milestones and are explicitly **out of scope**:
+The following components belong to later milestones and are explicitly **out of scope / incomplete**:
 
-- **Orchard Shielded Transactions:** The outer transaction envelope is validated, but cryptographic verification of Orchard V2 bundles, Action circuits, RedPallas signatures, Merkle commitment trees, and nullifiers is deferred to the §12 Orchard compatibility gate.
+- **Stateful Orchard Consensus Protections:**
+  - *Historical Anchor Validation:* Transaction anchors are checked for canonical field encoding, but are not yet validated against historical Orchard commitment tree roots.
+  - *Nullifier Set & Double-Spend Prevention:* Nullifiers are not yet tracked in `ChainState` or checked against historical nullifiers on the active chain.
+  - *Incremental Commitment Tree & Header Root Enforcement:* Block headers currently require `EMPTY_ORCHARD_ROOT` pending implementation of the incremental Orchard commitment tree.
+  - *Pool Balance & Subsidy Accounting:* `ChainState` does not yet account for shielded pool value balances or block subsidy limits.
 - **P2P Networking:** No libp2p transport, gossipsub, bootstrap discovery, or synchronization protocols are active yet.
 - **Mempool & Storage:** Transactions and blocks are validated against in-memory `ChainState`; there is no transaction pool or on-disk database engine.
 - **Wallet & Mining Client:** No key management, note scanning, or standalone mining client exists.
@@ -66,12 +83,14 @@ ownchain/
 │   ├── main.rs                     # Binary entry point
 │   ├── merkle.rs                   # Transaction Merkle tree calculation
 │   ├── orchard_root.rs             # Canonical empty Orchard commitment tree root
+│   ├── orchard_tx.rs               # Production Orchard transaction parser & validator
 │   ├── randomx.rs                  # RandomX C++ FFI wrapper and PoW verification
 │   ├── tx.rs                       # Outer transaction envelope parser
 │   └── validation.rs               # Consensus block validation pipeline
 ├── tests/
 │   ├── difficulty.rs               # Arithmetic regression and golden vector tests
 │   ├── golden_vectors.rs           # M1-A serialization and Merkle tests
+│   ├── orchard_compat.rs           # Orchard codec, digest, and stateless verification tests
 │   ├── randomx.rs                  # RandomX Light/Fast independent C++ parity tests
 │   └── validation.rs               # Consensus validation and difficulty retarget tests
 ├── tools/

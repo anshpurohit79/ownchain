@@ -4,16 +4,23 @@
 //!
 //! * §6.1 — canonical header fields and canonical block encoding.
 //! * §6.2 — transaction Merkle commitment.
-//! * §6.3 — block and transaction size caps and coinbase rule.
+//! * §6.3 — block and transaction size caps, aggregate action limits, and coinbase rule.
 //! * §6.4 — genesis shape.
 //! * §7.0 — canonical transaction outer envelope.
+//! * §7.3, §12 — stateless Orchard V2 bundle verification (proofs, signatures, fee rules).
 //! * §4 — upper-median timestamp rule.
 //! * §4, §4.1 — network-computed expected difficulty enforcement.
 //! * §4, §4.1 — RandomX proof-of-work verification against the validated target.
 //!
-//! Everything that requires full Orchard V2 bundle verification, nullifier
-//! set spending, fee formula checking and pool-value accounting is deferred
-//! to the Orchard compatibility gate (§12).
+//! Stateless Orchard V2 bundle verification (including Halo2 proof verification,
+//! spend authorization signatures, binding signatures, and exact consensus fee
+//! formula enforcement) is fully integrated into the block-validation path.
+//!
+//! Stateful checks that require historical anchor validation against active chain
+//! commitment-tree roots, nullifier double-spend tracking against the chain,
+//! commitment tree updates and header `orchard_commitment_root` calculation for
+//! transaction-bearing blocks, subsidy limits, and pool balance accounting remain
+//! deferred to the subsequent stateful consensus integration stage.
 //! This module never invents a rule the specification does not state; in
 //! particular it does not implement the "two hours ahead of local time"
 //! deferral rule, because §4 explicitly classifies that as a local-clock
@@ -176,6 +183,34 @@ pub enum ValidationError {
     Randomx(crate::randomx::RandomxError),
     /// The block's canonical serialization could not be produced.
     Encoding(crate::error::EncodeError),
+    /// An Orchard transaction failed stateless verification (§7.3, §12).
+    InvalidOrchardTransaction {
+        /// The index of the offending transaction within the block.
+        index: usize,
+        /// The stateless validation error.
+        error: crate::orchard_tx::OrchardValidationError,
+    },
+    /// A transaction declared an invalid consensus fee (§4).
+    IncorrectTransactionFee {
+        /// The index of the offending transaction within the block.
+        index: usize,
+        /// The fee declared in the transaction.
+        declared: u64,
+        /// The expected consensus fee according to the formula.
+        expected: u64,
+    },
+    /// A transaction fee calculation overflowed (§4).
+    FeeCalculationOverflow {
+        /// The index of the offending transaction within the block.
+        index: usize,
+    },
+    /// The total number of Orchard actions across all transactions in the block exceeds the block limit (§6.3).
+    TooManyBlockActions {
+        /// The actual number of actions in the block.
+        actual: usize,
+        /// The maximum permitted number of actions.
+        limit: usize,
+    },
 }
 
 impl fmt::Display for ValidationError {
@@ -279,6 +314,31 @@ impl fmt::Display for ValidationError {
             }
             ValidationError::Randomx(e) => write!(f, "RandomX error: {e}"),
             ValidationError::Encoding(e) => write!(f, "encoding error: {e}"),
+            ValidationError::InvalidOrchardTransaction { index, error } => {
+                write!(f, "invalid Orchard transaction at index {index}: {error}")
+            }
+            ValidationError::IncorrectTransactionFee {
+                index,
+                declared,
+                expected,
+            } => {
+                write!(
+                    f,
+                    "incorrect transaction fee at index {index}: declared {declared}, expected {expected}"
+                )
+            }
+            ValidationError::FeeCalculationOverflow { index } => {
+                write!(
+                    f,
+                    "transaction fee calculation overflowed for transaction at index {index}"
+                )
+            }
+            ValidationError::TooManyBlockActions { actual, limit } => {
+                write!(
+                    f,
+                    "block contains {actual} Orchard actions, exceeds limit {limit}"
+                )
+            }
         }
     }
 }
@@ -411,12 +471,15 @@ impl<'a> ValidationContext<'a> {
 /// 4. canonical block and transaction size limits (§6.3);
 /// 5. transaction Merkle root (§6.2) and duplicate transaction IDs (§6.3);
 /// 6. transaction envelopes, coinbase position and coinbase height (§7.0, §7.1);
-/// 7. Orchard commitment root (§6.3, §6.4);
-/// 8. upper-median timestamp rule (§4);
-/// 9. RandomX proof of work against the validated target (§4, §4.1).
+/// 7. stateless Orchard transaction validation, fee rules, and block action limits (§7.3, §4, §6.3, §12);
+/// 8. Orchard commitment root (§6.3, §6.4);
+/// 9. upper-median timestamp rule (§4);
+/// 10. RandomX proof of work against the validated target (§4, §4.1).
 ///
-/// Orchard V2 bundle cryptographic proof verification and value-balance accounting
-/// are deferred to the Orchard compatibility gate (§12).
+/// Stateful checks (historical anchors against active chain commitment-tree roots,
+/// nullifier double-spend tracking against the chain, commitment tree updates,
+/// header `orchard_commitment_root` calculation for transaction-bearing blocks, subsidy limits,
+/// and pool-balance accounting) remain deferred.
 ///
 /// The function is pure: it never mutates any state. A caller may therefore
 /// validate first and only then commit the block, which is what
@@ -597,6 +660,32 @@ fn validate_transactions(
     block: &Block,
     context: &ValidationContext<'_>,
 ) -> Result<(), ValidationError> {
+    // §6.3: Count declared Orchard actions across all transactions in the block.
+    // Enforcing MAX_ACTIONS_PER_BLOCK early bounds block complexity before allocating
+    // large buffers or running expensive Halo2 cryptographic proof verification.
+    if context.parent.is_some() {
+        let mut total_actions = 0usize;
+        for raw in &block.transactions {
+            if raw.len() > tx::TX_ENVELOPE_LEN + 8 {
+                let mut bundle_slice = &raw[tx::TX_ENVELOPE_LEN + 8..];
+                if let Ok(n_actions) = crate::orchard_tx::decode_compact_size(&mut bundle_slice) {
+                    total_actions = total_actions.checked_add(n_actions).ok_or(
+                        ValidationError::TooManyBlockActions {
+                            actual: usize::MAX,
+                            limit: crate::orchard_tx::MAX_ACTIONS_PER_BLOCK,
+                        },
+                    )?;
+                }
+            }
+        }
+        if total_actions > crate::orchard_tx::MAX_ACTIONS_PER_BLOCK {
+            return Err(ValidationError::TooManyBlockActions {
+                actual: total_actions,
+                limit: crate::orchard_tx::MAX_ACTIONS_PER_BLOCK,
+            });
+        }
+    }
+
     // §6.3: the canonical block encoding must fit into the block limit.
     //
     // The size is computed here rather than taken from
@@ -706,6 +795,67 @@ fn validate_transactions(
         });
     }
 
+    // §7.3, §12: For non-genesis blocks, every transaction must pass production
+    // stateless Orchard validation (canonical bundle deserialization, action count,
+    // flag validation, value balance rules, Halo2 proof verification against the
+    // pinned FixedPostNu6_2 verifying key, spend authorization signatures, and binding
+    // signature verification).
+    //
+    // Also enforces:
+    // - Exact consensus fee formula for OrchardTransfer transactions (§4).
+    // - Block aggregate action count limit MAX_ACTIONS_PER_BLOCK (§6.3).
+    //
+    // Stateful checks (historical anchors against active chain commitment-tree
+    // roots, nullifier double-spend tracking against the chain, commitment tree
+    // updates, header orchard_commitment_root for tx-bearing blocks, subsidy limits,
+    // and pool balance accounting) remain deferred.
+    if context.parent.is_some() {
+        let vk = crate::orchard_tx::verifying_key();
+        let mut total_actions = 0usize;
+
+        for (index, raw) in block.transactions.iter().enumerate() {
+            let validated =
+                crate::orchard_tx::validate_transaction_stateless(raw, context.chain_id, vk)
+                    .map_err(|error| ValidationError::InvalidOrchardTransaction { index, error })?;
+
+            let action_count = validated.bundle().actions().len();
+            total_actions = total_actions.checked_add(action_count).ok_or(
+                ValidationError::TooManyBlockActions {
+                    actual: usize::MAX,
+                    limit: crate::orchard_tx::MAX_ACTIONS_PER_BLOCK,
+                },
+            )?;
+
+            if validated.tx_type() == TxType::OrchardTransfer {
+                let declared_fee = validated.fee_atoms().unwrap_or(0);
+                match crate::orchard_tx::check_transaction_fee(
+                    action_count,
+                    raw.len(),
+                    declared_fee,
+                ) {
+                    Ok(_) => {}
+                    Err(crate::orchard_tx::FeeError::Overflow) => {
+                        return Err(ValidationError::FeeCalculationOverflow { index });
+                    }
+                    Err(crate::orchard_tx::FeeError::Mismatch { declared, expected }) => {
+                        return Err(ValidationError::IncorrectTransactionFee {
+                            index,
+                            declared,
+                            expected,
+                        });
+                    }
+                }
+            }
+        }
+
+        if total_actions > crate::orchard_tx::MAX_ACTIONS_PER_BLOCK {
+            return Err(ValidationError::TooManyBlockActions {
+                actual: total_actions,
+                limit: crate::orchard_tx::MAX_ACTIONS_PER_BLOCK,
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -728,23 +878,16 @@ fn parse_envelope_at(
 /// at its fixed depth of 32, and the header root is the tree state after
 /// processing the complete block.
 ///
-/// Milestone M1-B does not parse Orchard bundles, so it cannot compute the
-/// tree state for a block that carries transactions: the commitments live
-/// inside the bundle, which is opaque here. The check is therefore applied
-/// exactly where it is decidable — a block that carries no transactions
-/// commits to no Orchard commitment, so its header must carry the canonical
-/// empty Orchard root.
-///
-/// For a block that carries transactions the root is **deferred** to the
-/// Orchard compatibility gate of §12. This is a known, documented limitation
-/// of the milestone, not an oversight: silently accepting an unverified
-/// commitment root would be a consensus hole, and rejecting every block with
-/// a transaction would make the chain unusable. The Orchard root of a
-/// transaction-bearing block is verified once bundle parsing lands.
+/// While stateless Orchard bundle verification is now active, incremental
+/// commitment-tree state updates and root calculation for transaction-bearing
+/// blocks remain deferred to the subsequent stateful consensus integration stage.
+/// The check is therefore applied exactly where it is currently decidable without
+/// stateful tree tracking — a block that carries no transactions commits to no Orchard
+/// commitment, so its header must carry the canonical empty Orchard root.
 fn validate_orchard_root(block: &Block) -> Result<(), ValidationError> {
     if !block.transactions.is_empty() {
-        // Deferred: the commitment tree state cannot be computed without
-        // parsing the Orchard bundles.
+        // Deferred to stateful consensus integration: commitment tree state updates
+        // and header orchard_commitment_root verification for transaction-bearing blocks.
         return Ok(());
     }
 

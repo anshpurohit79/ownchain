@@ -33,11 +33,11 @@ pub mod validation;
 
 pub use orchard_root::{empty_commitment_root, ORCHARD_EMPTY_ROOT_HEX};
 pub use orchard_tx::{
-    all_zero_ovk, compute_action_effect, compute_action_effect_from_action,
+    all_zero_ovk, check_transaction_fee, compute_action_effect, compute_action_effect_from_action,
     compute_bundle_auth_digest, compute_tx_auth_digest, consensus_fee, decode_compact_size,
     deserialize_bundle, encode_compact_size, serialize_bundle, validate_bundle_stateless,
     validate_bundle_structure_stateless, validate_transaction_stateless, verifying_key,
-    BundleCodecError, OrchardValidationError, ValidatedOrchardTx, ACTION_DESCRIPTION_LEN,
+    BundleCodecError, FeeError, OrchardValidationError, ValidatedOrchardTx, ACTION_DESCRIPTION_LEN,
     ACTION_EFFECT_DOMAIN, ALL_ZERO_OVK_BYTES, MAX_ACTIONS_PER_BLOCK, MAX_ACTIONS_PER_TX,
     TX_AUTH_DOMAIN,
 };

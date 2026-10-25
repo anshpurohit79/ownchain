@@ -76,7 +76,7 @@ pub fn all_zero_ovk() -> OutgoingViewingKey {
 }
 
 /// Errors produced when encoding or decoding canonical Orchard V2 bundles.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum BundleCodecError {
     /// The bundle declared zero actions.
     EmptyActions,
@@ -548,8 +548,54 @@ pub fn consensus_fee(action_count: usize, canonical_tx_size: usize) -> Option<u6
     Some(core::cmp::max(1_000, base))
 }
 
+/// Errors produced when checking an Orchard transaction fee against the consensus formula (§4).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum FeeError {
+    /// The fee calculation overflowed arithmetic bounds.
+    Overflow,
+    /// The declared fee does not match the exact expected consensus fee.
+    Mismatch {
+        /// The fee declared in the transaction.
+        declared: u64,
+        /// The expected consensus fee.
+        expected: u64,
+    },
+}
+
+impl fmt::Display for FeeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FeeError::Overflow => write!(f, "consensus fee calculation overflowed"),
+            FeeError::Mismatch { declared, expected } => {
+                write!(
+                    f,
+                    "declared fee {declared} atoms does not match expected consensus fee {expected} atoms"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for FeeError {}
+
+/// Checks that a declared fee matches the exact consensus fee formula (§4).
+pub fn check_transaction_fee(
+    action_count: usize,
+    canonical_tx_size: usize,
+    declared_fee: u64,
+) -> Result<u64, FeeError> {
+    let expected = consensus_fee(action_count, canonical_tx_size).ok_or(FeeError::Overflow)?;
+    if declared_fee != expected {
+        return Err(FeeError::Mismatch {
+            declared: declared_fee,
+            expected,
+        });
+    }
+    Ok(expected)
+}
+
 /// Errors produced during stateless validation of an Orchard transaction.
-#[derive(Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum OrchardValidationError {
     /// The transaction outer envelope is invalid.
     Envelope(EnvelopeError),
@@ -1078,5 +1124,32 @@ mod tests {
             format!("{val_err}"),
             "coinbase valueBalanceOrchard must be negative, got 50"
         );
+    }
+
+    #[test]
+    fn test_fee_error_and_check_transaction_fee() {
+        assert_eq!(check_transaction_fee(1, 6028, 7028), Ok(7028));
+        assert_eq!(
+            check_transaction_fee(1, 6028, 5000),
+            Err(FeeError::Mismatch {
+                declared: 5000,
+                expected: 7028,
+            })
+        );
+        assert_eq!(
+            check_transaction_fee(usize::MAX, usize::MAX, 1000),
+            Err(FeeError::Overflow)
+        );
+
+        let err = FeeError::Mismatch {
+            declared: 5000,
+            expected: 7028,
+        };
+        assert_eq!(
+            format!("{err}"),
+            "declared fee 5000 atoms does not match expected consensus fee 7028 atoms"
+        );
+        let ovf = FeeError::Overflow;
+        assert_eq!(format!("{ovf}"), "consensus fee calculation overflowed");
     }
 }
