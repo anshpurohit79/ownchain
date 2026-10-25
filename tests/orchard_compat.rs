@@ -12,19 +12,17 @@
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
-use blake2::{Blake2b256, Digest};
-use nonempty::NonEmpty;
 use orchard::{
     builder::{Builder, BundleType},
     bundle::{Authorized, BatchValidator, BundleError, BundleVersion, Flags},
     circuit::{OrchardCircuitVersion, ProvingKey, VerifyingKey},
     keys::{FullViewingKey, OutgoingViewingKey, Scope, SpendAuthorizingKey, SpendingKey},
-    note::{ExtractedNoteCommitment, Nullifier, TransmittedNoteCiphertext},
-    note_encryption::{NoteBytesData, NoteCiphertextBytes},
-    primitives::redpallas::{self, Binding, SpendAuth},
+    note::{ExtractedNoteCommitment, TransmittedNoteCiphertext},
+    note_encryption::NoteBytesData,
+    primitives::redpallas::{self, SpendAuth},
     tree::{Anchor, MerkleHashOrchard, MerklePath},
     value::NoteValue,
-    Action, ActionFromPartsError, Address, Bundle, Proof,
+    Action, ActionFromPartsError, Address, Bundle,
 };
 use rand::SeedableRng;
 
@@ -32,24 +30,14 @@ use rand::SeedableRng;
 // Circuit Key Cache (Cached across tests to avoid expensive repeated setup)
 // ---------------------------------------------------------------------------
 
-struct CachedKeys {
-    proving_key: OnceLock<ProvingKey>,
-    verifying_key: OnceLock<VerifyingKey>,
-}
-
-static KEYS: CachedKeys = CachedKeys {
-    proving_key: OnceLock::new(),
-    verifying_key: OnceLock::new(),
-};
+static PROVING_KEY: OnceLock<ProvingKey> = OnceLock::new();
 
 fn get_proving_key() -> &'static ProvingKey {
-    KEYS.proving_key
-        .get_or_init(|| ProvingKey::build(OrchardCircuitVersion::FixedPostNu6_2))
+    PROVING_KEY.get_or_init(|| ProvingKey::build(OrchardCircuitVersion::FixedPostNu6_2))
 }
 
 fn get_verifying_key() -> &'static VerifyingKey {
-    KEYS.verifying_key
-        .get_or_init(|| get_proving_key().verifying_key())
+    ownchain::orchard_tx::verifying_key()
 }
 
 // ---------------------------------------------------------------------------
@@ -230,357 +218,18 @@ fn single_leaf_witness(cmx: &ExtractedNoteCommitment) -> (Anchor, MerklePath) {
 }
 
 // ---------------------------------------------------------------------------
-// Canonical CompactSize and Bundle Serialization / Deserialization (ZIP-225)
+// Production APIs from ownchain::orchard_tx (Milestone M1-E Stage 1)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum BundleCodecError {
-    EmptyActions,
-    TooManyActions,
-    UnexpectedEof,
-    TrailingBytes,
-    NonCanonicalCompactSize,
-    InvalidFlags,
-    InvalidAnchor,
-    InvalidValueCommitment,
-    InvalidNullifier,
-    InvalidRk,
-    InvalidCmx,
-    Action(ActionFromPartsError),
-    Bundle(BundleError),
-}
-
-fn encode_compact_size(val: usize, buf: &mut Vec<u8>) {
-    if val <= 252 {
-        buf.push(val as u8);
-    } else if val <= 0xffff {
-        buf.push(0xfd);
-        buf.extend_from_slice(&(val as u16).to_le_bytes());
-    } else if val <= 0xffff_ffff {
-        buf.push(0xfe);
-        buf.extend_from_slice(&(val as u32).to_le_bytes());
-    } else {
-        buf.push(0xff);
-        buf.extend_from_slice(&(val as u64).to_le_bytes());
-    }
-}
-
-fn decode_compact_size(data: &mut &[u8]) -> Result<usize, BundleCodecError> {
-    if data.is_empty() {
-        return Err(BundleCodecError::UnexpectedEof);
-    }
-    let first = data[0];
-    *data = &data[1..];
-    match first {
-        0..=252 => Ok(first as usize),
-        0xfd => {
-            if data.len() < 2 {
-                return Err(BundleCodecError::UnexpectedEof);
-            }
-            let val = u16::from_le_bytes([data[0], data[1]]);
-            if val < 253 {
-                return Err(BundleCodecError::NonCanonicalCompactSize);
-            }
-            *data = &data[2..];
-            Ok(val as usize)
-        }
-        0xfe => {
-            if data.len() < 4 {
-                return Err(BundleCodecError::UnexpectedEof);
-            }
-            let val = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-            if val < 0x10000 {
-                return Err(BundleCodecError::NonCanonicalCompactSize);
-            }
-            *data = &data[4..];
-            usize::try_from(val).map_err(|_| BundleCodecError::NonCanonicalCompactSize)
-        }
-        0xff => {
-            if data.len() < 8 {
-                return Err(BundleCodecError::UnexpectedEof);
-            }
-            let val = u64::from_le_bytes([
-                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-            ]);
-            if val < 0x1_0000_0000 {
-                return Err(BundleCodecError::NonCanonicalCompactSize);
-            }
-            *data = &data[8..];
-            usize::try_from(val).map_err(|_| BundleCodecError::NonCanonicalCompactSize)
-        }
-    }
-}
-
-/// Serializes an Orchard V2 bundle in official ZIP-225 Section 7 order:
-/// 1. actionCount: CompactSize
-/// 2. actions: [actionDescription; actionCount] (each: cv_net, nullifier, rk, cmx, epk, enc_ciphertext, out_ciphertext)
-/// 3. flags: 1 byte
-/// 4. valueBalanceOrchard: 8 bytes (i64 little-endian)
-/// 5. anchorOrchard: 32 bytes
-/// 6. sizeProofsOrchard: CompactSize
-/// 7. proofsOrchard: proof bytes
-/// 8. spendAuthSigsOrchard: [64 bytes; actionCount]
-/// 9. bindingSigOrchard: 64 bytes
-pub fn serialize_bundle(bundle: &Bundle<Authorized, i64>) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let actions = bundle.actions();
-    encode_compact_size(actions.len(), &mut buf);
-
-    for action in actions.iter() {
-        buf.extend_from_slice(&action.cv_net().to_bytes());
-        buf.extend_from_slice(&action.nullifier().to_bytes());
-        buf.extend_from_slice(&<[u8; 32]>::from(action.rk()));
-        buf.extend_from_slice(&action.cmx().to_bytes());
-        buf.extend_from_slice(&action.encrypted_note().epk_bytes);
-        buf.extend_from_slice(&action.encrypted_note().enc_ciphertext.0);
-        buf.extend_from_slice(&action.encrypted_note().out_ciphertext);
-    }
-
-    buf.push(bundle.flag_byte());
-    buf.extend_from_slice(&bundle.value_balance().to_le_bytes());
-    buf.extend_from_slice(&bundle.anchor().to_bytes());
-
-    let proof_bytes = bundle.authorization().proof().as_ref();
-    encode_compact_size(proof_bytes.len(), &mut buf);
-    buf.extend_from_slice(proof_bytes);
-
-    for action in actions.iter() {
-        buf.extend_from_slice(&<[u8; 64]>::from(action.authorization()));
-    }
-
-    buf.extend_from_slice(&<[u8; 64]>::from(
-        bundle.authorization().binding_signature(),
-    ));
-
-    buf
-}
-
-/// Deserializes an Orchard V2 bundle in official ZIP-225 Section 7 order.
-pub fn deserialize_bundle(mut data: &[u8]) -> Result<Bundle<Authorized, i64>, BundleCodecError> {
-    let n_actions = decode_compact_size(&mut data)?;
-    if n_actions == 0 {
-        return Err(BundleCodecError::EmptyActions);
-    }
-    if n_actions > 50 {
-        return Err(BundleCodecError::TooManyActions);
-    }
-
-    struct ActionDesc {
-        cv_net: orchard::value::ValueCommitment,
-        nf: Nullifier,
-        rk: redpallas::VerificationKey<SpendAuth>,
-        cmx: ExtractedNoteCommitment,
-        epk_bytes: [u8; 32],
-        enc_ciphertext: NoteCiphertextBytes,
-        out_ciphertext: [u8; 80],
-    }
-
-    let mut descs = Vec::with_capacity(n_actions);
-    for _ in 0..n_actions {
-        if data.len() < 32 * 5 + 580 + 80 {
-            return Err(BundleCodecError::UnexpectedEof);
-        }
-        let mut cv_bytes = [0u8; 32];
-        cv_bytes.copy_from_slice(&data[..32]);
-        let cv_net = orchard::value::ValueCommitment::from_bytes(&cv_bytes)
-            .into_option()
-            .ok_or(BundleCodecError::InvalidValueCommitment)?;
-        data = &data[32..];
-
-        let mut nf_bytes = [0u8; 32];
-        nf_bytes.copy_from_slice(&data[..32]);
-        let nf = Nullifier::from_bytes(&nf_bytes)
-            .into_option()
-            .ok_or(BundleCodecError::InvalidNullifier)?;
-        data = &data[32..];
-
-        let mut rk_bytes = [0u8; 32];
-        rk_bytes.copy_from_slice(&data[..32]);
-        let rk: redpallas::VerificationKey<SpendAuth> = rk_bytes
-            .try_into()
-            .map_err(|_| BundleCodecError::InvalidRk)?;
-        data = &data[32..];
-
-        let mut cmx_bytes = [0u8; 32];
-        cmx_bytes.copy_from_slice(&data[..32]);
-        let cmx = ExtractedNoteCommitment::from_bytes(&cmx_bytes)
-            .into_option()
-            .ok_or(BundleCodecError::InvalidCmx)?;
-        data = &data[32..];
-
-        let mut epk_bytes = [0u8; 32];
-        epk_bytes.copy_from_slice(&data[..32]);
-        data = &data[32..];
-
-        let mut enc_bytes = [0u8; 580];
-        enc_bytes.copy_from_slice(&data[..580]);
-        let enc_ciphertext = NoteBytesData(enc_bytes);
-        data = &data[580..];
-
-        let mut out_ciphertext = [0u8; 80];
-        out_ciphertext.copy_from_slice(&data[..80]);
-        data = &data[80..];
-
-        descs.push(ActionDesc {
-            cv_net,
-            nf,
-            rk,
-            cmx,
-            epk_bytes,
-            enc_ciphertext,
-            out_ciphertext,
-        });
-    }
-
-    if data.len() < 1 + 8 + 32 {
-        return Err(BundleCodecError::UnexpectedEof);
-    }
-    let flag_byte = data[0];
-    let flags = Flags::from_byte(flag_byte, BundleVersion::orchard_v2())
-        .ok_or(BundleCodecError::InvalidFlags)?;
-    data = &data[1..];
-
-    let mut vb_bytes = [0u8; 8];
-    vb_bytes.copy_from_slice(&data[..8]);
-    let value_balance = i64::from_le_bytes(vb_bytes);
-    data = &data[8..];
-
-    let mut anchor_bytes = [0u8; 32];
-    anchor_bytes.copy_from_slice(&data[..32]);
-    let anchor: Anchor = Anchor::from_bytes(anchor_bytes)
-        .into_option()
-        .ok_or(BundleCodecError::InvalidAnchor)?;
-    data = &data[32..];
-
-    let proof_len = decode_compact_size(&mut data)?;
-    if data.len() < proof_len {
-        return Err(BundleCodecError::UnexpectedEof);
-    }
-    let proof_bytes = data[..proof_len].to_vec();
-    data = &data[proof_len..];
-
-    let mut spend_auth_sigs = Vec::with_capacity(n_actions);
-    for _ in 0..n_actions {
-        if data.len() < 64 {
-            return Err(BundleCodecError::UnexpectedEof);
-        }
-        let mut sig_bytes = [0u8; 64];
-        sig_bytes.copy_from_slice(&data[..64]);
-        spend_auth_sigs.push(redpallas::Signature::<SpendAuth>::from(sig_bytes));
-        data = &data[64..];
-    }
-
-    if data.len() < 64 {
-        return Err(BundleCodecError::UnexpectedEof);
-    }
-    let mut binding_sig_bytes = [0u8; 64];
-    binding_sig_bytes.copy_from_slice(&data[..64]);
-    let binding_sig = redpallas::Signature::<Binding>::from(binding_sig_bytes);
-    data = &data[64..];
-
-    if !data.is_empty() {
-        return Err(BundleCodecError::TrailingBytes);
-    }
-
-    let mut actions = Vec::with_capacity(n_actions);
-    for (desc, sig) in descs.into_iter().zip(spend_auth_sigs) {
-        let encrypted_note = TransmittedNoteCiphertext {
-            epk_bytes: desc.epk_bytes,
-            enc_ciphertext: desc.enc_ciphertext,
-            out_ciphertext: desc.out_ciphertext,
-        };
-        let action =
-            Action::from_parts(desc.nf, desc.rk, desc.cmx, encrypted_note, desc.cv_net, sig)
-                .map_err(BundleCodecError::Action)?;
-        actions.push(action);
-    }
-
-    let non_empty_actions = NonEmpty::from_vec(actions).unwrap();
-    let auth = Authorized::from_parts(Proof::new(proof_bytes), binding_sig);
-
-    Bundle::try_from_parts(
-        non_empty_actions,
-        flags,
-        value_balance,
-        anchor,
-        auth,
-        BundleVersion::orchard_v2(),
-    )
-    .map_err(BundleCodecError::Bundle)
-}
-
-// ---------------------------------------------------------------------------
-// Transaction Authorization Digest & Action Effects (§7.3)
-// ---------------------------------------------------------------------------
-
-/// Computes the 32-byte action effect digest for an Orchard action over the complete
-/// canonical 820-byte action description in ZIP-225 order:
-/// `BLAKE2b-256("OwnChain/ActionEffect/v1" || cv_net || nullifier || rk || cmx || epk || enc_ciphertext || out_ciphertext)`
-pub fn compute_action_effect(
-    cv_net: &[u8; 32],
-    nullifier: &[u8; 32],
-    rk: &[u8; 32],
-    cmx: &[u8; 32],
-    epk: &[u8; 32],
-    enc_ciphertext: &[u8; 580],
-    out_ciphertext: &[u8; 80],
-) -> [u8; 32] {
-    let mut hasher = Blake2b256::new();
-    hasher.update(b"OwnChain/ActionEffect/v1");
-    hasher.update(cv_net);
-    hasher.update(nullifier);
-    hasher.update(rk);
-    hasher.update(cmx);
-    hasher.update(epk);
-    hasher.update(enc_ciphertext);
-    hasher.update(out_ciphertext);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&hasher.finalize());
-    out
-}
-
-/// Computes the 32-byte action effect digest directly from an Orchard `Action`.
-pub fn compute_action_effect_from_action<A>(action: &Action<A>) -> [u8; 32] {
-    compute_action_effect(
-        &action.cv_net().to_bytes(),
-        &action.nullifier().to_bytes(),
-        &<[u8; 32]>::from(action.rk()),
-        &action.cmx().to_bytes(),
-        &action.encrypted_note().epk_bytes,
-        &action.encrypted_note().enc_ciphertext.0,
-        &action.encrypted_note().out_ciphertext,
-    )
-}
-
-/// Computes the domain-separated authorization digest for an OwnChain transaction:
-/// `BLAKE2b-256("OwnChain/TxAuth/v1" || chain_id || tx_type || tx_version || payload_prefix || bundle_flags || bundle_value_balance || bundle_anchor || repeated(action_effect_i))`
-#[allow(clippy::too_many_arguments)]
-pub fn compute_tx_auth_digest(
-    chain_id: [u8; 32],
-    tx_type: u8,
-    tx_version: u16,
-    payload_prefix: u64,
-    bundle_flag_byte: u8,
-    bundle_value_balance: i64,
-    bundle_anchor: [u8; 32],
-    action_effects: &[[u8; 32]],
-) -> [u8; 32] {
-    let mut hasher = Blake2b256::new();
-    hasher.update(b"OwnChain/TxAuth/v1");
-    hasher.update(chain_id);
-    hasher.update([tx_type]);
-    hasher.update(tx_version.to_le_bytes());
-    hasher.update(payload_prefix.to_le_bytes());
-    hasher.update([bundle_flag_byte]);
-    hasher.update(bundle_value_balance.to_le_bytes());
-    hasher.update(bundle_anchor);
-    for effect in action_effects {
-        hasher.update(effect);
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&hasher.finalize());
-    out
-}
+use ownchain::hash::Hash;
+use ownchain::orchard_tx::{
+    all_zero_ovk, compute_action_effect, compute_action_effect_from_action,
+    compute_bundle_auth_digest, compute_tx_auth_digest, consensus_fee, decode_compact_size,
+    deserialize_bundle, encode_compact_size, serialize_bundle, validate_bundle_stateless,
+    validate_bundle_structure_stateless, validate_transaction_stateless, BundleCodecError,
+    OrchardValidationError, ValidatedOrchardTx, MAX_ACTIONS_PER_BLOCK, MAX_ACTIONS_PER_TX,
+};
+use ownchain::tx::{EnvelopeError, TxType};
 
 // ---------------------------------------------------------------------------
 // Deterministic Fixture Generation (Reused across tests for fast execution)
@@ -785,6 +434,25 @@ fn test_valid_orchard_v2_transfer() {
         ),
         Ok(())
     );
+
+    // 6. Test production bundle validation APIs
+    let transfer_envelope = ownchain::tx::TxEnvelope {
+        tx_type: TxType::OrchardTransfer,
+        version: 1,
+        chain_id: Hash::new(f.devnet_chain_id),
+    };
+    assert_eq!(
+        compute_bundle_auth_digest(f.devnet_chain_id, 1, 1, 5_000, bundle),
+        f.transfer_sighash
+    );
+    assert_eq!(
+        validate_bundle_structure_stateless(&transfer_envelope, 5_000, bundle).unwrap(),
+        f.transfer_sighash
+    );
+    assert_eq!(
+        validate_bundle_stateless(&transfer_envelope, 5_000, bundle, vk).unwrap(),
+        f.transfer_sighash
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -823,8 +491,8 @@ fn test_output_only_shielded_coinbase() {
     // 4. Value balance = -1_000_000_000 (negative of payout)
     assert_eq!(*bundle.value_balance(), -1_000_000_000i64);
 
-    // 5. All-zero OVK recovery
-    let zero_ovk = OutgoingViewingKey::from([0u8; 32]);
+    // 5. All-zero OVK recovery using production helper
+    let zero_ovk = all_zero_ovk();
     let (recovered_note, recovered_addr, _) = bundle
         .recover_output_with_ovk(0, &zero_ovk)
         .expect("Recovery with all-zero OVK");
@@ -838,6 +506,25 @@ fn test_output_only_shielded_coinbase() {
     assert_eq!(*roundtrip.value_balance(), -1_000_000_000i64);
     assert_eq!(*roundtrip.flags(), Flags::SPENDS_DISABLED);
     assert!(roundtrip.verify_proof(vk).is_ok());
+
+    // 7. Test production bundle validation APIs for coinbase
+    let coinbase_envelope = ownchain::tx::TxEnvelope {
+        tx_type: TxType::Coinbase,
+        version: 1,
+        chain_id: Hash::new(f.devnet_chain_id),
+    };
+    assert_eq!(
+        compute_bundle_auth_digest(f.devnet_chain_id, 0, 1, 1, bundle),
+        f.coinbase_sighash
+    );
+    assert_eq!(
+        validate_bundle_structure_stateless(&coinbase_envelope, 1, bundle).unwrap(),
+        f.coinbase_sighash
+    );
+    assert_eq!(
+        validate_bundle_stateless(&coinbase_envelope, 1, bundle, vk).unwrap(),
+        f.coinbase_sighash
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1789,4 +1476,157 @@ fn test_ciphertexts_not_covered_by_halo2_proof_alone() {
     )
     .unwrap_err();
     assert_eq!(epk_err, ActionFromPartsError::InvalidEpk);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2E — Production Stateless Transaction Validation Layer (M1-E Stage 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_stateless_transaction_validation_transfer() {
+    let f = get_fixtures();
+    let vk = get_verifying_key();
+    let bundle_bytes = serialize_bundle(&f.transfer_bundle);
+
+    // 1. Build canonical wire transaction:
+    // tx_type: 1 (OrchardTransfer) || tx_version: 1 || chain_id: 32 bytes || fee_atoms: 5_000 || bundle
+    let mut raw_tx = Vec::new();
+    raw_tx.push(1u8); // tx_type
+    raw_tx.extend_from_slice(&1u16.to_le_bytes()); // tx_version = 1
+    raw_tx.extend_from_slice(&f.devnet_chain_id); // chain_id
+    raw_tx.extend_from_slice(&5_000u64.to_le_bytes()); // fee_atoms = 5_000
+    raw_tx.extend_from_slice(&bundle_bytes);
+
+    // 2. Validate transaction statelessly through the production API
+    let devnet_hash = Hash::new(f.devnet_chain_id);
+    let validated: ValidatedOrchardTx = validate_transaction_stateless(&raw_tx, devnet_hash, vk)
+        .expect("Production stateless transfer validation succeeds");
+
+    assert_eq!(validated.tx_type(), TxType::OrchardTransfer);
+    assert_eq!(validated.chain_id(), devnet_hash);
+    assert_eq!(validated.fee_atoms(), Some(5_000));
+    assert_eq!(validated.coinbase_height(), None);
+    assert_eq!(validated.auth_digest(), f.transfer_sighash);
+    assert_eq!(validated.bundle().actions().len(), 1);
+
+    // 3. Negative checks through production validation:
+    // 3a. Wrong chain ID rejected
+    let testnet_hash = Hash::new(f.testnet_chain_id);
+    match validate_transaction_stateless(&raw_tx, testnet_hash, vk) {
+        Err(OrchardValidationError::Envelope(EnvelopeError::WrongChainId { found, expected })) => {
+            assert_eq!(found, devnet_hash);
+            assert_eq!(expected, testnet_hash);
+        }
+        other => panic!("Expected WrongChainId error, got {other:?}"),
+    }
+
+    // 3b. Mismatched fee prefix (e.g. fee declared as 5_001 while bundle vb is 5_000)
+    let mut bad_fee_tx = raw_tx.clone();
+    bad_fee_tx[35..43].copy_from_slice(&5_001u64.to_le_bytes());
+    match validate_transaction_stateless(&bad_fee_tx, devnet_hash, vk) {
+        Err(OrchardValidationError::TransferFeeMismatch {
+            value_balance,
+            fee_atoms,
+        }) => {
+            assert_eq!(value_balance, 5_000);
+            assert_eq!(fee_atoms, 5_001);
+        }
+        other => panic!("Expected TransferFeeMismatch error, got {other:?}"),
+    }
+
+    // 3c. Trailing bytes rejected
+    let mut trailing_tx = raw_tx.clone();
+    trailing_tx.push(0xff);
+    match validate_transaction_stateless(&trailing_tx, devnet_hash, vk) {
+        Err(OrchardValidationError::Codec(BundleCodecError::TrailingBytes)) => {}
+        other => panic!("Expected TrailingBytes error, got {other:?}"),
+    }
+
+    // 3d. Truncated bundle rejected
+    let truncated_tx = &raw_tx[..raw_tx.len() - 10];
+    match validate_transaction_stateless(truncated_tx, devnet_hash, vk) {
+        Err(OrchardValidationError::Codec(BundleCodecError::UnexpectedEof)) => {}
+        other => panic!("Expected UnexpectedEof error, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_stateless_transaction_validation_coinbase() {
+    let f = get_fixtures();
+    let vk = get_verifying_key();
+    let bundle_bytes = serialize_bundle(&f.coinbase_bundle);
+
+    // 1. Build canonical wire transaction:
+    // tx_type: 0 (Coinbase) || tx_version: 1 || chain_id: 32 bytes || height: 1 || bundle
+    let mut raw_tx = Vec::new();
+    raw_tx.push(0u8); // tx_type
+    raw_tx.extend_from_slice(&1u16.to_le_bytes()); // tx_version = 1
+    raw_tx.extend_from_slice(&f.devnet_chain_id); // chain_id
+    raw_tx.extend_from_slice(&1u64.to_le_bytes()); // block height = 1
+    raw_tx.extend_from_slice(&bundle_bytes);
+
+    // 2. Validate coinbase statelessly through production API
+    let devnet_hash = Hash::new(f.devnet_chain_id);
+    let validated = validate_transaction_stateless(&raw_tx, devnet_hash, vk)
+        .expect("Production stateless coinbase validation succeeds");
+
+    assert_eq!(validated.tx_type(), TxType::Coinbase);
+    assert_eq!(validated.chain_id(), devnet_hash);
+    assert_eq!(validated.coinbase_height(), Some(1));
+    assert_eq!(validated.fee_atoms(), None);
+    assert_eq!(validated.auth_digest(), f.coinbase_sighash);
+
+    // 3. Public note and address recovery under all-zero OVK
+    let (recovered_note, recovered_addr) = validated
+        .recover_coinbase_output()
+        .expect("Recover coinbase output");
+    assert_eq!(recovered_note.value().inner(), 1_000_000_000);
+    assert_eq!(recovered_addr, f.miner_address);
+
+    // 4. Truncated coinbase height prefix rejected
+    let truncated_envelope = &raw_tx[..38]; // less than 35 + 8 = 43 bytes
+    match validate_transaction_stateless(truncated_envelope, devnet_hash, vk) {
+        Err(OrchardValidationError::Envelope(EnvelopeError::TruncatedCoinbaseHeight)) => {}
+        other => panic!("Expected TruncatedCoinbaseHeight error, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_stateless_consensus_bounds_and_action_limits() {
+    // 1. Action bounds
+    assert_eq!(MAX_ACTIONS_PER_TX, 50);
+    assert_eq!(MAX_ACTIONS_PER_BLOCK, 2000);
+
+    // 2. Exact consensus fee arithmetic (§4)
+    assert_eq!(consensus_fee(0, 0), Some(1_000));
+    assert_eq!(consensus_fee(1, 1_000), Some(2_000));
+    assert_eq!(consensus_fee(50, 100_000), Some(150_000));
+    // Checked arithmetic overflow protection
+    assert_eq!(consensus_fee(usize::MAX, usize::MAX), None);
+
+    // 3. Oversized transaction rejection before large allocations
+    let devnet_hash = Hash::new([0u8; 32]);
+    let vk = get_verifying_key();
+
+    // 3a. Exceeding non-coinbase 1,000,000 byte limit
+    let mut oversized_transfer = vec![0u8; 1_000_001];
+    oversized_transfer[0] = 1; // OrchardTransfer
+    oversized_transfer[1..3].copy_from_slice(&1u16.to_le_bytes());
+    match validate_transaction_stateless(&oversized_transfer, devnet_hash, vk) {
+        Err(OrchardValidationError::TransactionTooLarge { actual, limit }) => {
+            assert_eq!(actual, 1_000_001);
+            assert_eq!(limit, 1_000_000);
+        }
+        other => panic!("Expected TransactionTooLarge error, got {other:?}"),
+    }
+
+    // 3b. Exceeding 2,000,000 byte block limit
+    let oversized_block_tx = vec![0u8; 2_000_001];
+    match validate_transaction_stateless(&oversized_block_tx, devnet_hash, vk) {
+        Err(OrchardValidationError::BlockLimitExceeded { actual, limit }) => {
+            assert_eq!(actual, 2_000_001);
+            assert_eq!(limit, 2_000_000);
+        }
+        other => panic!("Expected BlockLimitExceeded error, got {other:?}"),
+    }
 }

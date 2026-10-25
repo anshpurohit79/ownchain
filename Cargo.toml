@@ -21,6 +21,7 @@ path = "src/main.rs"
 #   Merkle leaves and inner nodes).
 [dependencies]
 blake2 = { version = "0.11.0", default-features = false }
+nonempty = "0.11"
 orchard = "0.16.0"
 
 # M1-C2 build dependency: compiles the vendored RandomX v1.2.3 native library
@@ -31,5 +32,4 @@ cmake = "0.1"
 # Test-only dependency used to express golden vectors as hex text.
 [dev-dependencies]
 hex = "0.4.3"
-nonempty = "0.11"
 rand = "0.10.3"
