@@ -161,7 +161,22 @@ A transaction reveals its ID, inclusion height, time, serialized size, action co
 ### 7.3 Validation
 
 Every validating node must, at minimum:
-1. Enforce the canonical outer envelope, Orchard V2 bundle encoding, transaction size/action caps, and active chain ID. The Orchard spend-authorization digest must be domain-separated by `OwnChain/TxAuth/v1` and must commit to the active chain ID plus every consensus-relevant transaction effect (type/version, fee or coinbase height, Orchard value balance, anchor, action effect fields and flags). The exact effect-byte encoding and API compatibility are gated by §12. Use Orchard's RedPallas authorization primitive; do not invent a new signature scheme.
+1. Enforce the canonical outer envelope, Orchard V2 bundle encoding, transaction size/action caps, and active chain ID. The Orchard spend-authorization digest must be domain-separated by `OwnChain/TxAuth/v1` and must commit to the active chain ID plus every consensus-relevant transaction effect (type/version, fee or coinbase height, Orchard value balance, anchor, action effect fields and flags). The exact effect-byte encoding is:
+   - For each action $i \in [0, n\_actions-1]$, its 32-byte action-effect digest is:
+     $$\text{action\_effect}_i = \text{BLAKE2b-256}(\text{UTF8("OwnChain/ActionEffect/v1")} \parallel cv\_net_i \parallel nullifier_i \parallel rk_i \parallel cmx_i)$$
+     where $cv\_net$, $nullifier$, $rk$, and $cmx$ are the canonical 32-byte field representations.
+   - The 32-byte transaction authorization digest is:
+     $$\text{sighash} = \text{BLAKE2b-256}(\text{UTF8("OwnChain/TxAuth/v1")} \parallel chain\_id \parallel tx\_type \parallel tx\_version \parallel payload\_prefix \parallel flags \parallel value\_balance \parallel anchor \parallel \text{action\_effect}_0 \parallel \dots \parallel \text{action\_effect}_{n-1})$$
+     where:
+     - $chain\_id$ is the active network's 32-byte chain ID.
+     - $tx\_type$ is the 1-byte transaction type (`0` for Coinbase, `1` for OrchardTransfer).
+     - $tx\_version$ is the 2-byte unsigned little-endian transaction version (`1`).
+     - $payload\_prefix$ is the 8-byte unsigned little-endian payload prefix (`height: u64_le` for Coinbase, `fee_atoms: u64_le` for OrchardTransfer).
+     - $flags$ is the 1-byte Orchard flags field (`0x02` for Coinbase, `0x03` for OrchardTransfer).
+     - $value\_balance$ is the 8-byte signed little-endian `valueBalanceOrchard` (`i64_le`).
+     - $anchor$ is the 32-byte Orchard commitment tree anchor.
+     - $\text{action\_effect}_i$ are the 32-byte action effect digests in action order.
+   Every hash uses unkeyed BLAKE2b-256. Use Orchard's RedPallas authorization primitive (`action.rk().verify(&sighash, sig)` and `bundle.binding_validating_key().verify(&sighash, binding_sig)`); do not invent a new signature scheme.
 2. Verify the bundle using `BundleVersion::orchard_v2()` and `OrchardCircuitVersion::FixedPostNu6_2`, including canonical proof size, canonical point/scalar encodings, non-identity/valid authorization-key checks required by the selected upstream consensus rules, and all Orchard V2 validation checks selected by this specification.
 3. Verify the anchor is an Orchard commitment-tree root recorded at the end of any ancestor block on the selected chain. Retain or deterministically reconstruct these roots, and roll them back during reorganisation.
 4. Reject every nullifier already used on the selected chain or earlier in the same block.

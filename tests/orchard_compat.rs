@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
-use blake2::{Blake2b512, Digest};
+use blake2::{Blake2b256, Digest};
 use nonempty::NonEmpty;
 use orchard::{
     builder::{Builder, BundleType},
@@ -239,6 +239,7 @@ pub enum BundleCodecError {
     TooManyActions,
     UnexpectedEof,
     TrailingBytes,
+    NonCanonicalCompactSize,
     InvalidFlags,
     InvalidAnchor,
     InvalidValueCommitment,
@@ -276,17 +277,23 @@ fn decode_compact_size(data: &mut &[u8]) -> Result<usize, BundleCodecError> {
             if data.len() < 2 {
                 return Err(BundleCodecError::UnexpectedEof);
             }
-            let val = u16::from_le_bytes([data[0], data[1]]) as usize;
+            let val = u16::from_le_bytes([data[0], data[1]]);
+            if val < 253 {
+                return Err(BundleCodecError::NonCanonicalCompactSize);
+            }
             *data = &data[2..];
-            Ok(val)
+            Ok(val as usize)
         }
         0xfe => {
             if data.len() < 4 {
                 return Err(BundleCodecError::UnexpectedEof);
             }
-            let val = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            let val = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            if val < 0x10000 {
+                return Err(BundleCodecError::NonCanonicalCompactSize);
+            }
             *data = &data[4..];
-            Ok(val)
+            usize::try_from(val).map_err(|_| BundleCodecError::NonCanonicalCompactSize)
         }
         0xff => {
             if data.len() < 8 {
@@ -294,20 +301,30 @@ fn decode_compact_size(data: &mut &[u8]) -> Result<usize, BundleCodecError> {
             }
             let val = u64::from_le_bytes([
                 data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-            ]) as usize;
+            ]);
+            if val < 0x1_0000_0000 {
+                return Err(BundleCodecError::NonCanonicalCompactSize);
+            }
             *data = &data[8..];
-            Ok(val)
+            usize::try_from(val).map_err(|_| BundleCodecError::NonCanonicalCompactSize)
         }
     }
 }
 
+/// Serializes an Orchard V2 bundle in official ZIP-225 Section 7 order:
+/// 1. actionCount: CompactSize
+/// 2. actions: [actionDescription; actionCount] (each: cv_net, nullifier, rk, cmx, epk, enc_ciphertext, out_ciphertext)
+/// 3. flags: 1 byte
+/// 4. valueBalanceOrchard: 8 bytes (i64 little-endian)
+/// 5. anchorOrchard: 32 bytes
+/// 6. sizeProofsOrchard: CompactSize
+/// 7. proofsOrchard: proof bytes
+/// 8. spendAuthSigsOrchard: [64 bytes; actionCount]
+/// 9. bindingSigOrchard: 64 bytes
 pub fn serialize_bundle(bundle: &Bundle<Authorized, i64>) -> Vec<u8> {
     let mut buf = Vec::new();
     let actions = bundle.actions();
     encode_compact_size(actions.len(), &mut buf);
-    buf.push(bundle.flag_byte());
-    buf.extend_from_slice(&bundle.value_balance().to_le_bytes());
-    buf.extend_from_slice(&bundle.anchor().to_bytes());
 
     for action in actions.iter() {
         buf.extend_from_slice(&action.cv_net().to_bytes());
@@ -318,6 +335,10 @@ pub fn serialize_bundle(bundle: &Bundle<Authorized, i64>) -> Vec<u8> {
         buf.extend_from_slice(&action.encrypted_note().enc_ciphertext.0);
         buf.extend_from_slice(&action.encrypted_note().out_ciphertext);
     }
+
+    buf.push(bundle.flag_byte());
+    buf.extend_from_slice(&bundle.value_balance().to_le_bytes());
+    buf.extend_from_slice(&bundle.anchor().to_bytes());
 
     let proof_bytes = bundle.authorization().proof().as_ref();
     encode_compact_size(proof_bytes.len(), &mut buf);
@@ -334,6 +355,7 @@ pub fn serialize_bundle(bundle: &Bundle<Authorized, i64>) -> Vec<u8> {
     buf
 }
 
+/// Deserializes an Orchard V2 bundle in official ZIP-225 Section 7 order.
 pub fn deserialize_bundle(mut data: &[u8]) -> Result<Bundle<Authorized, i64>, BundleCodecError> {
     let n_actions = decode_compact_size(&mut data)?;
     if n_actions == 0 {
@@ -342,25 +364,6 @@ pub fn deserialize_bundle(mut data: &[u8]) -> Result<Bundle<Authorized, i64>, Bu
     if n_actions > 50 {
         return Err(BundleCodecError::TooManyActions);
     }
-    if data.len() < 1 + 8 + 32 {
-        return Err(BundleCodecError::UnexpectedEof);
-    }
-    let flag_byte = data[0];
-    let flags = Flags::from_byte(flag_byte, BundleVersion::orchard_v2())
-        .ok_or(BundleCodecError::InvalidFlags)?;
-    data = &data[1..];
-
-    let mut vb_bytes = [0u8; 8];
-    vb_bytes.copy_from_slice(&data[..8]);
-    let value_balance = i64::from_le_bytes(vb_bytes);
-    data = &data[8..];
-
-    let mut anchor_bytes = [0u8; 32];
-    anchor_bytes.copy_from_slice(&data[..32]);
-    let anchor: Anchor = Anchor::from_bytes(anchor_bytes)
-        .into_option()
-        .ok_or(BundleCodecError::InvalidAnchor)?;
-    data = &data[32..];
 
     struct ActionDesc {
         cv_net: orchard::value::ValueCommitment,
@@ -429,6 +432,26 @@ pub fn deserialize_bundle(mut data: &[u8]) -> Result<Bundle<Authorized, i64>, Bu
         });
     }
 
+    if data.len() < 1 + 8 + 32 {
+        return Err(BundleCodecError::UnexpectedEof);
+    }
+    let flag_byte = data[0];
+    let flags = Flags::from_byte(flag_byte, BundleVersion::orchard_v2())
+        .ok_or(BundleCodecError::InvalidFlags)?;
+    data = &data[1..];
+
+    let mut vb_bytes = [0u8; 8];
+    vb_bytes.copy_from_slice(&data[..8]);
+    let value_balance = i64::from_le_bytes(vb_bytes);
+    data = &data[8..];
+
+    let mut anchor_bytes = [0u8; 32];
+    anchor_bytes.copy_from_slice(&data[..32]);
+    let anchor: Anchor = Anchor::from_bytes(anchor_bytes)
+        .into_option()
+        .ok_or(BundleCodecError::InvalidAnchor)?;
+    data = &data[32..];
+
     let proof_len = decode_compact_size(&mut data)?;
     if data.len() < proof_len {
         return Err(BundleCodecError::UnexpectedEof);
@@ -487,37 +510,55 @@ pub fn deserialize_bundle(mut data: &[u8]) -> Result<Bundle<Authorized, i64>, Bu
 }
 
 // ---------------------------------------------------------------------------
-// Transaction Authorization Digest (§7.3)
+// Transaction Authorization Digest & Action Effects (§7.3)
 // ---------------------------------------------------------------------------
 
+/// Computes the 32-byte action effect digest for an Orchard action:
+/// `BLAKE2b-256("OwnChain/ActionEffect/v1" || cv_net || nullifier || rk || cmx)`
+pub fn compute_action_effect(
+    cv_net: &[u8; 32],
+    nullifier: &[u8; 32],
+    rk: &[u8; 32],
+    cmx: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Blake2b256::new();
+    hasher.update(b"OwnChain/ActionEffect/v1");
+    hasher.update(cv_net);
+    hasher.update(nullifier);
+    hasher.update(rk);
+    hasher.update(cmx);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&hasher.finalize());
+    out
+}
+
 /// Computes the domain-separated authorization digest for an OwnChain transaction:
-/// `BLAKE2b-256("OwnChain/TxAuth/v1" || chain_id || tx_type || tx_version || payload_prefix || bundle_effects)`
+/// `BLAKE2b-256("OwnChain/TxAuth/v1" || chain_id || tx_type || tx_version || payload_prefix || bundle_flags || bundle_value_balance || bundle_anchor || repeated(action_effect_i))`
 #[allow(clippy::too_many_arguments)]
 pub fn compute_tx_auth_digest(
     chain_id: [u8; 32],
     tx_type: u8,
     tx_version: u16,
-    prefix_u64: u64,
+    payload_prefix: u64,
     bundle_flag_byte: u8,
     bundle_value_balance: i64,
     bundle_anchor: [u8; 32],
-    actions_effects: &[[u8; 32]],
+    action_effects: &[[u8; 32]],
 ) -> [u8; 32] {
-    let mut hasher = Blake2b512::new();
+    let mut hasher = Blake2b256::new();
     hasher.update(b"OwnChain/TxAuth/v1");
     hasher.update(chain_id);
     hasher.update([tx_type]);
     hasher.update(tx_version.to_le_bytes());
-    hasher.update(prefix_u64.to_le_bytes());
+    hasher.update(payload_prefix.to_le_bytes());
     hasher.update([bundle_flag_byte]);
     hasher.update(bundle_value_balance.to_le_bytes());
     hasher.update(bundle_anchor);
-    for effect in actions_effects {
+    for effect in action_effects {
         hasher.update(effect);
     }
-    let full = hasher.finalize();
     let mut out = [0u8; 32];
-    out.copy_from_slice(&full[..32]);
+    out.copy_from_slice(&hasher.finalize());
     out
 }
 
@@ -581,7 +622,13 @@ fn get_fixtures() -> &'static TestFixtures {
             .unwrap()
             .0;
 
-        let cb_action_cmx = cb_unauth.actions()[0].cmx().to_bytes();
+        let cb_act = &cb_unauth.actions()[0];
+        let cb_action_effect = compute_action_effect(
+            &cb_act.cv_net().to_bytes(),
+            &cb_act.nullifier().to_bytes(),
+            &<[u8; 32]>::from(cb_act.rk()),
+            &cb_act.cmx().to_bytes(),
+        );
         let cb_sighash = compute_tx_auth_digest(
             devnet_chain_id,
             0, // Coinbase
@@ -590,7 +637,7 @@ fn get_fixtures() -> &'static TestFixtures {
             cb_unauth.flag_byte(),
             *cb_unauth.value_balance(),
             cb_unauth.anchor().to_bytes(),
-            &[cb_action_cmx],
+            &[cb_action_effect],
         );
 
         let cb_proven = cb_unauth.create_proof(pk, &mut rng).unwrap();
@@ -626,7 +673,13 @@ fn get_fixtures() -> &'static TestFixtures {
             .unwrap();
 
         let (tx_unauth, _) = tx_builder.build::<i64>(&mut rng).unwrap().unwrap();
-        let tx_action_cmx = tx_unauth.actions()[0].cmx().to_bytes();
+        let tx_act = &tx_unauth.actions()[0];
+        let tx_action_effect = compute_action_effect(
+            &tx_act.cv_net().to_bytes(),
+            &tx_act.nullifier().to_bytes(),
+            &<[u8; 32]>::from(tx_act.rk()),
+            &tx_act.cmx().to_bytes(),
+        );
         let transfer_sighash = compute_tx_auth_digest(
             devnet_chain_id,
             1, // OrchardTransfer
@@ -635,7 +688,7 @@ fn get_fixtures() -> &'static TestFixtures {
             tx_unauth.flag_byte(),
             *tx_unauth.value_balance(),
             tx_unauth.anchor().to_bytes(),
-            &[tx_action_cmx],
+            &[tx_action_effect],
         );
 
         let tx_proven = tx_unauth.create_proof(pk, &mut rng).unwrap();
@@ -790,7 +843,7 @@ fn test_negative_tampered_proof_data() {
     let raw = serialize_bundle(&f.transfer_bundle);
 
     // Mutate one byte in the proof body
-    // In our serialization: 1 (action count) + 1 (flags) + 8 (val) + 32 (anchor) + actions (820) + 3 (compactSize 4992) = 865
+    // In ZIP-225 Section 7 order: 1 (action count) + 820 (actions) + 1 (flags) + 8 (value_balance) + 32 (anchor) + 3 (proof length compactSize) = 865
     let mut tampered = raw.clone();
     let proof_offset = 865;
     tampered[proof_offset + 10] ^= 0x55;
@@ -814,7 +867,7 @@ fn test_negative_non_canonical_proof_length() {
     let raw = serialize_bundle(&f.transfer_bundle);
 
     // Tamper proof length by appending 1 byte (4993 instead of 4992)
-    // Proof length CompactSize is at offset 1 + 1 + 8 + 32 + 820 = 862
+    // Proof length CompactSize is at offset 1 + 820 + 1 + 8 + 32 = 862
     let mut tampered = Vec::new();
     tampered.extend_from_slice(&raw[..862]);
     encode_compact_size(4993, &mut tampered);
@@ -869,34 +922,55 @@ fn test_negative_identity_and_invalid_authorization_keys() {
 #[test]
 fn test_negative_duplicate_nullifier_chain_state() {
     let f = get_fixtures();
-    let nf_bytes = f.transfer_bundle.actions()[0].nullifier().to_bytes();
+    let vk = get_verifying_key();
+    let bundle = &f.transfer_bundle;
+    let nf_bytes = bundle.actions()[0].nullifier().to_bytes();
 
-    // Isolated crate does NOT track chain nullifiers.
-    // Chain-state layer (OwnChain) tracks and rejects duplicate nullifiers.
-    let mut chain_seen_nullifiers: HashSet<[u8; 32]> = HashSet::new();
+    // 1. ISOLATED CRATE BEHAVIOR:
+    // The Orchard crate's cryptographic proof verifier is completely stateless.
+    // If presented with the same valid bundle twice, verify_proof succeeds both times.
+    assert!(bundle.verify_proof(vk).is_ok());
+    assert!(bundle.verify_proof(vk).is_ok());
+
+    // 2. CHAIN-STATE RULE (HARNESS SIMULATION):
+    // NOTE (M1-D gate boundary): This is a harness-level policy simulation.
+    // Actual production nullifier set tracking and persistence in ChainState is deferred to M1-E.
+    let mut simulated_seen_nullifiers: HashSet<[u8; 32]> = HashSet::new();
 
     // First block inclusion succeeds
-    assert!(chain_seen_nullifiers.insert(nf_bytes));
+    assert!(simulated_seen_nullifiers.insert(nf_bytes));
 
     // Attempting to include the same nullifier again MUST be rejected by chain-state rule
-    let is_duplicate = !chain_seen_nullifiers.insert(nf_bytes);
-    assert!(is_duplicate, "Chain state must reject duplicate nullifier");
+    let is_duplicate = !simulated_seen_nullifiers.insert(nf_bytes);
+    assert!(
+        is_duplicate,
+        "Chain-state policy must reject duplicate nullifier"
+    );
 }
 
 #[test]
 fn test_negative_unknown_historical_anchor() {
     let f = get_fixtures();
-    let valid_anchor_bytes = f.transfer_bundle.anchor().to_bytes();
+    let vk = get_verifying_key();
+    let bundle = &f.transfer_bundle;
+    let valid_anchor_bytes = bundle.anchor().to_bytes();
 
-    // Chain-state tracker has known valid historical block anchors
-    let mut chain_historical_anchors: HashSet<[u8; 32]> = HashSet::new();
-    chain_historical_anchors.insert(valid_anchor_bytes);
+    // 1. ISOLATED CRATE BEHAVIOR:
+    // The Orchard proof verifier only verifies consistency against the anchor in the bundle.
+    // It does NOT know which block headers have occurred on the blockchain.
+    assert!(bundle.verify_proof(vk).is_ok());
 
-    // Unknown anchor
+    // 2. CHAIN-STATE RULE (HARNESS SIMULATION):
+    // NOTE (M1-D gate boundary): This is a harness-level policy simulation.
+    // Actual production commitment tree root tracking and ancestor anchor checks in ChainState are deferred to M1-E.
+    let mut simulated_historical_anchors: HashSet<[u8; 32]> = HashSet::new();
+    simulated_historical_anchors.insert(valid_anchor_bytes);
+
+    // Stale or unknown anchor (such as empty tree root for a spend)
     let unknown_anchor_bytes = Anchor::empty_tree().to_bytes();
     assert!(
-        !chain_historical_anchors.contains(&unknown_anchor_bytes),
-        "Chain state must reject unknown / non-historical anchor"
+        !simulated_historical_anchors.contains(&unknown_anchor_bytes),
+        "Chain-state policy must reject unknown / non-historical anchor"
     );
 }
 
@@ -909,6 +983,13 @@ fn test_negative_cross_chain_replay_rejected() {
     // Transaction was authorized on devnet
     assert_ne!(f.devnet_chain_id, f.testnet_chain_id);
 
+    let action_effect = compute_action_effect(
+        &action.cv_net().to_bytes(),
+        &action.nullifier().to_bytes(),
+        &<[u8; 32]>::from(action.rk()),
+        &action.cmx().to_bytes(),
+    );
+
     // Compute sighash under testnet chain ID
     let testnet_sighash = compute_tx_auth_digest(
         f.testnet_chain_id,
@@ -918,7 +999,7 @@ fn test_negative_cross_chain_replay_rejected() {
         bundle.flag_byte(),
         *bundle.value_balance(),
         bundle.anchor().to_bytes(),
-        &[action.cmx().to_bytes()],
+        &[action_effect],
     );
     assert_ne!(f.transfer_sighash, testnet_sighash);
 
@@ -1023,4 +1104,429 @@ fn test_fee_and_pool_balance_convention() {
         invalid_pool < 0,
         "Negative pool balance must be rejected by consensus"
     );
+}
+
+// ---------------------------------------------------------------------------
+// M1-D.1 — Corrected Wire Encoding, Offsets, CompactSize & Digest Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_zip225_field_order_and_byte_offsets() {
+    let f = get_fixtures();
+    let bundle = &f.transfer_bundle;
+    let bytes = serialize_bundle(bundle);
+
+    // For 1 action: 1 + 820 + 1 + 8 + 32 + 3 + 4992 + 64 + 64 = 5985 bytes
+    assert_eq!(bytes.len(), 5985);
+
+    // 1. Action count as canonical CompactSize (offset 0..1)
+    assert_eq!(bytes[0], 0x01);
+
+    // 2. Action descriptions immediately follow action count (offset 1..821)
+    let act = &bundle.actions()[0];
+    assert_eq!(&bytes[1..33], &act.cv_net().to_bytes());
+    assert_eq!(&bytes[33..65], &act.nullifier().to_bytes());
+    assert_eq!(&bytes[65..97], &<[u8; 32]>::from(act.rk()));
+    assert_eq!(&bytes[97..129], &act.cmx().to_bytes());
+    assert_eq!(&bytes[129..161], &act.encrypted_note().epk_bytes);
+    assert_eq!(&bytes[161..741], &act.encrypted_note().enc_ciphertext.0);
+    assert_eq!(&bytes[741..821], &act.encrypted_note().out_ciphertext);
+
+    // 3. Flags byte (offset 821)
+    assert_eq!(bytes[821], bundle.flag_byte());
+    assert_eq!(bytes[821], 0x03);
+
+    // 4. valueBalanceOrchard (offset 822..830)
+    assert_eq!(&bytes[822..830], &bundle.value_balance().to_le_bytes());
+    let vb = i64::from_le_bytes(bytes[822..830].try_into().unwrap());
+    assert_eq!(vb, 5_000i64);
+
+    // 5. Anchor (offset 830..862)
+    assert_eq!(&bytes[830..862], &bundle.anchor().to_bytes());
+
+    // 6. sizeProofsOrchard CompactSize (offset 862..865)
+    // 4992 = 0x1380, canonically encoded as [0xfd, 0x80, 0x13]
+    assert_eq!(&bytes[862..865], &[0xfd, 0x80, 0x13]);
+
+    // 7. proofsOrchard (offset 865..5857)
+    assert_eq!(&bytes[865..5857], bundle.authorization().proof().as_ref());
+
+    // 8. spendAuthSigsOrchard (offset 5857..5921)
+    assert_eq!(&bytes[5857..5921], &<[u8; 64]>::from(act.authorization()));
+
+    // 9. bindingSigOrchard (offset 5921..5985)
+    assert_eq!(
+        &bytes[5921..5985],
+        &<[u8; 64]>::from(bundle.authorization().binding_signature())
+    );
+
+    // Deterministic layout verification:
+    // If fields are swapped (e.g. putting flags/vb/anchor before action descriptions),
+    // deserialization MUST fail.
+    let mut permuted_order = Vec::new();
+    permuted_order.push(0x01); // action count
+    permuted_order.push(bytes[821]); // flags placed prematurely
+    permuted_order.extend_from_slice(&bytes[822..830]); // vb
+    permuted_order.extend_from_slice(&bytes[830..862]); // anchor
+    permuted_order.extend_from_slice(&bytes[1..821]); // actions
+    permuted_order.extend_from_slice(&bytes[862..]); // proof and sigs
+    assert!(deserialize_bundle(&permuted_order).is_err());
+}
+
+#[test]
+fn test_compact_size_rejections() {
+    let f = get_fixtures();
+    let raw = serialize_bundle(&f.transfer_bundle);
+
+    // 1. Non-minimal 3-byte encoding of value < 253 (e.g. 1 encoded as [0xfd, 0x01, 0x00])
+    let mut non_minimal_action_count = Vec::new();
+    non_minimal_action_count.extend_from_slice(&[0xfd, 0x01, 0x00]);
+    non_minimal_action_count.extend_from_slice(&raw[1..]);
+    assert_eq!(
+        deserialize_bundle(&non_minimal_action_count).unwrap_err(),
+        BundleCodecError::NonCanonicalCompactSize
+    );
+
+    // Non-minimal 3-byte encoding of 252: [0xfd, 0xfc, 0x00]
+    let mut mut_slice = &[0xfd, 0xfc, 0x00][..];
+    assert_eq!(
+        decode_compact_size(&mut mut_slice).unwrap_err(),
+        BundleCodecError::NonCanonicalCompactSize
+    );
+
+    // Minimal 3-byte encoding of 253: [0xfd, 0xfd, 0x00] is valid
+    let mut valid_253 = &[0xfd, 0xfd, 0x00][..];
+    assert_eq!(decode_compact_size(&mut valid_253).unwrap(), 253);
+
+    // Non-minimal 5-byte encoding of value <= 0xffff: [0xfe, 0xff, 0xff, 0x00, 0x00]
+    let mut non_min_fe = &[0xfe, 0xff, 0xff, 0x00, 0x00][..];
+    assert_eq!(
+        decode_compact_size(&mut non_min_fe).unwrap_err(),
+        BundleCodecError::NonCanonicalCompactSize
+    );
+
+    // Minimal 5-byte encoding of 0x10000: [0xfe, 0x00, 0x00, 0x01, 0x00] is valid
+    let mut valid_65536 = &[0xfe, 0x00, 0x00, 0x01, 0x00][..];
+    assert_eq!(decode_compact_size(&mut valid_65536).unwrap(), 65536);
+
+    // Non-minimal 9-byte encoding of value <= 0xffffffff: [0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00]
+    let mut non_min_ff = &[0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00][..];
+    assert_eq!(
+        decode_compact_size(&mut non_min_ff).unwrap_err(),
+        BundleCodecError::NonCanonicalCompactSize
+    );
+
+    // 2. Non-canonical proof-length encoding:
+    // The proof is 4992 bytes (0x1380). Canonical encoding is [0xfd, 0x80, 0x13].
+    // If encoded with 5-byte prefix 0xfe: [0xfe, 0x80, 0x13, 0x00, 0x00]
+    let mut non_min_proof_len = Vec::new();
+    non_min_proof_len.extend_from_slice(&raw[..862]);
+    non_min_proof_len.extend_from_slice(&[0xfe, 0x80, 0x13, 0x00, 0x00]);
+    non_min_proof_len.extend_from_slice(&raw[865..]);
+    assert_eq!(
+        deserialize_bundle(&non_min_proof_len).unwrap_err(),
+        BundleCodecError::NonCanonicalCompactSize
+    );
+
+    // 3. Truncated CompactSize encodings
+    let mut trunc_fd = &[0xfd, 0x01][..]; // needs 2 bytes
+    assert_eq!(
+        decode_compact_size(&mut trunc_fd).unwrap_err(),
+        BundleCodecError::UnexpectedEof
+    );
+    let mut trunc_fe = &[0xfe, 0x01, 0x02][..]; // needs 4 bytes
+    assert_eq!(
+        decode_compact_size(&mut trunc_fe).unwrap_err(),
+        BundleCodecError::UnexpectedEof
+    );
+    let mut trunc_ff = &[0xff, 0x01, 0x02, 0x03][..]; // needs 8 bytes
+    assert_eq!(
+        decode_compact_size(&mut trunc_ff).unwrap_err(),
+        BundleCodecError::UnexpectedEof
+    );
+
+    // 4. Truncated bundle
+    assert_eq!(
+        deserialize_bundle(&raw[..raw.len() - 10]).unwrap_err(),
+        BundleCodecError::UnexpectedEof
+    );
+
+    // 5. Trailing bytes
+    let mut trailing = raw.clone();
+    trailing.push(0xee);
+    assert_eq!(
+        deserialize_bundle(&trailing).unwrap_err(),
+        BundleCodecError::TrailingBytes
+    );
+}
+
+#[test]
+fn test_authorization_digest_mutations_and_invalidation() {
+    let f = get_fixtures();
+    let bundle = &f.transfer_bundle;
+    let action = &bundle.actions()[0];
+
+    let action_effect = compute_action_effect(
+        &action.cv_net().to_bytes(),
+        &action.nullifier().to_bytes(),
+        &<[u8; 32]>::from(action.rk()),
+        &action.cmx().to_bytes(),
+    );
+
+    let baseline_sighash = compute_tx_auth_digest(
+        f.devnet_chain_id,
+        1,     // OrchardTransfer
+        1,     // tx_version
+        5_000, // fee_atoms
+        bundle.flag_byte(),
+        *bundle.value_balance(),
+        bundle.anchor().to_bytes(),
+        &[action_effect],
+    );
+
+    assert_eq!(baseline_sighash, f.transfer_sighash);
+    // Baseline verifies successfully
+    assert!(action
+        .rk()
+        .verify(&baseline_sighash, action.authorization())
+        .is_ok());
+    assert!(bundle
+        .binding_validating_key()
+        .verify(
+            &baseline_sighash,
+            bundle.authorization().binding_signature()
+        )
+        .is_ok());
+
+    // 1. Mutate chain_id
+    let mut mut_chain_id = f.devnet_chain_id;
+    mut_chain_id[0] ^= 0x01;
+    let sig_mut_chain = compute_tx_auth_digest(
+        mut_chain_id,
+        1,
+        1,
+        5_000,
+        bundle.flag_byte(),
+        *bundle.value_balance(),
+        bundle.anchor().to_bytes(),
+        &[action_effect],
+    );
+    assert_ne!(baseline_sighash, sig_mut_chain);
+    assert!(action
+        .rk()
+        .verify(&sig_mut_chain, action.authorization())
+        .is_err());
+    assert!(bundle
+        .binding_validating_key()
+        .verify(&sig_mut_chain, bundle.authorization().binding_signature())
+        .is_err());
+
+    // 2. Mutate tx_type (e.g. 0 Coinbase instead of 1 OrchardTransfer)
+    let sig_mut_type = compute_tx_auth_digest(
+        f.devnet_chain_id,
+        0,
+        1,
+        5_000,
+        bundle.flag_byte(),
+        *bundle.value_balance(),
+        bundle.anchor().to_bytes(),
+        &[action_effect],
+    );
+    assert_ne!(baseline_sighash, sig_mut_type);
+    assert!(action
+        .rk()
+        .verify(&sig_mut_type, action.authorization())
+        .is_err());
+
+    // 3. Mutate tx_version (e.g. 2 instead of 1)
+    let sig_mut_ver = compute_tx_auth_digest(
+        f.devnet_chain_id,
+        1,
+        2,
+        5_000,
+        bundle.flag_byte(),
+        *bundle.value_balance(),
+        bundle.anchor().to_bytes(),
+        &[action_effect],
+    );
+    assert_ne!(baseline_sighash, sig_mut_ver);
+    assert!(action
+        .rk()
+        .verify(&sig_mut_ver, action.authorization())
+        .is_err());
+
+    // 4. Mutate payload_prefix (fee 5_001 instead of 5_000)
+    let sig_mut_prefix = compute_tx_auth_digest(
+        f.devnet_chain_id,
+        1,
+        1,
+        5_001,
+        bundle.flag_byte(),
+        *bundle.value_balance(),
+        bundle.anchor().to_bytes(),
+        &[action_effect],
+    );
+    assert_ne!(baseline_sighash, sig_mut_prefix);
+    assert!(action
+        .rk()
+        .verify(&sig_mut_prefix, action.authorization())
+        .is_err());
+
+    // 5. Mutate bundle_flag_byte (0x02 instead of 0x03)
+    let sig_mut_flags = compute_tx_auth_digest(
+        f.devnet_chain_id,
+        1,
+        1,
+        5_000,
+        0x02,
+        *bundle.value_balance(),
+        bundle.anchor().to_bytes(),
+        &[action_effect],
+    );
+    assert_ne!(baseline_sighash, sig_mut_flags);
+    assert!(action
+        .rk()
+        .verify(&sig_mut_flags, action.authorization())
+        .is_err());
+
+    // 6. Mutate bundle_value_balance (4_999 instead of 5_000)
+    let sig_mut_vb = compute_tx_auth_digest(
+        f.devnet_chain_id,
+        1,
+        1,
+        5_000,
+        bundle.flag_byte(),
+        4_999,
+        bundle.anchor().to_bytes(),
+        &[action_effect],
+    );
+    assert_ne!(baseline_sighash, sig_mut_vb);
+    assert!(action
+        .rk()
+        .verify(&sig_mut_vb, action.authorization())
+        .is_err());
+
+    // 7. Mutate bundle_anchor
+    let mut mut_anchor = bundle.anchor().to_bytes();
+    mut_anchor[0] ^= 0x01;
+    let sig_mut_anchor = compute_tx_auth_digest(
+        f.devnet_chain_id,
+        1,
+        1,
+        5_000,
+        bundle.flag_byte(),
+        *bundle.value_balance(),
+        mut_anchor,
+        &[action_effect],
+    );
+    assert_ne!(baseline_sighash, sig_mut_anchor);
+    assert!(action
+        .rk()
+        .verify(&sig_mut_anchor, action.authorization())
+        .is_err());
+
+    // 8. Mutate committed action-effect fields individually:
+    // 8a. Mutate cv_net
+    let mut mut_cv = action.cv_net().to_bytes();
+    mut_cv[0] ^= 0xff;
+    let effect_mut_cv = compute_action_effect(
+        &mut_cv,
+        &action.nullifier().to_bytes(),
+        &<[u8; 32]>::from(action.rk()),
+        &action.cmx().to_bytes(),
+    );
+    assert_ne!(action_effect, effect_mut_cv);
+    let sig_mut_cv = compute_tx_auth_digest(
+        f.devnet_chain_id,
+        1,
+        1,
+        5_000,
+        bundle.flag_byte(),
+        *bundle.value_balance(),
+        bundle.anchor().to_bytes(),
+        &[effect_mut_cv],
+    );
+    assert_ne!(baseline_sighash, sig_mut_cv);
+    assert!(action
+        .rk()
+        .verify(&sig_mut_cv, action.authorization())
+        .is_err());
+
+    // 8b. Mutate nullifier
+    let mut mut_nf = action.nullifier().to_bytes();
+    mut_nf[0] ^= 0xff;
+    let effect_mut_nf = compute_action_effect(
+        &action.cv_net().to_bytes(),
+        &mut_nf,
+        &<[u8; 32]>::from(action.rk()),
+        &action.cmx().to_bytes(),
+    );
+    assert_ne!(action_effect, effect_mut_nf);
+    let sig_mut_nf = compute_tx_auth_digest(
+        f.devnet_chain_id,
+        1,
+        1,
+        5_000,
+        bundle.flag_byte(),
+        *bundle.value_balance(),
+        bundle.anchor().to_bytes(),
+        &[effect_mut_nf],
+    );
+    assert_ne!(baseline_sighash, sig_mut_nf);
+    assert!(action
+        .rk()
+        .verify(&sig_mut_nf, action.authorization())
+        .is_err());
+
+    // 8c. Mutate rk
+    let mut mut_rk = <[u8; 32]>::from(action.rk());
+    mut_rk[0] ^= 0xff;
+    let effect_mut_rk = compute_action_effect(
+        &action.cv_net().to_bytes(),
+        &action.nullifier().to_bytes(),
+        &mut_rk,
+        &action.cmx().to_bytes(),
+    );
+    assert_ne!(action_effect, effect_mut_rk);
+    let sig_mut_rk = compute_tx_auth_digest(
+        f.devnet_chain_id,
+        1,
+        1,
+        5_000,
+        bundle.flag_byte(),
+        *bundle.value_balance(),
+        bundle.anchor().to_bytes(),
+        &[effect_mut_rk],
+    );
+    assert_ne!(baseline_sighash, sig_mut_rk);
+    assert!(action
+        .rk()
+        .verify(&sig_mut_rk, action.authorization())
+        .is_err());
+
+    // 8d. Mutate cmx
+    let mut mut_cmx = action.cmx().to_bytes();
+    mut_cmx[0] ^= 0xff;
+    let effect_mut_cmx = compute_action_effect(
+        &action.cv_net().to_bytes(),
+        &action.nullifier().to_bytes(),
+        &<[u8; 32]>::from(action.rk()),
+        &mut_cmx,
+    );
+    assert_ne!(action_effect, effect_mut_cmx);
+    let sig_mut_cmx = compute_tx_auth_digest(
+        f.devnet_chain_id,
+        1,
+        1,
+        5_000,
+        bundle.flag_byte(),
+        *bundle.value_balance(),
+        bundle.anchor().to_bytes(),
+        &[effect_mut_cmx],
+    );
+    assert_ne!(baseline_sighash, sig_mut_cmx);
+    assert!(action
+        .rk()
+        .verify(&sig_mut_cmx, action.authorization())
+        .is_err());
 }

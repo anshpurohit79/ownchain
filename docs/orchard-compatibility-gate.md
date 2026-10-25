@@ -1,7 +1,7 @@
-# OwnChain Milestone M1-D — Orchard V2 Compatibility Gate Report
+# OwnChain Milestone M1-D — Orchard V2 Compatibility Gate Report (with M1-D.1 Corrections)
 
-**Date:** 2026-10-25  
-**Baseline Commit:** `e6fd1a61f7d0742ebaa816d78e37b227c3744078`  
+**Date:** 2026-10-25
+**Baseline Commit:** `032b283c1df5b4dd2483e8b8904a231984104245` (M1-D baseline)
 **Crate:** `orchard = 0.16.0` (pinned in `Cargo.lock`)  
 **Status:** **PASS**
 
@@ -9,11 +9,18 @@
 
 ## 1. Executive Summary
 
-Milestone M1-D proves that the pinned `orchard = 0.16.0` crate successfully satisfies all shielded payment cryptography requirements specified in `docs/protocol-v1.md` (§§3, 5, 6.3, 7, and 12).
+Milestone M1-D (with M1-D.1 corrections) proves that the pinned `orchard = 0.16.0` crate successfully satisfies all shielded payment cryptography requirements specified in `docs/protocol-v1.md` (§§3, 5, 6.3, 7, and 12).
 
-An isolated, reproducible compatibility harness was implemented in `tests/orchard_compat.rs`. It generates real zero-knowledge proofs using the corrected `OrchardCircuitVersion::FixedPostNu6_2` circuit, applies RedPallas spend and binding authorizations bound to OwnChain's domain-separated authorization digest (`OwnChain/TxAuth/v1`), serializes bundles canonically according to ZIP-225, recovers coinbase notes under the protocol-mandated all-zero outgoing viewing key (OVK), enforces the specified value-balance sign convention, and rigorously tests negative conditions across both bundle-level and chain-state validation boundaries.
+An isolated, reproducible compatibility harness in `tests/orchard_compat.rs` demonstrates:
+- Correct zero-knowledge proof generation and verification using `OrchardCircuitVersion::FixedPostNu6_2`.
+- Canonical wire encoding and decoding in strict compliance with official ZIP-225 Section 7 component order.
+- Canonical CompactSize decoding rejecting non-minimal representations, truncation, and trailing data.
+- Domain-separated transaction authorization digest using unkeyed BLAKE2b-256 (`OwnChain/TxAuth/v1`) binding active `chain_id` and all consensus-relevant effects, including structured action effect digests (`OwnChain/ActionEffect/v1`).
+- Consensus-recoverable output-only shielded coinbase notes under an all-zero outgoing viewing key (OVK).
+- Value-balance sign conventions (`valueBalanceOrchard = +fee_atoms` for transfer, `-payout_atoms` for coinbase) and ZIP-209 pool balance accounting.
+- Precise separation between crate-level cryptographic verifications, harness-only policy simulations, and future production `ChainState` consensus integration.
 
-No mocks or dummy proofs were used. All 10 isolated compatibility tests pass in ~33 seconds alongside the full existing consensus test suite (141 total tests passing).
+No mocks or dummy proofs were used. All 13 compatibility tests pass in ~34 seconds alongside the full existing consensus test suite (144 total tests passing).
 
 ---
 
@@ -72,7 +79,6 @@ The following public APIs from `orchard = 0.16.0` were verified and integrated:
       signing_keys: &[SpendAuthorizingKey],
   ) -> Result<Bundle<Authorized, V>, SignatureError>
   ```
-  *Note:* `sighash: [u8; 32]` is fully caller-provided, allowing OwnChain's domain-separated digest to be bound without forcing Zcash transaction envelopes.
 
 ### 2.4 Wire Deserialization & Canonical Parts
 - **Action Construction:**
@@ -105,7 +111,7 @@ The following public APIs from `orchard = 0.16.0` were verified and integrated:
 ## 3. Valid Bundles & Coinbase Construction
 
 ### 3.1 Shielded Transfer Bundle (Spend & Output)
-1. **Anchor:** Set to an existing root from the Orchard commitment tree (e.g. tree containing the note being spent).
+1. **Anchor:** Set to an existing root from the Orchard commitment tree.
 2. **Spend:** Spends a previous note using `SpendInfo::new(fvk, note, merkle_path)`.
 3. **Output:** Sends `(note_value - fee)` to recipient address `recipient_addr` with user's OVK.
 4. **Value Balance:** `+5_000` atoms (the public transaction fee).
@@ -125,9 +131,9 @@ The following public APIs from `orchard = 0.16.0` were verified and integrated:
 2. **No Padding:** The builder produces **exactly 1 action** for a single coinbase output without requiring dummy spends or padding actions.
 3. **Reward Output:** 10 OWN (`1_000_000_000` atoms) sent to the miner's shielded address.
 4. **All-Zero Outgoing Viewing Key:**
-   The output is constructed using `ovk = Some(OutgoingViewingKey::from([0u8; 32]))`.
+   Constructed using `ovk = Some(OutgoingViewingKey::from([0u8; 32]))`.
 5. **Consensus Note & Value Recovery:**
-   Any verifying node recovers the coinbase note plaintext and validates the exact payout amount and recipient using the public all-zero OVK:
+   Verifying nodes recover the coinbase note plaintext and validate the payout amount and recipient using the public all-zero OVK:
    ```rust
    let zero_ovk = OutgoingViewingKey::from([0u8; 32]);
    let (recovered_note, recovered_addr, recovered_memo) = bundle
@@ -135,141 +141,159 @@ The following public APIs from `orchard = 0.16.0` were verified and integrated:
        .expect("Recover output 0 under zero OVK");
    assert_eq!(recovered_note.value().inner(), 1_000_000_000);
    ```
-6. **Dummy Nullifier Handling:**
-   For output-only actions with `Flags::SPENDS_DISABLED`, the nullifier in the action is derived by the circuit over a dummy note commitment. The isolated proof verifier checks this, and the node's nullifier set records and guards against duplicate nullifiers across blocks.
+6. **Stateless Verification vs Chain-State Nullifier Tracking:**
+   For output-only actions with `Flags::SPENDS_DISABLED`, the action nullifier is derived by the circuit over a dummy note commitment. The isolated proof verifier validates the circuit proof. Tracking and duplicate rejection across blocks is the responsibility of the node's `ChainState` (deferred to M1-E).
 
 ---
 
-## 4. Canonical Wire Serialization & Roundtrip (ZIP-225 Section 7)
+## 4. Corrected ZIP-225 Section 7 Wire Encoding & Evidence
 
-OwnChain transactions serialize the Orchard V2 bundle payload canonically following ZIP-225 Section 7 rules:
+The wire encoding follows the official ZIP-225 Section 7 Orchard component order:
 
 ```
-[n_actions: CompactSize]
-[flags: 1 byte]             (0x02 for Coinbase, 0x03 for Transfer)
-[value_balance: 8 bytes]    (i64 little-endian)
-[anchor: 32 bytes]
-repeated n_actions times:
-    [cv_net: 32 bytes]
-    [nullifier: 32 bytes]
-    [rk: 32 bytes]
-    [cmx: 32 bytes]
-    [epk: 32 bytes]
-    [enc_ciphertext: 580 bytes]
-    [out_ciphertext: 80 bytes]
-[proof_len: CompactSize]
-[proof_bytes: proof_len bytes]   (2720 + 2272 * n_actions for FixedPostNu6_2)
-repeated n_actions times:
-    [spend_auth_sig: 64 bytes]
-[binding_sig: 64 bytes]
+1. actionCount: CompactSize
+2. actions: [actionDescription; actionCount]
+   Each actionDescription (820 bytes):
+     - cv_net: 32 bytes
+     - nullifier: 32 bytes
+     - rk: 32 bytes
+     - cmx: 32 bytes
+     - epk: 32 bytes
+     - enc_ciphertext: 580 bytes
+     - out_ciphertext: 80 bytes
+3. flagsOrchard: 1 byte (0x02 for Coinbase, 0x03 for Transfer)
+4. valueBalanceOrchard: 8 bytes (i64 little-endian)
+5. anchorOrchard: 32 bytes
+6. sizeProofsOrchard: CompactSize
+7. proofsOrchard: proof bytes (2720 + 2272 * n_actions for FixedPostNu6_2)
+8. spendAuthSigsOrchard: [64 bytes; actionCount]
+9. bindingSigOrchard: 64 bytes
 ```
 
-### Roundtrip Fidelity
-`tests/orchard_compat.rs` implements `serialize_bundle` and `deserialize_bundle`. The test `test_valid_orchard_v2_transfer` verifies that:
-- Serialized byte length matches canonical calculations (`1 + 1 + 8 + 32 + 820 + 3 + 4992 + 64 + 64 = 5985` bytes for 1 action).
-- Deserialization restores exact fields: `flags`, `value_balance`, `anchor`, `actions()`, `proof()`, `binding_signature()`.
-- Proof verification and batch validation succeed identically on the reconstructed bundle.
+### 4.1 Independent Layout & Offset Evidence (`test_zip225_field_order_and_byte_offsets`)
+For a 1-action bundle (total length 5,985 bytes), the harness independently asserts every byte range against the model:
+- `bytes[0]`: `actionCount` = `0x01`
+- `bytes[1..821]`: Action description (820 bytes: cv_net, nullifier, rk, cmx, epk, enc_ciphertext, out_ciphertext)
+- `bytes[821]`: `flags` = `0x03`
+- `bytes[822..830]`: `valueBalanceOrchard` = `5_000i64` (little-endian)
+- `bytes[830..862]`: `anchor` = 32-byte tree root
+- `bytes[862..865]`: `sizeProofsOrchard` = `[0xfd, 0x80, 0x13]` (CompactSize for 4,992)
+- `bytes[865..5857]`: `proofsOrchard` = 4,992 Halo2 proof bytes
+- `bytes[5857..5921]`: `spendAuthSigsOrchard` = 64-byte RedPallas signature
+- `bytes[5921..5985]`: `bindingSigOrchard` = 64-byte RedPallas binding signature
+
+A negative permutation test deliberately swaps the field order (e.g. placing flags/value_balance/anchor before action descriptions); `deserialize_bundle` rejects the permuted stream.
+
+### 4.2 Strict CompactSize Canonical Validation (`test_compact_size_rejections`)
+The decoder enforces Bitcoin/Zcash canonical CompactSize rules:
+- Non-minimal representations rejected with `BundleCodecError::NonCanonicalCompactSize`:
+  - `[0xfd, 0x01, 0x00]` (value $1 < 253$ in 3 bytes)
+  - `[0xfd, 0xfc, 0x00]` (value $252 < 253$ in 3 bytes)
+  - `[0xfe, 0xff, 0xff, 0x00, 0x00]` (value $\le 0\text{xFFFF}$ in 5 bytes)
+  - `[0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00]` (value $\le 0\text{xFFFFFFFF}$ in 9 bytes)
+  - Non-minimal proof length (4,992 encoded with `0xfe` prefix)
+- Truncated prefixes and values rejected with `BundleCodecError::UnexpectedEof`.
+- Trailing bytes rejected with `BundleCodecError::TrailingBytes`.
 
 ---
 
 ## 5. Domain-Separated Transaction Authorization Digest (§7.3)
 
-OwnChain binds spend authorization signatures and binding signatures to the transaction context via BLAKE2b-256 with the domain separator `OwnChain/TxAuth/v1`:
+The transaction authorization digest uses unkeyed BLAKE2b-256 (consistent with `src/hash.rs`) and binds the transaction to the active chain ID and all consensus-relevant effects:
 
-```rust
-sighash = BLAKE2b-256(
-    "OwnChain/TxAuth/v1" ||
-    chain_id             || // 32 bytes
-    tx_type              || // 1 byte (0=Coinbase, 1=Transfer)
-    tx_version           || // 2 bytes le (1)
-    payload_prefix       || // 8 bytes le (height for Coinbase, fee_atoms for Transfer)
-    bundle_flag_byte     || // 1 byte
-    bundle_value_balance || // 8 bytes le
-    bundle_anchor        || // 32 bytes
-    actions_effects         // 32 * n_actions bytes: BLAKE2b-256("OwnChain/ActionEffect/v1" || cv_net || nf || rk || cmx)
-)
-```
+### 5.1 Action Effect Digest
+For each action $i \in [0, n\_actions-1]$:
+$$\text{action\_effect}_i = \text{BLAKE2b-256}(\text{UTF8("OwnChain/ActionEffect/v1")} \parallel cv\_net_i \parallel nullifier_i \parallel rk_i \parallel cmx_i)$$
+Input: $22 + 32 + 32 + 32 + 32 = 150$ bytes. Output: 32 bytes.
 
-Both `action.rk().verify(&sighash, sig)` and `bvk.verify(&sighash, binding_sig)` enforce this digest.
+### 5.2 Transaction Authorization Digest (`sighash`)
+$$\text{sighash} = \text{BLAKE2b-256}(\text{UTF8("OwnChain/TxAuth/v1")} \parallel chain\_id \parallel tx\_type \parallel tx\_version \parallel payload\_prefix \parallel flags \parallel value\_balance \parallel anchor \parallel \text{action\_effect}_0 \parallel \dots \parallel \text{action\_effect}_{n-1})$$
+Where:
+- `chain_id`: 32 bytes (active network ID)
+- `tx_type`: 1 byte (`0` for Coinbase, `1` for OrchardTransfer)
+- `tx_version`: 2 bytes unsigned little-endian (`1`)
+- `payload_prefix`: 8 bytes unsigned little-endian (`height` for Coinbase, `fee_atoms` for OrchardTransfer)
+- `flags`: 1 byte Orchard flags
+- `value_balance`: 8 bytes signed little-endian `valueBalanceOrchard` (`i64_le`)
+- `anchor`: 32 bytes Orchard tree anchor
+- `action_effect_i`: 32 bytes per action in action order
+
+### 5.3 Comprehensive Mutation Testing (`test_authorization_digest_mutations_and_invalidation`)
+The test suite systematically proves that mutating any committed field produces a distinct `sighash` and cryptographically invalidates existing authorizations:
+1. Mutating `chain_id` $\to$ digest changes, spend auth and binding verification fail.
+2. Mutating `tx_type` $\to$ digest changes, authorization invalid.
+3. Mutating `tx_version` $\to$ digest changes, authorization invalid.
+4. Mutating `payload_prefix` (`fee_atoms`) $\to$ digest changes, authorization invalid.
+5. Mutating `flags` $\to$ digest changes, authorization invalid.
+6. Mutating `value_balance` $\to$ digest changes, authorization invalid.
+7. Mutating `anchor` $\to$ digest changes, authorization invalid.
+8. Mutating individual action-effect fields:
+   - Mutating `cv_net` $\to$ action effect changes, digest changes, authorization invalid.
+   - Mutating `nullifier` $\to$ action effect changes, digest changes, authorization invalid.
+   - Mutating `rk` $\to$ action effect changes, digest changes, authorization invalid.
+   - Mutating `cmx` $\to$ action effect changes, digest changes, authorization invalid.
 
 ---
 
 ## 6. Negative Test Results & Layer Attribution
 
-The harness systematically mutated valid fixtures to verify rejection across both validation layers:
+The test suite rigorously classifies checks into their appropriate enforcement layer:
 
-| Condition | Observed Result | Enforcing Layer | Rationale |
+| Test Condition | Observed Result | Enforcing Layer | Scope & Limitations |
 |---|---|---|---|
-| **Altered / Corrupted Proof Data** | `bundle.verify_proof()` fails (`VerificationError`); `BatchValidator::validate()` returns `false` | **Orchard Crate (Circuit/Proof)** | Cryptographic proof invalidity is caught by Halo2 proof verification. |
-| **Non-Canonical Proof Length** | `Bundle::try_from_parts` fails with `BundleError::NonCanonicalProofSize` | **Orchard Crate (Bundle Builder)** | Enforced by crate constructor asserting `proof.len() == Proof::expected_proof_size(n)`. |
-| **Identity Authorization Key (`rk == 0`)** | `Action::from_parts` fails with `ActionFromPartsError::IdentityRk` | **Orchard Crate (Action)** | `Action::from_parts` asserts `!rk.is_identity()` per Orchard consensus rules. |
-| **Non-Canonical Authorization Key Bytes** | `redpallas::VerificationKey::try_from` returns `Err` | **RedPallas / Crate** | Pallas point decompression rejects non-canonical curve encodings. |
+| **Altered / Corrupted Proof Bytes** | `bundle.verify_proof()` fails (`VerificationError`); `BatchValidator` returns `false` | **Orchard Crate (Circuit/Proof)** | Verified by Halo2 verifier. |
+| **Non-Canonical Proof Length** | `Bundle::try_from_parts` fails with `NonCanonicalProofSize` | **Orchard Crate (Constructor)** | Verified by crate constructor assertions. |
+| **Non-Canonical CompactSize** | `decode_compact_size` fails with `NonCanonicalCompactSize` | **Wire Codec** | Rejects non-minimal integer encodings. |
+| **Truncated Bundle / Fields** | `deserialize_bundle` fails with `UnexpectedEof` | **Wire Codec** | Rejects incomplete payloads. |
+| **Trailing Bytes** | `deserialize_bundle` fails with `TrailingBytes` | **Wire Codec** | Prevents unparsed data attachment. |
+| **Identity Authorization Key (`rk == 0`)** | `Action::from_parts` fails with `IdentityRk` | **Orchard Crate (Action Constructor)** | Rejects identity group element. |
+| **Non-Canonical Authorization Key** | `redpallas::VerificationKey::try_from` returns `Err` | **RedPallas / Crate** | Rejects invalid curve point decompression. |
 | **Mismatched Authorization Key** | `rk.verify()` returns `Err` | **Orchard Crate (Signature)** | Signature verification failure. |
-| **Cross-Chain Replay (Different `chain_id`)** | Signatures and `BatchValidator` fail against different network sighash | **Orchard Crate / OwnChain Digest** | Domain separation commits to `chain_id` in `compute_tx_auth_digest`. |
-| **Incorrect Fee / Value Balance Sign** | Altering `value_balance` changes expected BVK; `bvk.verify()` fails with `VerificationError` | **Orchard Crate (Value Commitment)** | `bvk = sum(cv_net) - ValueCommit(value_balance)`; sign alteration breaks binding signature. |
-| **Duplicate Nullifier** | Isolated bundle verifier accepts; node state rejects | **OwnChain Consensus (`ChainState`)** | The Orchard proof verifier is stateless. The node's chain state tracks seen nullifiers and rejects duplicates across blocks/transactions. |
-| **Stale or Unknown Historical Anchor** | Isolated bundle verifier accepts; node state rejects | **OwnChain Consensus (`ChainState`)** | The Orchard proof verifier only checks consistency with the bundle's public anchor. The node's chain state verifies that the anchor matches a known ancestor block's root. |
+| **Cross-Chain Replay (`chain_id` mismatch)** | Signatures and `BatchValidator` fail against testnet sighash | **Orchard Crate / OwnChain Digest** | Domain separation prevents cross-chain replay. |
+| **Mutated Effects / Digest Fields** | Signatures and binding verification fail on altered digest | **Orchard Crate / OwnChain Digest** | Any field change invalidates authorizations. |
+| **Incorrect Fee / Value Balance Sign** | Mutated `value_balance` alters expected BVK; `bvk.verify()` fails | **Orchard Crate (Value Commitment)** | BVK derivation commits to value balance. |
+| **Duplicate Nullifier** | Isolated crate verifier succeeds; harness simulation rejects | **Harness Simulation (Future `ChainState`)** | **CRATE DOES NOT ENFORCE.** The stateless crate verifier accepts duplicate nullifiers. Production tracking belongs to M1-E. |
+| **Stale / Unknown Historical Anchor** | Isolated crate verifier succeeds; harness simulation rejects | **Harness Simulation (Future `ChainState`)** | **CRATE DOES NOT ENFORCE.** The crate only validates internal anchor consistency. Production ancestor-root validation belongs to M1-E. |
 
 ---
 
 ## 7. Confirmed Value-Balance & Pool Conservation Conventions
 
-All signed and verified test fixtures confirm the exact protocol rules:
-
-### Transfer Bundle
-- External flow: public fee of 5,000 atoms leaves the shielded pool to reward the miner.
-- `bundle.value_balance()` = `+5_000` atoms (`+fee_atoms`).
-- Crate invariant: value leaving the pool has positive sign.
-
-### Coinbase Bundle
-- External flow: block subsidy of 10 OWN (`1_000_000_000` atoms) enters the shielded pool.
-- `bundle.value_balance()` = `-1_000_000_000` atoms (`-payout_atoms`).
-- Crate invariant: value entering the pool has negative sign.
-
-### Pool Balance Invariants
-ZIP-209 chain pool balance calculation:
-$$\text{pool\_balance}_{h} = \text{pool\_balance}_{h-1} - \text{valueBalanceOrchard}$$
-
-- **Genesis:** `pool_balance = 0`.
-- **Block 1 (Coinbase 10 OWN):** `0 - (-1_000_000_000) = +1_000_000_000` atoms.
-- **Block 2 (Transfer with 5,000 atom fee):** `1_000_000_000 - (+5_000) = +999_995_000` atoms.
-- **Bounds Enforced:** $0 \le \text{pool\_balance} \le 2,102,400,000,000,000$ atoms.
-- Any transaction attempting to extract more value than exists in the pool results in a negative pool balance and is rejected by consensus.
+All signed and verified test fixtures confirm protocol rules:
+- **Transfer:** `valueBalanceOrchard = +fee_atoms = +5_000` (value leaves pool to pay fee).
+- **Coinbase:** `valueBalanceOrchard = -payout_atoms = -1_000_000_000` (value enters pool as subsidy).
+- **Pool Balance:** $\text{pool\_balance}_{h} = \text{pool\_balance}_{h-1} - \text{valueBalanceOrchard}$.
+  - Genesis: 0 atoms
+  - Block 1 (Coinbase 10 OWN): $+1{,}000{,}000{,}000$ atoms
+  - Block 2 (Transfer with 5,000 fee): $+999{,}995{,}000$ atoms
+  - Range Invariant: $0 \le \text{pool\_balance} \le 2{,}102{,}400{,}000{,}000{,}000$ atoms.
 
 ---
 
 ## 8. Verification Results
 
-### Toolchain & Quality Checks
-- `cargo fmt --all -- --check`: **Pass** (clean exit code 0)
-- `cargo clippy --locked --all-targets --all-features -- -D warnings`: **Pass** (0 warnings, 0 errors)
-- `git diff --check`: **Pass** (clean exit code 0)
+### Quality Checks
+- `cargo fmt --all -- --check`: **Pass**
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`: **Pass**
+- `git diff --check`: **Pass**
 
 ### Test Suite Execution
-- `cargo test --locked --all-targets`: **Pass** (141 tests total)
+- `cargo test --locked --all-targets`: **Pass** (144 total tests across 5 targets, 0 failed):
   - `ownchain` lib unittests: 8 passed
   - `difficulty`: 22 passed
   - `golden_vectors`: 37 passed
-  - `orchard_compat`: 10 passed
+  - `orchard_compat`: 13 passed
   - `randomx`: 9 passed
   - `validation`: 55 passed
 
 ---
 
-## 9. Required Future Transaction-Validation Components (M1-E / M2)
+## 9. Remaining M1-E Work (Future Consensus Integration)
 
-The compatibility gate establishes cryptographic and wire compatibility. Full transaction validation in production consensus will require:
+Passing the M1-D/M1-D.1 compatibility gate proves that the pinned Orchard API can implement OwnChain's shielded rules. It does **not** integrate shielded transactions into production consensus. The following work remains for Milestone M1-E:
 
-1. **Commitment Tree State Tracking:** An incremental depth-32 Sinsemilla/Orchard commitment tree in `ChainState` that accumulates `action.cmx()` commitments in block order and produces the canonical header `orchard_root`.
-2. **Historical Anchor Ring Buffer:** Storing historical tree roots from ancestor blocks to validate incoming transaction anchors during block validation and fork reorganizations.
-3. **Nullifier Set Persistence:** Tracking all spent nullifiers in `ChainState` to detect duplicate spends within blocks and across the active chain.
-4. **Transaction Envelope Parser in Block Validation:** Integrating `tx_type`, `tx_version`, `chain_id`, `fee_atoms`, and `height` parsing into `src/validation.rs` alongside outer block framing.
-5. **Subsidy & Fee Accounting:** Verifying that `coinbase_payout == scheduled_subsidy(h) + sum(tx.fee_atoms)`.
-
----
-
-## 10. Conclusion & Next Steps
-
-The M1-D Orchard V2 compatibility gate has passed with complete cryptographic and structural verification. No blocking incompatibilities were found in `orchard = 0.16.0`.
-
-**Recommended Next Action:** Proceed to Milestone M1-E (Transaction Integration & Commitment Tree State).
+1. **Commitment Tree State Tracking in `ChainState`:** Implement an incremental depth-32 Sinsemilla/Orchard commitment tree that appends `action.cmx()` in block order and produces the canonical header `orchard_root`.
+2. **Historical Anchor Ring Buffer:** Maintain historical tree roots across ancestor blocks to validate transaction anchors during block validation and fork reorgs.
+3. **Nullifier Persistence in `ChainState`:** Implement permanent nullifier tracking to detect and reject duplicate nullifiers within a block and against the active chain.
+4. **Transaction Envelope Parser in Block Validation:** Wire `tx_type`, `tx_version`, `chain_id`, `fee_atoms`, and `height` parsing into `src/validation.rs` for block bodies.
+5. **Subsidy & Fee Accounting in Consensus:** Verify that block coinbase payouts do not exceed `scheduled_subsidy(h) + sum(tx.fee_atoms)` and that atomic rollback occurs upon any validation failure.
