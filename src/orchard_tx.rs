@@ -833,7 +833,7 @@ pub fn validate_bundle_structure_stateless(
                 });
             }
         }
-        TxType::OrchardTransfer => {
+        TxType::OrchardTransfer | TxType::ShieldedTransfer => {
             if n_actions == 0 || n_actions > MAX_ACTIONS_PER_TX {
                 return Err(OrchardValidationError::InvalidTransferActionCount {
                     actual: n_actions,
@@ -864,6 +864,11 @@ pub fn validate_bundle_structure_stateless(
                     fee_atoms: payload_prefix,
                 });
             }
+        }
+        _ => {
+            return Err(OrchardValidationError::from(EnvelopeError::UnknownType {
+                tag: envelope.tx_type.tag(),
+            }));
         }
     }
 
@@ -941,8 +946,8 @@ impl ValidatedOrchardTx {
     /// Returns the fee in atoms if this is an ordinary transfer.
     pub fn fee_atoms(&self) -> Option<u64> {
         match self.envelope.tx_type {
-            TxType::OrchardTransfer => Some(self.payload_prefix),
-            TxType::Coinbase => None,
+            TxType::OrchardTransfer | TxType::ShieldedTransfer => Some(self.payload_prefix),
+            _ => None,
         }
     }
 
@@ -950,7 +955,7 @@ impl ValidatedOrchardTx {
     pub fn coinbase_height(&self) -> Option<u64> {
         match self.envelope.tx_type {
             TxType::Coinbase => Some(self.payload_prefix),
-            TxType::OrchardTransfer => None,
+            _ => None,
         }
     }
 
@@ -1004,8 +1009,13 @@ pub fn validate_transaction_stateless(
         TxType::Coinbase => {
             tx::coinbase_height(tx_bytes).ok_or(EnvelopeError::TruncatedCoinbaseHeight)?
         }
-        TxType::OrchardTransfer => {
+        TxType::OrchardTransfer | TxType::ShieldedTransfer => {
             tx::transfer_fee(tx_bytes).ok_or(EnvelopeError::TruncatedTransferFee)?
+        }
+        _ => {
+            return Err(OrchardValidationError::from(EnvelopeError::UnknownType {
+                tag: envelope.tx_type.tag(),
+            }));
         }
     };
 

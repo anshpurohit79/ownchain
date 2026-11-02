@@ -815,7 +815,7 @@ fn a_transaction_with_an_unknown_type_is_rejected() {
     let id = chain_id();
     let genesis = genesis::genesis_block(id);
     let mut tx = transfer(id, 7028);
-    tx[0] = 7; // Not a known transaction type.
+    tx[0] = 8; // Not a known transaction type.
     let block = make_block(
         id,
         &genesis,
@@ -1977,4 +1977,194 @@ fn test_chain_state_atomicity_preserved_on_orchard_failure() {
         ))
     );
     assert_eq!(state, state_before);
+}
+
+/// Constructs a genuine Type 5 ShieldedTransfer transaction.
+fn genuine_shielded_transfer(chain_id: Hash) -> Vec<u8> {
+    let f = get_fixtures();
+    let fee_atoms = 7_028u64;
+    let sighash = compute_tx_auth_digest(
+        *chain_id.as_bytes(),
+        ownchain::tx::TX_TYPE_SHIELDED_TRANSFER,
+        1,
+        fee_atoms,
+        f.tx_proven_7028.flag_byte(),
+        *f.tx_proven_7028.value_balance(),
+        f.tx_proven_7028.anchor().to_bytes(),
+        &[f.tx_action_effect_7028],
+    );
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    let bundle = f
+        .tx_proven_7028
+        .clone()
+        .apply_signatures(&mut rng, sighash, &[SpendAuthorizingKey::from(&f.miner_sk)])
+        .unwrap();
+    let serialized_bundle = serialize_bundle(&bundle);
+
+    let mut raw_tx =
+        Vec::with_capacity(ownchain::tx::TX_ENVELOPE_LEN + 8 + serialized_bundle.len());
+    raw_tx.push(ownchain::tx::TX_TYPE_SHIELDED_TRANSFER);
+    raw_tx.extend_from_slice(&TX_VERSION.to_le_bytes());
+    raw_tx.extend_from_slice(chain_id.as_bytes());
+    raw_tx.extend_from_slice(&fee_atoms.to_le_bytes());
+    raw_tx.extend_from_slice(&serialized_bundle);
+    raw_tx
+}
+
+#[test]
+fn test_stateful_shielded_transfer_execution_and_conservation() {
+    let id = chain_id();
+    let mut state = chain_with_genesis();
+    let genesis = genesis::genesis_block(id);
+
+    // Block 1: Genuine Shielded Coinbase (10 OWN payout)
+    let b1 = make_block(
+        id,
+        &genesis,
+        genesis::GENESIS_TIMESTAMP + 120,
+        vec![coinbase(id, 1)],
+    );
+    state
+        .apply_block(&b1)
+        .expect("block 1 with shielded coinbase succeeds");
+
+    assert_eq!(state.shielded_pool_balance(), 1_000_000_000);
+    assert_eq!(state.cumulative_issuance(), 1_000_000_000);
+    assert_eq!(state.accounts().len(), 0);
+    assert_eq!(state.nullifier_set().len(), 0);
+
+    // Block 2: Type 5 ShieldedTransfer with anchor from Block 1
+    let shielded_tx = genuine_shielded_transfer(id);
+    let b2 = make_block(
+        id,
+        &b1,
+        genesis::GENESIS_TIMESTAMP + 240,
+        vec![coinbase(id, 2), shielded_tx.clone()],
+    );
+    state
+        .apply_block(&b2)
+        .expect("block 2 with genuine shielded transfer succeeds");
+
+    // Conservation check:
+    // S_2 = 1_000_000_000 (from cb1) - 7,028 (fee) + 1_000_000_000 (cb2 payout) = 1_999_992_972
+    // I_2 = I_1 (1_000_000_000) + actual_claimed_2 (1_000_000_000 - 7,028) = 1_999_992_972
+    // T_2 = 0
+    assert_eq!(state.shielded_pool_balance(), 1_999_992_972);
+    assert_eq!(state.cumulative_issuance(), 1_999_992_972);
+    assert_eq!(state.nullifier_set().len(), 1);
+}
+
+#[test]
+fn test_stateful_duplicate_nullifier_rejection_in_block_and_chain() {
+    let id = chain_id();
+    let mut state = chain_with_genesis();
+    let genesis = genesis::genesis_block(id);
+
+    // Block 1: Genuine Coinbase
+    let b1 = make_block(
+        id,
+        &genesis,
+        genesis::GENESIS_TIMESTAMP + 120,
+        vec![coinbase(id, 1)],
+    );
+    state.apply_block(&b1).expect("block 1 succeeds");
+
+    // Case 1: Block with duplicate nullifiers within the same block
+    let shielded_tx = genuine_shielded_transfer(id);
+    let mut bad_tx_dupe_nf = shielded_tx.clone();
+    // Mutate fee payload slightly so tx_id differs, but nullifier remains identical
+    bad_tx_dupe_nf[35] ^= 0x01; // mutate payload prefix byte
+    let bad_block_dupe = make_block(
+        id,
+        &b1,
+        genesis::GENESIS_TIMESTAMP + 240,
+        vec![coinbase(id, 2), shielded_tx.clone(), bad_tx_dupe_nf],
+    );
+    assert!(state.apply_block(&bad_block_dupe).is_err());
+
+    // Accept Block 2 with shielded_tx
+    let b2 = make_block(
+        id,
+        &b1,
+        genesis::GENESIS_TIMESTAMP + 240,
+        vec![coinbase(id, 2), shielded_tx.clone()],
+    );
+    state.apply_block(&b2).expect("block 2 succeeds");
+
+    // Case 2: Attempting to spend the already-consumed nullifier in Block 3
+    let b3_double_spend = make_block(
+        id,
+        &b2,
+        genesis::GENESIS_TIMESTAMP + 360,
+        vec![coinbase(id, 3), shielded_tx.clone()],
+    );
+    let res = state.apply_block(&b3_double_spend);
+    assert!(res.is_err(), "nullifier double-spend must be rejected");
+}
+
+#[test]
+fn test_stateful_10_block_ancestor_anchor_window_boundaries() {
+    let id = chain_id();
+    let mut state = chain_with_genesis();
+    let genesis = genesis::genesis_block(id);
+
+    // Block 1 generates the output note commitment cmx
+    let b1 = make_block(
+        id,
+        &genesis,
+        genesis::GENESIS_TIMESTAMP + 120,
+        vec![coinbase(id, 1)],
+    );
+    state.apply_block(&b1).expect("block 1 succeeds");
+
+    // Fast forward with coinbase blocks up to height 10
+    let mut parent = b1;
+    let mut ts = genesis::GENESIS_TIMESTAMP + 120;
+    for h in 2..=10 {
+        ts += 120;
+        let blk = make_block(id, &parent, ts, vec![coinbase(id, h)]);
+        state.apply_block(&blk).expect("chain extends");
+        parent = blk;
+    }
+    assert_eq!(state.tip_height(), Some(10));
+
+    // At height 11, permitted window is [max(0, 11-10), 11-1] = [1, 10].
+    // Anchor from Block 1 is AT height 1 (the lower boundary of the 10-block window).
+    // Therefore, genuine_shielded_transfer (anchor from Block 1) is ACCEPTED at height 11!
+    ts += 120;
+    let shielded_tx = genuine_shielded_transfer(id);
+    let b11 = make_block(id, &parent, ts, vec![coinbase(id, 11), shielded_tx.clone()]);
+    state
+        .apply_block(&b11)
+        .expect("anchor from height 1 is accepted at height 11 (10 blocks ago)");
+    assert_eq!(state.tip_height(), Some(11));
+
+    // Now test height 12: permitted window is [max(0, 12-10), 12-1] = [2, 11].
+    // Anchor from Block 1 is at height 1 < 2, so it is strictly OUTSIDE the 10-block window!
+    // A new transfer using Block 1's anchor at height 12 MUST be rejected!
+    let b12_parent = state.tip().unwrap().clone();
+    ts += 120;
+    let b12_stale_anchor = make_block(
+        id,
+        &b12_parent,
+        ts,
+        vec![coinbase(id, 12), shielded_tx.clone()],
+    );
+    let err = state.apply_block(&b12_stale_anchor);
+    assert!(
+        err.is_err(),
+        "anchor older than 10 blocks (H-11) must be rejected"
+    );
+
+    // Case 3: Future or unknown anchor must also be rejected
+    let mut bad_anchor_tx = shielded_tx;
+    // Mutate anchor bytes in bundle
+    bad_anchor_tx[ownchain::tx::TX_ENVELOPE_LEN + 8 + 820 + 1 + 8
+        ..ownchain::tx::TX_ENVELOPE_LEN + 8 + 820 + 1 + 8 + 32]
+        .copy_from_slice(&[0xee; 32]);
+    let b12_unknown_anchor = make_block(id, &b12_parent, ts, vec![coinbase(id, 12), bad_anchor_tx]);
+    assert!(
+        state.apply_block(&b12_unknown_anchor).is_err(),
+        "unknown anchor must be rejected"
+    );
 }

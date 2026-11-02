@@ -7,15 +7,7 @@
 //! tx_type:u8 || tx_version:u16_le || chain_id:[u8;32] || payload
 //! ```
 //!
-//! with `tx_version == 1`, `tx_type == 0` (Coinbase, payload
-//! `height:u64_le || orchard_bundle`) or `tx_type == 1` (OrchardTransfer,
-//! payload `fee_atoms:u64_le || orchard_bundle`).
-//!
-//! This module checks only the *envelope*: the type tag, the version, the
-//! chain ID and the fixed-width payload prefix. It deliberately does not
-//! parse, prove, or verify the embedded Orchard V2 bundle — that is the
-//! Orchard integration gate of §12 and is out of scope for milestone
-//! M1-B.
+//! with `tx_version == 1` and authoritative transaction types 0..=7.
 
 use crate::hash::Hash;
 
@@ -36,18 +28,53 @@ pub const TX_ENVELOPE_LEN: usize = TX_TYPE_LEN + TX_VERSION_LEN + TX_CHAIN_ID_LE
 /// The only supported transaction version.
 pub const TX_VERSION: u16 = 1;
 
-/// Transaction type tag for a coinbase.
+/// Transaction type tag for a coinbase (Type 0).
 pub const TX_TYPE_COINBASE: u8 = 0;
 
-/// Transaction type tag for an ordinary Orchard transfer.
+/// Transaction type tag for a transparent transfer (Type 1).
+pub const TX_TYPE_TRANSPARENT_TRANSFER: u8 = 1;
+
+/// Historical alias for shielded Orchard transfers (from early M1-B harness).
 pub const TX_TYPE_ORCHARD_TRANSFER: u8 = 1;
+
+/// Transaction type tag for configure guardians (Type 2).
+pub const TX_TYPE_CONFIGURE_GUARDIANS: u8 = 2;
+
+/// Transaction type tag for guardian action (Type 3).
+pub const TX_TYPE_GUARDIAN_ACTION: u8 = 3;
+
+/// Transaction type tag for cancel pending transfer (Type 4).
+pub const TX_TYPE_CANCEL_PENDING: u8 = 4;
+
+/// Transaction type tag for shielded transfer (Type 5).
+pub const TX_TYPE_SHIELDED_TRANSFER: u8 = 5;
+
+/// Transaction type tag for transparent to shielded transfer (Type 6).
+pub const TX_TYPE_TRANSPARENT_TO_SHIELDED: u8 = 6;
+
+/// Transaction type tag for shielded to transparent transfer (Type 7).
+pub const TX_TYPE_SHIELDED_TO_TRANSPARENT: u8 = 7;
 
 /// The transaction type of a canonical transaction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TxType {
-    /// A coinbase: block position 0 only.
+    /// A coinbase: block position 0 only (Type 0).
     Coinbase,
-    /// An ordinary shielded Orchard transfer.
+    /// Transparent transfer between Ed25519 accounts (Type 1).
+    TransparentTransfer,
+    /// Configure guardian protection and rules for transparent account (Type 2).
+    ConfigureGuardians,
+    /// Guardian authorized action (Type 3).
+    GuardianAction,
+    /// Cancel a pending transfer to an unconfirmed recipient (Type 4).
+    CancelPendingTransfer,
+    /// Shielded transfer within Orchard pool (Type 5).
+    ShieldedTransfer,
+    /// Shielding transfer from transparent account to Orchard pool (Type 6).
+    TransparentToShielded,
+    /// Deshielding transfer from Orchard pool to transparent account (Type 7).
+    ShieldedToTransparent,
+    /// Historical alias for shielded transfers from milestone M1-B.
     OrchardTransfer,
 }
 
@@ -56,7 +83,13 @@ impl TxType {
     pub fn from_tag(tag: u8) -> Option<Self> {
         match tag {
             TX_TYPE_COINBASE => Some(TxType::Coinbase),
-            TX_TYPE_ORCHARD_TRANSFER => Some(TxType::OrchardTransfer),
+            TX_TYPE_TRANSPARENT_TRANSFER => Some(TxType::TransparentTransfer),
+            TX_TYPE_CONFIGURE_GUARDIANS => Some(TxType::ConfigureGuardians),
+            TX_TYPE_GUARDIAN_ACTION => Some(TxType::GuardianAction),
+            TX_TYPE_CANCEL_PENDING => Some(TxType::CancelPendingTransfer),
+            TX_TYPE_SHIELDED_TRANSFER => Some(TxType::ShieldedTransfer),
+            TX_TYPE_TRANSPARENT_TO_SHIELDED => Some(TxType::TransparentToShielded),
+            TX_TYPE_SHIELDED_TO_TRANSPARENT => Some(TxType::ShieldedToTransparent),
             _ => None,
         }
     }
@@ -65,6 +98,13 @@ impl TxType {
     pub fn tag(self) -> u8 {
         match self {
             TxType::Coinbase => TX_TYPE_COINBASE,
+            TxType::TransparentTransfer => TX_TYPE_TRANSPARENT_TRANSFER,
+            TxType::ConfigureGuardians => TX_TYPE_CONFIGURE_GUARDIANS,
+            TxType::GuardianAction => TX_TYPE_GUARDIAN_ACTION,
+            TxType::CancelPendingTransfer => TX_TYPE_CANCEL_PENDING,
+            TxType::ShieldedTransfer => TX_TYPE_SHIELDED_TRANSFER,
+            TxType::TransparentToShielded => TX_TYPE_TRANSPARENT_TO_SHIELDED,
+            TxType::ShieldedToTransparent => TX_TYPE_SHIELDED_TO_TRANSPARENT,
             TxType::OrchardTransfer => TX_TYPE_ORCHARD_TRANSFER,
         }
     }
@@ -165,15 +205,13 @@ impl std::error::Error for EnvelopeError {}
 
 /// Parses the outer envelope of a canonical transaction.
 ///
-/// Checks the type tag, the version and the chain ID. The payload that
-/// follows is only checked for the fixed-width prefix each transaction
-/// type defines; the embedded Orchard bundle is not parsed.
+/// Checks the type tag, the version and the chain ID.
 pub fn parse_envelope(tx: &[u8], expected_chain_id: Hash) -> Result<TxEnvelope, EnvelopeError> {
     if tx.len() < TX_ENVELOPE_LEN {
         return Err(EnvelopeError::TooShort { actual: tx.len() });
     }
 
-    let tx_type = TxType::from_tag(tx[0]).ok_or(EnvelopeError::UnknownType { tag: tx[0] })?;
+    let mut tx_type = TxType::from_tag(tx[0]).ok_or(EnvelopeError::UnknownType { tag: tx[0] })?;
 
     let version = u16::from_le_bytes([tx[1], tx[2]]);
     if version != TX_VERSION {
@@ -194,9 +232,14 @@ pub fn parse_envelope(tx: &[u8], expected_chain_id: Hash) -> Result<TxEnvelope, 
     }
 
     let payload = &tx[TX_ENVELOPE_LEN..];
+    if payload.is_empty() {
+        return Err(EnvelopeError::MissingPayload);
+    }
+
     match tx_type {
         TxType::Coinbase => {
-            // `height:u64_le || orchard_bundle`
+            // Either transparent `height (8) || recipient (32) || payout (8)` (48 bytes)
+            // or shielded `height:u64_le || orchard_bundle` (>8 bytes)
             if payload.len() < 8 {
                 return Err(EnvelopeError::TruncatedCoinbaseHeight);
             }
@@ -204,8 +247,18 @@ pub fn parse_envelope(tx: &[u8], expected_chain_id: Hash) -> Result<TxEnvelope, 
                 return Err(EnvelopeError::MissingPayload);
             }
         }
-        TxType::OrchardTransfer => {
-            // `fee_atoms:u64_le || orchard_bundle`
+        TxType::TransparentTransfer => {
+            // If payload is not exactly 160 bytes (TransparentTransfer),
+            // check if it is a legacy OrchardTransfer (payload.len() > 8)
+            if payload.len() != 160 {
+                if payload.len() > 8 {
+                    tx_type = TxType::OrchardTransfer;
+                } else {
+                    return Err(EnvelopeError::TruncatedTransferFee);
+                }
+            }
+        }
+        TxType::OrchardTransfer | TxType::ShieldedTransfer => {
             if payload.len() < 8 {
                 return Err(EnvelopeError::TruncatedTransferFee);
             }
@@ -213,6 +266,7 @@ pub fn parse_envelope(tx: &[u8], expected_chain_id: Hash) -> Result<TxEnvelope, 
                 return Err(EnvelopeError::MissingPayload);
             }
         }
+        _ => {}
     }
 
     Ok(TxEnvelope {
@@ -244,4 +298,57 @@ pub fn transfer_fee(tx: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ]))
+}
+
+/// Reads the fee declared by any transaction type according to its wire layout.
+pub fn transaction_fee(tx: &[u8]) -> Option<u64> {
+    let tag = *tx.first()?;
+    let payload = tx.get(TX_ENVELOPE_LEN..)?;
+    match tag {
+        TX_TYPE_COINBASE => Some(0),
+        TX_TYPE_TRANSPARENT_TRANSFER => {
+            if payload.len() == 160 {
+                // fee is at payload offset 80..88 (sender 32, recipient 32, amount 16)
+                let bytes = payload.get(80..88)?;
+                Some(u64::from_le_bytes(bytes.try_into().ok()?))
+            } else if payload.len() >= 8 {
+                // legacy OrchardTransfer
+                let bytes = payload.get(..8)?;
+                Some(u64::from_le_bytes(bytes.try_into().ok()?))
+            } else {
+                None
+            }
+        }
+        TX_TYPE_CONFIGURE_GUARDIANS => {
+            // nonce (8), fee (8)
+            let bytes = payload.get(40..48)?;
+            Some(u64::from_le_bytes(bytes.try_into().ok()?))
+        }
+        TX_TYPE_GUARDIAN_ACTION => {
+            // account (32), action (1), fee (8)
+            let bytes = payload.get(33..41)?;
+            Some(u64::from_le_bytes(bytes.try_into().ok()?))
+        }
+        TX_TYPE_CANCEL_PENDING => {
+            // sender (32), transfer_id (32), fee (8)
+            let bytes = payload.get(64..72)?;
+            Some(u64::from_le_bytes(bytes.try_into().ok()?))
+        }
+        TX_TYPE_SHIELDED_TRANSFER => {
+            // fee is at payload offset 0..8
+            let bytes = payload.get(..8)?;
+            Some(u64::from_le_bytes(bytes.try_into().ok()?))
+        }
+        TX_TYPE_TRANSPARENT_TO_SHIELDED => {
+            // sender (32), nonce (8), shielded_amount (16), fee (8)
+            let bytes = payload.get(56..64)?;
+            Some(u64::from_le_bytes(bytes.try_into().ok()?))
+        }
+        TX_TYPE_SHIELDED_TO_TRANSPARENT => {
+            // recipient (32), release_amount (16), fee (8)
+            let bytes = payload.get(48..56)?;
+            Some(u64::from_le_bytes(bytes.try_into().ok()?))
+        }
+        _ => None,
+    }
 }

@@ -1,0 +1,980 @@
+{
+  "spec": "OwnChain protocol v1 (Transparent Account Ledger Baseline)",
+  "version": 1,
+  "hash_primitive": "BLAKE2b-256 (32 bytes, unkeyed)",
+  "signature_primitive": "Ed25519 (RFC 8032)",
+  "header_size_bytes": 170,
+  "domain_prefixes": {
+    "block": "OwnChain/Block/v1",
+    "tx": "OwnChain/Tx/v1",
+    "tx_auth": "OwnChain/TxAuth/v1",
+    "address": "OwnChain/Address/v1",
+    "merkle_empty": "OwnChain/Merkle/Empty/v1",
+    "merkle_leaf": "OwnChain/Merkle/Leaf/v1",
+    "merkle_node": "OwnChain/Merkle/Node/v1"
+  },
+  "chain_ids": {
+    "devnet": "0459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc",
+    "testnet": "8ba087ef6031654d96f608d75e144642a0750c26e84cb39637caee484e3c4de1"
+  },
+  "empty_merkle_root": "cea17a93b5d27d6fe8c246417586086579571c8b29b1b3e5988d7e3bbc873f8b",
+  "tx_merkle_roots": {
+    "0_leaves": {
+      "tx_count": 0,
+      "tx_ids": [],
+      "leaf_hashes": [],
+      "root": "cea17a93b5d27d6fe8c246417586086579571c8b29b1b3e5988d7e3bbc873f8b",
+      "structure": "empty_tree -> DOM_EMPTY"
+    },
+    "1_leaves": {
+      "tx_count": 1,
+      "tx_ids": [
+        "38ba81669098c844c5657d3418c5541a8bf4e186f1f1879ff816bc146229c9da"
+      ],
+      "leaf_hashes": [
+        "9628a2822a530fc6c5e6bae58210c4bf68aa90727a50a0446e33bbc18c47449e"
+      ],
+      "root": "9628a2822a530fc6c5e6bae58210c4bf68aa90727a50a0446e33bbc18c47449e",
+      "structure": "single_leaf -> leaf_0"
+    },
+    "2_leaves": {
+      "tx_count": 2,
+      "tx_ids": [
+        "38ba81669098c844c5657d3418c5541a8bf4e186f1f1879ff816bc146229c9da",
+        "72e24fcf340531288407b589625e23186120d9418f2aa25fd6bcf91efd075f36"
+      ],
+      "leaf_hashes": [
+        "9628a2822a530fc6c5e6bae58210c4bf68aa90727a50a0446e33bbc18c47449e",
+        "201ba362f2c9d5c95bd645f5aad7af7ea5b18a53d1a6cc8a91751e6ccd9903e1"
+      ],
+      "root": "33c717c24b3eb920512e594cf3e81884a1275aac180e4a1725ef6d681004b3e4",
+      "structure": "split at k=1: Node(leaf_0, leaf_1)",
+      "intermediate_nodes": {
+        "node_0_1": "33c717c24b3eb920512e594cf3e81884a1275aac180e4a1725ef6d681004b3e4"
+      }
+    },
+    "3_leaves": {
+      "tx_count": 3,
+      "tx_ids": [
+        "38ba81669098c844c5657d3418c5541a8bf4e186f1f1879ff816bc146229c9da",
+        "72e24fcf340531288407b589625e23186120d9418f2aa25fd6bcf91efd075f36",
+        "399bf16dabe007946ec756859171f28de9d74064876592b7b8d418869c4089ce"
+      ],
+      "leaf_hashes": [
+        "9628a2822a530fc6c5e6bae58210c4bf68aa90727a50a0446e33bbc18c47449e",
+        "201ba362f2c9d5c95bd645f5aad7af7ea5b18a53d1a6cc8a91751e6ccd9903e1",
+        "c5e5a30a484759a301479448ec5e420be0bf458725dbacb6a8b5d7a742585145"
+      ],
+      "root": "7ab23914d547a47fda8f2d664fbfef7fbb028ccc7dbde5bcd352d6f1f6ddd68c",
+      "structure": "split at k=2: Node(Node(leaf_0, leaf_1), leaf_2)",
+      "intermediate_nodes": {
+        "node_0_1": "33c717c24b3eb920512e594cf3e81884a1275aac180e4a1725ef6d681004b3e4",
+        "node_root": "7ab23914d547a47fda8f2d664fbfef7fbb028ccc7dbde5bcd352d6f1f6ddd68c"
+      }
+    },
+    "4_leaves": {
+      "tx_count": 4,
+      "tx_ids": [
+        "38ba81669098c844c5657d3418c5541a8bf4e186f1f1879ff816bc146229c9da",
+        "72e24fcf340531288407b589625e23186120d9418f2aa25fd6bcf91efd075f36",
+        "399bf16dabe007946ec756859171f28de9d74064876592b7b8d418869c4089ce",
+        "047d60fd261f60113947d3f6ea8d2467f5436dc6d36f2f609c2b5140140605c6"
+      ],
+      "leaf_hashes": [
+        "9628a2822a530fc6c5e6bae58210c4bf68aa90727a50a0446e33bbc18c47449e",
+        "201ba362f2c9d5c95bd645f5aad7af7ea5b18a53d1a6cc8a91751e6ccd9903e1",
+        "c5e5a30a484759a301479448ec5e420be0bf458725dbacb6a8b5d7a742585145",
+        "8c8db264ada1b7ab6293c591bdeb25ad14a1f96c6808c66efc45273b590d3e20"
+      ],
+      "root": "41e106435d3c8e9ec307ef31b7e02accd5155a9783313b6ae39374ce57b82ad3",
+      "structure": "split at k=2: Node(Node(leaf_0, leaf_1), Node(leaf_2, leaf_3))",
+      "intermediate_nodes": {
+        "node_0_1": "33c717c24b3eb920512e594cf3e81884a1275aac180e4a1725ef6d681004b3e4",
+        "node_2_3": "65cc8e516ef0ce91b5bed593de80bfc150cf1fa0e16b41237bf3247b2b2b4a80",
+        "node_root": "41e106435d3c8e9ec307ef31b7e02accd5155a9783313b6ae39374ce57b82ad3"
+      }
+    }
+  },
+  "sample_accounts": [
+    {
+      "name": "Account 0 (Alice)",
+      "address": "62c90595b5c5f8602dd334fe8eabb291260d8ee0633947eac29b6cc7f1a4f51a",
+      "pubkey": "5c9c6df261c9cb840475776aaefcd944b405328fab28f9b3a95ef40490d3de84",
+      "state": {
+        "balance": 1000000000,
+        "nonce": 1,
+        "allowance_limit": 500000000,
+        "allowance_window_start": 100,
+        "allowance_window_len": 720,
+        "allowance_spent": 19500,
+        "is_frozen": false,
+        "recovery_key": "1111111111111111111111111111111111111111111111111111111111111111",
+        "guardian_enabled": true,
+        "new_recipient_delay": 10,
+        "withdrawal_delay": 144,
+        "guardians": [
+          "0101010101010101010101010101010101010101010101010101010101010101",
+          "0202020202020202020202020202020202020202020202020202020202020202",
+          "0303030303030303030303030303030303030303030303030303030303030303",
+          "0404040404040404040404040404040404040404040404040404040404040404",
+          "0505050505050505050505050505050505050505050505050505050505050505",
+          "0606060606060606060606060606060606060606060606060606060606060606",
+          "0707070707070707070707070707070707070707070707070707070707070707"
+        ],
+        "pending_transfers": [
+          {
+            "transfer_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "recipient": "7e1e0f2e9e0d6076930671f5e63980d932b76b8dbb112954f3798878cb9ea3e5",
+            "amount": 100000000,
+            "release_height": 110
+          }
+        ],
+        "coinbase_tranches": []
+      },
+      "canonical_state_hex": "00ca9a3b00000000000000000000000001000000000000000065cd1d0000000000000000000000006400000000000000d0020000000000002c4c0000000000000000000000000000001111111111111111111111111111111111111111111111111111111111111111010a00000090000000010101010101010101010101010101010101010101010101010101010101010102020202020202020202020202020202020202020202020202020202020202020303030303030303030303030303030303030303030303030303030303030303040404040404040404040404040404040404040404040404040404040404040405050505050505050505050505050505050505050505050505050505050505050606060606060606060606060606060606060606060606060606060606060606070707070707070707070707070707070707070707070707070707070707070701000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa7e1e0f2e9e0d6076930671f5e63980d932b76b8dbb112954f3798878cb9ea3e500e1f5050000000000000000000000006e0000000000000000000000",
+      "canonical_state_len": 434,
+      "leaf_payload_hex": "62c90595b5c5f8602dd334fe8eabb291260d8ee0633947eac29b6cc7f1a4f51a00ca9a3b00000000000000000000000001000000000000000065cd1d0000000000000000000000006400000000000000d0020000000000002c4c0000000000000000000000000000001111111111111111111111111111111111111111111111111111111111111111010a00000090000000010101010101010101010101010101010101010101010101010101010101010102020202020202020202020202020202020202020202020202020202020202020303030303030303030303030303030303030303030303030303030303030303040404040404040404040404040404040404040404040404040404040404040405050505050505050505050505050505050505050505050505050505050505050606060606060606060606060606060606060606060606060606060606060606070707070707070707070707070707070707070707070707070707070707070701000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa7e1e0f2e9e0d6076930671f5e63980d932b76b8dbb112954f3798878cb9ea3e500e1f5050000000000000000000000006e0000000000000000000000",
+      "leaf_hash": "e331a8ed821b5313d3f121428bc8651ff7979f028d91f25fc1f4f4364d7efdb3"
+    },
+    {
+      "name": "Account 1 (Bob)",
+      "address": "7e1e0f2e9e0d6076930671f5e63980d932b76b8dbb112954f3798878cb9ea3e5",
+      "pubkey": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+      "state": {
+        "balance": 500000000,
+        "nonce": 0,
+        "allowance_limit": 0,
+        "allowance_window_start": 0,
+        "allowance_window_len": 0,
+        "allowance_spent": 0,
+        "is_frozen": false,
+        "recovery_key": "0000000000000000000000000000000000000000000000000000000000000000",
+        "guardian_enabled": false,
+        "new_recipient_delay": 10,
+        "withdrawal_delay": 144,
+        "guardians": [
+          "0000000000000000000000000000000000000000000000000000000000000000",
+          "0000000000000000000000000000000000000000000000000000000000000000",
+          "0000000000000000000000000000000000000000000000000000000000000000",
+          "0000000000000000000000000000000000000000000000000000000000000000",
+          "0000000000000000000000000000000000000000000000000000000000000000",
+          "0000000000000000000000000000000000000000000000000000000000000000",
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "pending_transfers": [],
+        "coinbase_tranches": []
+      },
+      "canonical_state_hex": "0065cd1d0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a0000009000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "canonical_state_len": 346,
+      "leaf_payload_hex": "7e1e0f2e9e0d6076930671f5e63980d932b76b8dbb112954f3798878cb9ea3e50065cd1d0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a0000009000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "leaf_hash": "e6bf1cfb475c865ac8f97eb5e912244fdd40a2b59bd925149e89017f779fe964"
+    },
+    {
+      "name": "Account 2 (Charlie)",
+      "address": "3ddaf6a594e23d3f8c353e64d423c5c1e4cd4315aec45b7b47d6e5784fb1a342",
+      "pubkey": "204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21",
+      "state": {
+        "balance": 250000000,
+        "nonce": 3,
+        "allowance_limit": 100000000,
+        "allowance_window_start": 50,
+        "allowance_window_len": 144,
+        "allowance_spent": 50000000,
+        "is_frozen": true,
+        "recovery_key": "2222222222222222222222222222222222222222222222222222222222222222",
+        "guardian_enabled": true,
+        "new_recipient_delay": 20,
+        "withdrawal_delay": 288,
+        "guardians": [
+          "1111111111111111111111111111111111111111111111111111111111111111",
+          "1212121212121212121212121212121212121212121212121212121212121212",
+          "1313131313131313131313131313131313131313131313131313131313131313",
+          "1414141414141414141414141414141414141414141414141414141414141414",
+          "1515151515151515151515151515151515151515151515151515151515151515",
+          "1616161616161616161616161616161616161616161616161616161616161616",
+          "1717171717171717171717171717171717171717171717171717171717171717"
+        ],
+        "pending_transfers": [],
+        "coinbase_tranches": []
+      },
+      "canonical_state_hex": "80b2e60e000000000000000000000000030000000000000000e1f5050000000000000000000000003200000000000000900000000000000080f0fa0200000000000000000000000001222222222222222222222222222222222222222222222222222222222222222201140000002001000011111111111111111111111111111111111111111111111111111111111111111212121212121212121212121212121212121212121212121212121212121212131313131313131313131313131313131313131313131313131313131313131314141414141414141414141414141414141414141414141414141414141414141515151515151515151515151515151515151515151515151515151515151515161616161616161616161616161616161616161616161616161616161616161617171717171717171717171717171717171717171717171717171717171717170000000000000000",
+      "canonical_state_len": 346,
+      "leaf_payload_hex": "3ddaf6a594e23d3f8c353e64d423c5c1e4cd4315aec45b7b47d6e5784fb1a34280b2e60e000000000000000000000000030000000000000000e1f5050000000000000000000000003200000000000000900000000000000080f0fa0200000000000000000000000001222222222222222222222222222222222222222222222222222222222222222201140000002001000011111111111111111111111111111111111111111111111111111111111111111212121212121212121212121212121212121212121212121212121212121212131313131313131313131313131313131313131313131313131313131313131314141414141414141414141414141414141414141414141414141414141414141515151515151515151515151515151515151515151515151515151515151515161616161616161616161616161616161616161616161616161616161616161617171717171717171717171717171717171717171717171717171717171717170000000000000000",
+      "leaf_hash": "8f8e5cfe6bf943d029dd57a7093d97815be333a27dc266abd57ead70141825a1"
+    },
+    {
+      "name": "Account 3 (Miner Dave)",
+      "address": "d9904256bdc9c3e7ffb896698bfb5bc5f40d0b44c26b174ceaa37d6de45050d6",
+      "pubkey": "66cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf7633",
+      "state": {
+        "balance": 2100000000,
+        "nonce": 0,
+        "allowance_limit": 0,
+        "allowance_window_start": 0,
+        "allowance_window_len": 0,
+        "allowance_spent": 0,
+        "is_frozen": false,
+        "recovery_key": "0000000000000000000000000000000000000000000000000000000000000000",
+        "guardian_enabled": false,
+        "new_recipient_delay": 10,
+        "withdrawal_delay": 144,
+        "guardians": [
+          "0000000000000000000000000000000000000000000000000000000000000000",
+          "0000000000000000000000000000000000000000000000000000000000000000",
+          "0000000000000000000000000000000000000000000000000000000000000000",
+          "0000000000000000000000000000000000000000000000000000000000000000",
+          "0000000000000000000000000000000000000000000000000000000000000000",
+          "0000000000000000000000000000000000000000000000000000000000000000",
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "pending_transfers": [],
+        "coinbase_tranches": [
+          {
+            "coinbase_tx_id": "26b11fa7b981aa2956c5a4c4d93a4a76bab6b7b63dd07cf3c45d7e2dddf9d061",
+            "amount": 1000000000,
+            "unlock_height": 200
+          }
+        ]
+      },
+      "canonical_state_hex": "00752b7d0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a000000900000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000026b11fa7b981aa2956c5a4c4d93a4a76bab6b7b63dd07cf3c45d7e2dddf9d06100ca9a3b000000000000000000000000c800000000000000",
+      "canonical_state_len": 402,
+      "leaf_payload_hex": "d9904256bdc9c3e7ffb896698bfb5bc5f40d0b44c26b174ceaa37d6de45050d600752b7d0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a000000900000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000026b11fa7b981aa2956c5a4c4d93a4a76bab6b7b63dd07cf3c45d7e2dddf9d06100ca9a3b000000000000000000000000c800000000000000",
+      "leaf_hash": "93db1c01b9129cb8df7111758738d773cf786cc688942430c8eb0378f7fa7ede"
+    }
+  ],
+  "state_merkle_roots": {
+    "0_accounts": {
+      "account_count": 0,
+      "sorted_addresses": [],
+      "leaf_hashes": [],
+      "state_root": "cea17a93b5d27d6fe8c246417586086579571c8b29b1b3e5988d7e3bbc873f8b"
+    },
+    "1_accounts": {
+      "account_count": 1,
+      "sorted_addresses": [
+        "62c90595b5c5f8602dd334fe8eabb291260d8ee0633947eac29b6cc7f1a4f51a"
+      ],
+      "leaf_hashes": [
+        "e331a8ed821b5313d3f121428bc8651ff7979f028d91f25fc1f4f4364d7efdb3"
+      ],
+      "state_root": "e331a8ed821b5313d3f121428bc8651ff7979f028d91f25fc1f4f4364d7efdb3"
+    },
+    "2_accounts": {
+      "account_count": 2,
+      "sorted_addresses": [
+        "62c90595b5c5f8602dd334fe8eabb291260d8ee0633947eac29b6cc7f1a4f51a",
+        "7e1e0f2e9e0d6076930671f5e63980d932b76b8dbb112954f3798878cb9ea3e5"
+      ],
+      "leaf_hashes": [
+        "e331a8ed821b5313d3f121428bc8651ff7979f028d91f25fc1f4f4364d7efdb3",
+        "e6bf1cfb475c865ac8f97eb5e912244fdd40a2b59bd925149e89017f779fe964"
+      ],
+      "state_root": "9600b23009074c1c10b65dc5f1513f590ded533e9028a7090b1a7828a0d70dda"
+    },
+    "3_accounts": {
+      "account_count": 3,
+      "sorted_addresses": [
+        "3ddaf6a594e23d3f8c353e64d423c5c1e4cd4315aec45b7b47d6e5784fb1a342",
+        "62c90595b5c5f8602dd334fe8eabb291260d8ee0633947eac29b6cc7f1a4f51a",
+        "7e1e0f2e9e0d6076930671f5e63980d932b76b8dbb112954f3798878cb9ea3e5"
+      ],
+      "leaf_hashes": [
+        "8f8e5cfe6bf943d029dd57a7093d97815be333a27dc266abd57ead70141825a1",
+        "e331a8ed821b5313d3f121428bc8651ff7979f028d91f25fc1f4f4364d7efdb3",
+        "e6bf1cfb475c865ac8f97eb5e912244fdd40a2b59bd925149e89017f779fe964"
+      ],
+      "state_root": "c95ae3a79b35cffa3fa3867d2ff9014866f550bcb2260c7c73916f70a45437d4"
+    },
+    "4_accounts": {
+      "account_count": 4,
+      "sorted_addresses": [
+        "3ddaf6a594e23d3f8c353e64d423c5c1e4cd4315aec45b7b47d6e5784fb1a342",
+        "62c90595b5c5f8602dd334fe8eabb291260d8ee0633947eac29b6cc7f1a4f51a",
+        "7e1e0f2e9e0d6076930671f5e63980d932b76b8dbb112954f3798878cb9ea3e5",
+        "d9904256bdc9c3e7ffb896698bfb5bc5f40d0b44c26b174ceaa37d6de45050d6"
+      ],
+      "leaf_hashes": [
+        "8f8e5cfe6bf943d029dd57a7093d97815be333a27dc266abd57ead70141825a1",
+        "e331a8ed821b5313d3f121428bc8651ff7979f028d91f25fc1f4f4364d7efdb3",
+        "e6bf1cfb475c865ac8f97eb5e912244fdd40a2b59bd925149e89017f779fe964",
+        "93db1c01b9129cb8df7111758738d773cf786cc688942430c8eb0378f7fa7ede"
+      ],
+      "state_root": "06d80013313472ca6688d51605a73c42f6e57f2be7a53667811a277a0617a1a4"
+    }
+  },
+  "genesis": {
+    "version": 1,
+    "chain_id": "0459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc",
+    "height": 0,
+    "parent_block_id": "0000000000000000000000000000000000000000000000000000000000000000",
+    "transaction_root": "cea17a93b5d27d6fe8c246417586086579571c8b29b1b3e5988d7e3bbc873f8b",
+    "state_root": "cea17a93b5d27d6fe8c246417586086579571c8b29b1b3e5988d7e3bbc873f8b",
+    "timestamp": 1792454400,
+    "difficulty": 1,
+    "nonce": 0,
+    "header_bytes_hex": "01000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc00000000000000000000000000000000000000000000000000000000000000000000000000000000cea17a93b5d27d6fe8c246417586086579571c8b29b1b3e5988d7e3bbc873f8bcea17a93b5d27d6fe8c246417586086579571c8b29b1b3e5988d7e3bbc873f8b00afd66a00000000010000000000000000000000000000000000000000000000",
+    "header_len": 170,
+    "block_id": "72a8588f6385c1b7cf62ae203369406f79036968dc4541f525e9fee28d15dafe"
+  },
+  "block_1_example": {
+    "version": 1,
+    "chain_id": "0459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc",
+    "height": 1,
+    "parent_block_id": "72a8588f6385c1b7cf62ae203369406f79036968dc4541f525e9fee28d15dafe",
+    "transaction_root": "9628a2822a530fc6c5e6bae58210c4bf68aa90727a50a0446e33bbc18c47449e",
+    "state_root": "e331a8ed821b5313d3f121428bc8651ff7979f028d91f25fc1f4f4364d7efdb3",
+    "timestamp": 1792454520,
+    "difficulty": 1,
+    "nonce": 12345,
+    "header_bytes_hex": "01000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc010000000000000072a8588f6385c1b7cf62ae203369406f79036968dc4541f525e9fee28d15dafe9628a2822a530fc6c5e6bae58210c4bf68aa90727a50a0446e33bbc18c47449ee331a8ed821b5313d3f121428bc8651ff7979f028d91f25fc1f4f4364d7efdb378afd66a00000000010000000000000000000000000000003930000000000000",
+    "header_len": 170,
+    "block_id": "13bb98d294fd59f8be57a58adeb235c6f6a675806604d5fcc42301f0f7d7f30f"
+  },
+  "address_derivation": {
+    "formula": "BLAKE2b-256(UTF8('OwnChain/Address/v1') || ed25519_public_key[32])",
+    "alice_private_key_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+    "alice_public_key_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+    "alice_address_hex": "7e62649584947abab19fb34633e990ce49dbbda3e80e7bb6848d88d4928f40d0",
+    "bob_private_key_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+    "bob_public_key_hex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+    "bob_address_hex": "010b76206e2af1dd1b2f84cb9c9f3ebf7d37f7065f1373a71f244a7790369ab4"
+  },
+  "signing_preimage_and_transaction": {
+    "tx_type": 1,
+    "tx_version": 1,
+    "chain_id": "0459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc",
+    "sender_pubkey": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+    "sender_address": "7e62649584947abab19fb34633e990ce49dbbda3e80e7bb6848d88d4928f40d0",
+    "recipient_address": "010b76206e2af1dd1b2f84cb9c9f3ebf7d37f7065f1373a71f244a7790369ab4",
+    "amount_atoms": 100000000,
+    "fee_atoms": 19500,
+    "nonce": 0,
+    "canonical_unsigned_tx_hex": "0101000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5cccd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a010b76206e2af1dd1b2f84cb9c9f3ebf7d37f7065f1373a71f244a7790369ab400e1f5050000000000000000000000002c4c0000000000000000000000000000",
+    "canonical_unsigned_tx_len": 131,
+    "signing_preimage_hex": "4f776e436861696e2f5478417574682f76310459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc0101000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5cccd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a010b76206e2af1dd1b2f84cb9c9f3ebf7d37f7065f1373a71f244a7790369ab400e1f5050000000000000000000000002c4c0000000000000000000000000000",
+    "signing_preimage_len": 181,
+    "signing_preimage_hash": "2f0ddd7e54e1f0f446c6d885e816f01f4f9f5f5bc78ad3ecb66970c87ca21ef9",
+    "ed25519_signature_hex": "5ce5376b58ffac25d51f1542ee088e05711335f01991517a2cbbb85b6973b390ec254b207d1bc2d57dbce08ff08afde88a580c0549247ac3a109a4bb08ae670d",
+    "canonical_signed_tx_hex": "0101000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5cccd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a010b76206e2af1dd1b2f84cb9c9f3ebf7d37f7065f1373a71f244a7790369ab400e1f5050000000000000000000000002c4c00000000000000000000000000005ce5376b58ffac25d51f1542ee088e05711335f01991517a2cbbb85b6973b390ec254b207d1bc2d57dbce08ff08afde88a580c0549247ac3a109a4bb08ae670d",
+    "canonical_signed_tx_len": 195,
+    "tx_id": "518faaf84388d69a70277d1b67940eb546607ef81777bd7c3bf4801a8f8722c0"
+  },
+  "minimum_fee_benchmarks": [
+    {
+      "desc": "Boundary zero-size",
+      "size_bytes": 0,
+      "min_fee_atoms": 1
+    },
+    {
+      "desc": "Boundary 1-byte",
+      "size_bytes": 1,
+      "min_fee_atoms": 100
+    },
+    {
+      "desc": "Coinbase tx (type 0, fixed 83 bytes)",
+      "size_bytes": 83,
+      "min_fee_atoms": 8300,
+      "note": "Coinbase pays subsidy+fees to miner, fee is not paid by coinbase itself"
+    },
+    {
+      "desc": "Standard Transfer tx (type 1, fixed 195 bytes)",
+      "size_bytes": 195,
+      "min_fee_atoms": 19500
+    },
+    {
+      "desc": "ConfigureGuardians tx (approx 363 bytes)",
+      "size_bytes": 363,
+      "min_fee_atoms": 36300
+    },
+    {
+      "desc": "CancelPendingTransfer tx (approx 443 bytes with 4 signatures)",
+      "size_bytes": 443,
+      "min_fee_atoms": 44300
+    },
+    {
+      "desc": "Arbitrary 1000-byte tx",
+      "size_bytes": 1000,
+      "min_fee_atoms": 100000
+    }
+  ],
+  "issuance_and_subsidy_schedule": {
+    "starting_subsidy_atoms": 1000000000,
+    "starting_subsidy_own": 10,
+    "halving_interval_blocks": 1050000,
+    "hard_cap_atoms": 2100000000000000,
+    "hard_cap_own": 21000000,
+    "subsidy_exhaustion_era": 30,
+    "subsidy_exhaustion_height": 31500001,
+    "final_cumulative_atoms": 2099999986350000,
+    "final_cumulative_own": "20999999.86350000",
+    "eras": [
+      {
+        "era": 0,
+        "start_height": 1,
+        "end_height": 1050000,
+        "subsidy_atoms": 1000000000,
+        "subsidy_own": "10.00000000",
+        "era_total_atoms": 1050000000000000,
+        "cumulative_atoms": 1050000000000000,
+        "cumulative_own": "10500000.00000000"
+      },
+      {
+        "era": 1,
+        "start_height": 1050001,
+        "end_height": 2100000,
+        "subsidy_atoms": 500000000,
+        "subsidy_own": "5.00000000",
+        "era_total_atoms": 525000000000000,
+        "cumulative_atoms": 1575000000000000,
+        "cumulative_own": "15750000.00000000"
+      },
+      {
+        "era": 2,
+        "start_height": 2100001,
+        "end_height": 3150000,
+        "subsidy_atoms": 250000000,
+        "subsidy_own": "2.50000000",
+        "era_total_atoms": 262500000000000,
+        "cumulative_atoms": 1837500000000000,
+        "cumulative_own": "18375000.00000000"
+      },
+      {
+        "era": 3,
+        "start_height": 3150001,
+        "end_height": 4200000,
+        "subsidy_atoms": 125000000,
+        "subsidy_own": "1.25000000",
+        "era_total_atoms": 131250000000000,
+        "cumulative_atoms": 1968750000000000,
+        "cumulative_own": "19687500.00000000"
+      },
+      {
+        "era": 4,
+        "start_height": 4200001,
+        "end_height": 5250000,
+        "subsidy_atoms": 62500000,
+        "subsidy_own": "0.62500000",
+        "era_total_atoms": 65625000000000,
+        "cumulative_atoms": 2034375000000000,
+        "cumulative_own": "20343750.00000000"
+      },
+      {
+        "era": 5,
+        "start_height": 5250001,
+        "end_height": 6300000,
+        "subsidy_atoms": 31250000,
+        "subsidy_own": "0.31250000",
+        "era_total_atoms": 32812500000000,
+        "cumulative_atoms": 2067187500000000,
+        "cumulative_own": "20671875.00000000"
+      },
+      {
+        "era": 6,
+        "start_height": 6300001,
+        "end_height": 7350000,
+        "subsidy_atoms": 15625000,
+        "subsidy_own": "0.15625000",
+        "era_total_atoms": 16406250000000,
+        "cumulative_atoms": 2083593750000000,
+        "cumulative_own": "20835937.50000000"
+      },
+      {
+        "era": 7,
+        "start_height": 7350001,
+        "end_height": 8400000,
+        "subsidy_atoms": 7812500,
+        "subsidy_own": "0.07812500",
+        "era_total_atoms": 8203125000000,
+        "cumulative_atoms": 2091796875000000,
+        "cumulative_own": "20917968.75000000"
+      },
+      {
+        "era": 8,
+        "start_height": 8400001,
+        "end_height": 9450000,
+        "subsidy_atoms": 3906250,
+        "subsidy_own": "0.03906250",
+        "era_total_atoms": 4101562500000,
+        "cumulative_atoms": 2095898437500000,
+        "cumulative_own": "20958984.37500000"
+      },
+      {
+        "era": 9,
+        "start_height": 9450001,
+        "end_height": 10500000,
+        "subsidy_atoms": 1953125,
+        "subsidy_own": "0.01953125",
+        "era_total_atoms": 2050781250000,
+        "cumulative_atoms": 2097949218750000,
+        "cumulative_own": "20979492.18750000"
+      },
+      {
+        "era": 10,
+        "start_height": 10500001,
+        "end_height": 11550000,
+        "subsidy_atoms": 976562,
+        "subsidy_own": "0.00976562",
+        "era_total_atoms": 1025390100000,
+        "cumulative_atoms": 2098974608850000,
+        "cumulative_own": "20989746.08850000"
+      },
+      {
+        "era": 11,
+        "start_height": 11550001,
+        "end_height": 12600000,
+        "subsidy_atoms": 488281,
+        "subsidy_own": "0.00488281",
+        "era_total_atoms": 512695050000,
+        "cumulative_atoms": 2099487303900000,
+        "cumulative_own": "20994873.03900000"
+      },
+      {
+        "era": 12,
+        "start_height": 12600001,
+        "end_height": 13650000,
+        "subsidy_atoms": 244140,
+        "subsidy_own": "0.00244140",
+        "era_total_atoms": 256347000000,
+        "cumulative_atoms": 2099743650900000,
+        "cumulative_own": "20997436.50900000"
+      },
+      {
+        "era": 13,
+        "start_height": 13650001,
+        "end_height": 14700000,
+        "subsidy_atoms": 122070,
+        "subsidy_own": "0.00122070",
+        "era_total_atoms": 128173500000,
+        "cumulative_atoms": 2099871824400000,
+        "cumulative_own": "20998718.24400000"
+      },
+      {
+        "era": 14,
+        "start_height": 14700001,
+        "end_height": 15750000,
+        "subsidy_atoms": 61035,
+        "subsidy_own": "0.00061035",
+        "era_total_atoms": 64086750000,
+        "cumulative_atoms": 2099935911150000,
+        "cumulative_own": "20999359.11150000"
+      },
+      {
+        "era": 15,
+        "start_height": 15750001,
+        "end_height": 16800000,
+        "subsidy_atoms": 30517,
+        "subsidy_own": "0.00030517",
+        "era_total_atoms": 32042850000,
+        "cumulative_atoms": 2099967954000000,
+        "cumulative_own": "20999679.54000000"
+      },
+      {
+        "era": 16,
+        "start_height": 16800001,
+        "end_height": 17850000,
+        "subsidy_atoms": 15258,
+        "subsidy_own": "0.00015258",
+        "era_total_atoms": 16020900000,
+        "cumulative_atoms": 2099983974900000,
+        "cumulative_own": "20999839.74900000"
+      },
+      {
+        "era": 17,
+        "start_height": 17850001,
+        "end_height": 18900000,
+        "subsidy_atoms": 7629,
+        "subsidy_own": "0.00007629",
+        "era_total_atoms": 8010450000,
+        "cumulative_atoms": 2099991985350000,
+        "cumulative_own": "20999919.85350000"
+      },
+      {
+        "era": 18,
+        "start_height": 18900001,
+        "end_height": 19950000,
+        "subsidy_atoms": 3814,
+        "subsidy_own": "0.00003814",
+        "era_total_atoms": 4004700000,
+        "cumulative_atoms": 2099995990050000,
+        "cumulative_own": "20999959.90050000"
+      },
+      {
+        "era": 19,
+        "start_height": 19950001,
+        "end_height": 21000000,
+        "subsidy_atoms": 1907,
+        "subsidy_own": "0.00001907",
+        "era_total_atoms": 2002350000,
+        "cumulative_atoms": 2099997992400000,
+        "cumulative_own": "20999979.92400000"
+      },
+      {
+        "era": 20,
+        "start_height": 21000001,
+        "end_height": 22050000,
+        "subsidy_atoms": 953,
+        "subsidy_own": "0.00000953",
+        "era_total_atoms": 1000650000,
+        "cumulative_atoms": 2099998993050000,
+        "cumulative_own": "20999989.93050000"
+      },
+      {
+        "era": 21,
+        "start_height": 22050001,
+        "end_height": 23100000,
+        "subsidy_atoms": 476,
+        "subsidy_own": "0.00000476",
+        "era_total_atoms": 499800000,
+        "cumulative_atoms": 2099999492850000,
+        "cumulative_own": "20999994.92850000"
+      },
+      {
+        "era": 22,
+        "start_height": 23100001,
+        "end_height": 24150000,
+        "subsidy_atoms": 238,
+        "subsidy_own": "0.00000238",
+        "era_total_atoms": 249900000,
+        "cumulative_atoms": 2099999742750000,
+        "cumulative_own": "20999997.42750000"
+      },
+      {
+        "era": 23,
+        "start_height": 24150001,
+        "end_height": 25200000,
+        "subsidy_atoms": 119,
+        "subsidy_own": "0.00000119",
+        "era_total_atoms": 124950000,
+        "cumulative_atoms": 2099999867700000,
+        "cumulative_own": "20999998.67700000"
+      },
+      {
+        "era": 24,
+        "start_height": 25200001,
+        "end_height": 26250000,
+        "subsidy_atoms": 59,
+        "subsidy_own": "0.00000059",
+        "era_total_atoms": 61950000,
+        "cumulative_atoms": 2099999929650000,
+        "cumulative_own": "20999999.29650000"
+      },
+      {
+        "era": 25,
+        "start_height": 26250001,
+        "end_height": 27300000,
+        "subsidy_atoms": 29,
+        "subsidy_own": "0.00000029",
+        "era_total_atoms": 30450000,
+        "cumulative_atoms": 2099999960100000,
+        "cumulative_own": "20999999.60100000"
+      },
+      {
+        "era": 26,
+        "start_height": 27300001,
+        "end_height": 28350000,
+        "subsidy_atoms": 14,
+        "subsidy_own": "0.00000014",
+        "era_total_atoms": 14700000,
+        "cumulative_atoms": 2099999974800000,
+        "cumulative_own": "20999999.74800000"
+      },
+      {
+        "era": 27,
+        "start_height": 28350001,
+        "end_height": 29400000,
+        "subsidy_atoms": 7,
+        "subsidy_own": "0.00000007",
+        "era_total_atoms": 7350000,
+        "cumulative_atoms": 2099999982150000,
+        "cumulative_own": "20999999.82150000"
+      },
+      {
+        "era": 28,
+        "start_height": 29400001,
+        "end_height": 30450000,
+        "subsidy_atoms": 3,
+        "subsidy_own": "0.00000003",
+        "era_total_atoms": 3150000,
+        "cumulative_atoms": 2099999985300000,
+        "cumulative_own": "20999999.85300000"
+      },
+      {
+        "era": 29,
+        "start_height": 30450001,
+        "end_height": 31500000,
+        "subsidy_atoms": 1,
+        "subsidy_own": "0.00000001",
+        "era_total_atoms": 1050000,
+        "cumulative_atoms": 2099999986350000,
+        "cumulative_own": "20999999.86350000"
+      },
+      {
+        "era": 30,
+        "start_height": 31500001,
+        "end_height": 32550000,
+        "subsidy_atoms": 0,
+        "subsidy_own": "0.00000000",
+        "era_total_atoms": 0,
+        "cumulative_atoms": 2099999986350000,
+        "cumulative_own": "20999999.86350000"
+      }
+    ]
+  },
+  "per_transfer_lock_and_guardian_scenario": {
+    "description": "Deterministic step-by-step per-transfer pending lock, spendability of unrelated funds, maturity vs cancellation",
+    "initial_state": {
+      "alice": {
+        "address": "7e62649584947abab19fb34633e990ce49dbbda3e80e7bb6848d88d4928f40d0",
+        "balance": 1000000000,
+        "nonce": 0,
+        "guardian_enabled": true,
+        "guardians": [
+          "0101010101010101010101010101010101010101010101010101010101010101",
+          "0202020202020202020202020202020202020202020202020202020202020202",
+          "0303030303030303030303030303030303030303030303030303030303030303",
+          "0404040404040404040404040404040404040404040404040404040404040404",
+          "0505050505050505050505050505050505050505050505050505050505050505",
+          "0606060606060606060606060606060606060606060606060606060606060606",
+          "0707070707070707070707070707070707070707070707070707070707070707"
+        ],
+        "new_recipient_delay": 10,
+        "withdrawal_delay": 144,
+        "pending_transfers": [],
+        "coinbase_tranches": []
+      },
+      "bob": {
+        "address": "010b76206e2af1dd1b2f84cb9c9f3ebf7d37f7065f1373a71f244a7790369ab4",
+        "balance": 500000000,
+        "nonce": 0,
+        "guardian_enabled": false,
+        "pending_transfers": [],
+        "coinbase_tranches": []
+      }
+    },
+    "step_1_alice_sends_protected_first_time_transfer": {
+      "block_height": 100,
+      "action": "Alice sends 100,000,000 atoms (1 OWN) to Bob (new recipient)",
+      "fee_atoms": 19500,
+      "transfer_id": "518faaf84388d69a70277d1b67940eb546607ef81777bd7c3bf4801a8f8722c0",
+      "delay_blocks": 10,
+      "release_height": 110,
+      "alice_state_after": {
+        "balance": 899980500,
+        "nonce": 1,
+        "pending_transfers": [
+          {
+            "transfer_id": "518faaf84388d69a70277d1b67940eb546607ef81777bd7c3bf4801a8f8722c0",
+            "recipient": "010b76206e2af1dd1b2f84cb9c9f3ebf7d37f7065f1373a71f244a7790369ab4",
+            "amount": 100000000,
+            "release_height": 110
+          }
+        ],
+        "coinbase_tranches": []
+      },
+      "bob_state_after": {
+        "balance": 500000000,
+        "nonce": 0,
+        "spendable_balance": 500000000
+      }
+    },
+    "step_2_bob_spends_unrelated_funds_while_transfer_is_pending": {
+      "block_height": 105,
+      "note": "105 < release_height 110. Bob's existing 500,000,000 atoms remain fully spendable!",
+      "action": "Bob spends 50,000,000 atoms to Charlie",
+      "bob_fee_atoms": 19500,
+      "bob_state_after": {
+        "balance": 449980500,
+        "nonce": 1,
+        "spendable_balance": 449980500
+      },
+      "pending_transfer_status": "Still pending in Alice account until height 110"
+    },
+    "step_3_branch_a_maturity_at_release_height": {
+      "block_height": 110,
+      "action": "Height 110 reached: pending transfer matures and is credited to Bob",
+      "alice_state_after": {
+        "balance": 899980500,
+        "nonce": 1,
+        "pending_transfers": [],
+        "coinbase_tranches": []
+      },
+      "bob_state_after": {
+        "balance": 549980500,
+        "nonce": 1,
+        "spendable_balance": 549980500
+      }
+    },
+    "step_3_branch_b_cancellation_before_maturity": {
+      "block_height": 106,
+      "action": "Alice detects unauthorized transfer and cancels with 4-of-7 guardian quorum",
+      "authorization": "Alice sender signature + 4-of-7 distinct guardian signatures",
+      "cancel_fee_atoms": 20000,
+      "rules": {
+        "original_fee_refunded": false,
+        "principal_restored": true,
+        "nonce_reused": false,
+        "cancel_consumes_new_nonce": true
+      },
+      "alice_state_after": {
+        "balance": 999960500,
+        "nonce": 2,
+        "pending_transfers": [],
+        "coinbase_tranches": []
+      },
+      "bob_state_after": {
+        "balance": 449980500,
+        "nonce": 1,
+        "spendable_balance": 449980500
+      }
+    },
+    "overlapping_delays": {
+      "note": "Multiple transfers from same account have independent pending records and release heights",
+      "transfer_1": {
+        "amount": 100000000,
+        "release_height": 110
+      },
+      "transfer_2_delayed_withdrawal": {
+        "amount": 200000000,
+        "request_height": 102,
+        "delay_blocks": 144,
+        "release_height": 246
+      },
+      "behavior": "Transfer 1 matures at 110, Transfer 2 matures at 246. Neither interferes with the other."
+    },
+    "reorganization_rollback": {
+      "rule": "If block 100 is reorganized out, all atomic transitions are reversed: Alice balance returns to 1,000,000,000, Alice nonce returns to 0, pending record is removed."
+    }
+  },
+  "coinbase_maturity_scenarios": {
+    "rule_summary": "Coinbase rewards must mature for 100 blocks (unlock_height = height + 100). The transparent account ledger tracks immature rewards in canonical per-account coinbase_tranches. spendable_balance = balance - sum(immature_coinbase_tranches). A transaction must not spend immature coinbase value even when mingled with mature funds. At block height >= unlock_height, tranches mature and are removed from the account state.",
+    "case_1_new_coinbase_reward": {
+      "description": "Miner receives block 1 coinbase reward (10 OWN). Reward is recorded as an immature tranche; spendable balance remains 0.",
+      "block_height": 1,
+      "coinbase_tx_id": "38ba81669098c844c5657d3418c5541a8bf4e186f1f1879ff816bc146229c9da",
+      "payout_atoms": 1000000000,
+      "maturity_delay_blocks": 100,
+      "unlock_height": 101,
+      "miner_state_after": {
+        "balance": 1000000000,
+        "nonce": 0,
+        "immature_coinbase_balance": 1000000000,
+        "spendable_balance": 0,
+        "coinbase_tranches": [
+          {
+            "coinbase_tx_id": "38ba81669098c844c5657d3418c5541a8bf4e186f1f1879ff816bc146229c9da",
+            "amount": 1000000000,
+            "unlock_height": 101
+          }
+        ]
+      },
+      "spend_validation_at_height_1": {
+        "attempted_spend_atoms": 100000000,
+        "spendable_balance": 0,
+        "result": "REJECTED (ErrImmatureCoinbaseSpend: spend exceeds spendable balance)"
+      }
+    },
+    "case_2_partially_mature_account": {
+      "description": "Miner has 500,000,000 mature atoms, then mines block 100 receiving 1,000,000,000 atoms reward. Total balance is 1,500,000,000, but only 500,000,000 is spendable.",
+      "block_height": 100,
+      "coinbase_tx_id": "26b11fa7b981aa2956c5a4c4d93a4a76bab6b7b63dd07cf3c45d7e2dddf9d061",
+      "payout_atoms": 1000000000,
+      "unlock_height": 200,
+      "miner_state_after": {
+        "balance": 1500000000,
+        "nonce": 0,
+        "immature_coinbase_balance": 1000000000,
+        "spendable_balance": 500000000,
+        "coinbase_tranches": [
+          {
+            "coinbase_tx_id": "26b11fa7b981aa2956c5a4c4d93a4a76bab6b7b63dd07cf3c45d7e2dddf9d061",
+            "amount": 1000000000,
+            "unlock_height": 200
+          }
+        ]
+      }
+    },
+    "case_3_spending_mature_funds_while_reward_immature": {
+      "description": "At height 105 (< 200), miner spends 200,000,000 atoms + 19,500 fee from mature balance. Spend succeeds; immature reward remains untouched.",
+      "block_height": 105,
+      "spend_amount_atoms": 200000000,
+      "fee_atoms": 19500,
+      "total_spend_atoms": 200019500,
+      "spendable_balance_before": 500000000,
+      "result": "ACCEPTED (200,019,500 <= spendable_balance 500,000,000)",
+      "miner_state_after": {
+        "balance": 1299980500,
+        "nonce": 1,
+        "immature_coinbase_balance": 1000000000,
+        "spendable_balance": 299980500,
+        "coinbase_tranches": [
+          {
+            "coinbase_tx_id": "26b11fa7b981aa2956c5a4c4d93a4a76bab6b7b63dd07cf3c45d7e2dddf9d061",
+            "amount": 1000000000,
+            "unlock_height": 200
+          }
+        ]
+      }
+    },
+    "case_4_rejection_of_spend_exceeding_mature_funds": {
+      "description": "At height 106 (< 200), miner attempts to spend 400,000,000 atoms. Total spend 400,019,500 <= balance 1,299,980,500, but > spendable_balance 299,980,500. Attempted spend of immature coinbase value is rejected.",
+      "block_height": 106,
+      "attempted_spend_amount_atoms": 400000000,
+      "fee_atoms": 19500,
+      "total_attempted_atoms": 400019500,
+      "spendable_balance": 299980500,
+      "total_balance": 1299980500,
+      "result": "REJECTED (ErrImmatureCoinbaseSpend: attempted spend exceeds spendable balance)",
+      "miner_state_after": {
+        "balance": 1299980500,
+        "nonce": 1,
+        "spendable_balance": 299980500,
+        "note": "State unchanged: transaction rejected before state modification"
+      }
+    },
+    "case_5_exact_unlock_height_boundary": {
+      "description": "At height 199, tranche remains immature. At height 200 (exact unlock_height), tranche matures and is removed; full balance becomes spendable.",
+      "height_199_pre_maturity": {
+        "block_height": 199,
+        "tranche_status": "Immature (unlock_height 200 > 199)",
+        "spendable_balance": 299980500,
+        "immature_coinbase_balance": 1000000000,
+        "tranche_count": 1
+      },
+      "height_200_exact_unlock": {
+        "block_height": 200,
+        "tranche_status": "Matured (unlock_height 200 <= 200)",
+        "action": "Tranche is removed from coinbase_tranches at start of block 200 state transition",
+        "miner_state_after": {
+          "balance": 1299980500,
+          "nonce": 1,
+          "immature_coinbase_balance": 0,
+          "spendable_balance": 1299980500,
+          "coinbase_tranches": []
+        },
+        "post_maturity_spend_validation": {
+          "attempted_spend_atoms": 1000000000,
+          "fee_atoms": 19500,
+          "total_spend_atoms": 1000019500,
+          "result": "ACCEPTED (1,000,019,500 <= spendable_balance 1,299,980,500)"
+        }
+      }
+    }
+  },
+  "consensus_parameters_summary": {
+    "header_size_bytes": 170,
+    "block_size_limit_bytes": 2000000,
+    "tx_size_limit_bytes": 1000000,
+    "starting_subsidy_own": 10,
+    "halving_interval_blocks": 1050000,
+    "issuance_cap_own": 21000000,
+    "min_fee_formula": "max(1, 100 * canonical_signed_tx_size)",
+    "ordinary_maturity_blocks": 1,
+    "coinbase_maturity_blocks": 100,
+    "spendable_balance_formula": "balance - sum(immature_coinbase_tranches)",
+    "new_recipient_delay_blocks": 10,
+    "withdrawal_delay_blocks": 144,
+    "guardian_count_per_account": 7,
+    "quorum_strengthen_protections": "3-of-7",
+    "quorum_weaken_protections_and_recovery": "4-of-7"
+  }
+}

@@ -17,6 +17,7 @@
 //! Design decisions live in `docs/protocol-v1.md`. Wallets, p2p networking,
 //! mempool, and stateful Orchard consensus accounting belong to later milestones.
 
+pub mod account;
 pub mod block;
 pub mod chain;
 pub mod difficulty;
@@ -26,6 +27,7 @@ pub mod hash;
 pub mod header;
 pub mod merkle;
 pub mod orchard_root;
+pub mod orchard_tree;
 pub mod orchard_tx;
 pub mod randomx;
 pub mod tx;

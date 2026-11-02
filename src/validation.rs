@@ -666,7 +666,14 @@ fn validate_transactions(
     if context.parent.is_some() {
         let mut total_actions = 0usize;
         for raw in &block.transactions {
-            if raw.len() > tx::TX_ENVELOPE_LEN + 8 {
+            let tag = *raw.first().unwrap_or(&0xff);
+            let has_direct_bundle = match tag {
+                tx::TX_TYPE_COINBASE => raw.len() > 83,
+                tx::TX_TYPE_TRANSPARENT_TRANSFER => raw.len() != 195, // legacy M1-B OrchardTransfer
+                tx::TX_TYPE_SHIELDED_TRANSFER => true,
+                _ => false,
+            };
+            if has_direct_bundle && raw.len() > tx::TX_ENVELOPE_LEN + 8 {
                 let mut bundle_slice = &raw[tx::TX_ENVELOPE_LEN + 8..];
                 if let Ok(n_actions) = crate::orchard_tx::decode_compact_size(&mut bundle_slice) {
                     total_actions = total_actions.checked_add(n_actions).ok_or(
@@ -814,36 +821,129 @@ fn validate_transactions(
         let mut total_actions = 0usize;
 
         for (index, raw) in block.transactions.iter().enumerate() {
-            let validated =
-                crate::orchard_tx::validate_transaction_stateless(raw, context.chain_id, vk)
+            let env = &envelopes[index];
+            match env.tx_type {
+                TxType::Coinbase => {
+                    if raw.len() == 83 {
+                        // Transparent coinbase: structural fields verified above;
+                        // value and tranche maturity verified in state execution.
+                        continue;
+                    }
+                    let validated = crate::orchard_tx::validate_transaction_stateless(
+                        raw,
+                        context.chain_id,
+                        vk,
+                    )
                     .map_err(|error| ValidationError::InvalidOrchardTransaction { index, error })?;
 
-            let action_count = validated.bundle().actions().len();
-            total_actions = total_actions.checked_add(action_count).ok_or(
-                ValidationError::TooManyBlockActions {
-                    actual: usize::MAX,
-                    limit: crate::orchard_tx::MAX_ACTIONS_PER_BLOCK,
-                },
-            )?;
+                    let action_count = validated.bundle().actions().len();
+                    total_actions = total_actions.checked_add(action_count).ok_or(
+                        ValidationError::TooManyBlockActions {
+                            actual: usize::MAX,
+                            limit: crate::orchard_tx::MAX_ACTIONS_PER_BLOCK,
+                        },
+                    )?;
+                }
+                TxType::TransparentTransfer => {
+                    if raw.len() != 195 {
+                        // Legacy M1-B OrchardTransfer
+                        let validated = crate::orchard_tx::validate_transaction_stateless(
+                            raw,
+                            context.chain_id,
+                            vk,
+                        )
+                        .map_err(|error| {
+                            ValidationError::InvalidOrchardTransaction { index, error }
+                        })?;
 
-            if validated.tx_type() == TxType::OrchardTransfer {
-                let declared_fee = validated.fee_atoms().unwrap_or(0);
-                match crate::orchard_tx::check_transaction_fee(
-                    action_count,
-                    raw.len(),
-                    declared_fee,
-                ) {
-                    Ok(_) => {}
-                    Err(crate::orchard_tx::FeeError::Overflow) => {
-                        return Err(ValidationError::FeeCalculationOverflow { index });
+                        let action_count = validated.bundle().actions().len();
+                        total_actions = total_actions.checked_add(action_count).ok_or(
+                            ValidationError::TooManyBlockActions {
+                                actual: usize::MAX,
+                                limit: crate::orchard_tx::MAX_ACTIONS_PER_BLOCK,
+                            },
+                        )?;
+
+                        let declared_fee = validated.fee_atoms().unwrap_or(0);
+                        match crate::orchard_tx::check_transaction_fee(
+                            action_count,
+                            raw.len(),
+                            declared_fee,
+                        ) {
+                            Ok(_) => {}
+                            Err(crate::orchard_tx::FeeError::Overflow) => {
+                                return Err(ValidationError::FeeCalculationOverflow { index });
+                            }
+                            Err(crate::orchard_tx::FeeError::Mismatch { declared, expected }) => {
+                                return Err(ValidationError::IncorrectTransactionFee {
+                                    index,
+                                    declared,
+                                    expected,
+                                });
+                            }
+                        }
+                    } else {
+                        let fee = tx::transaction_fee(raw).unwrap_or(0);
+                        let min_fee = std::cmp::max(1u64, (raw.len() as u64).saturating_mul(100));
+                        if fee < min_fee {
+                            return Err(ValidationError::IncorrectTransactionFee {
+                                index,
+                                declared: fee,
+                                expected: min_fee,
+                            });
+                        }
                     }
-                    Err(crate::orchard_tx::FeeError::Mismatch { declared, expected }) => {
+                }
+                TxType::ShieldedTransfer | TxType::OrchardTransfer => {
+                    let validated = crate::orchard_tx::validate_transaction_stateless(
+                        raw,
+                        context.chain_id,
+                        vk,
+                    )
+                    .map_err(|error| ValidationError::InvalidOrchardTransaction { index, error })?;
+
+                    let action_count = validated.bundle().actions().len();
+                    total_actions = total_actions.checked_add(action_count).ok_or(
+                        ValidationError::TooManyBlockActions {
+                            actual: usize::MAX,
+                            limit: crate::orchard_tx::MAX_ACTIONS_PER_BLOCK,
+                        },
+                    )?;
+
+                    let declared_fee = validated.fee_atoms().unwrap_or(0);
+                    match crate::orchard_tx::check_transaction_fee(
+                        action_count,
+                        raw.len(),
+                        declared_fee,
+                    ) {
+                        Ok(_) => {}
+                        Err(crate::orchard_tx::FeeError::Overflow) => {
+                            return Err(ValidationError::FeeCalculationOverflow { index });
+                        }
+                        Err(crate::orchard_tx::FeeError::Mismatch { declared, expected }) => {
+                            return Err(ValidationError::IncorrectTransactionFee {
+                                index,
+                                declared,
+                                expected,
+                            });
+                        }
+                    }
+                }
+                TxType::ConfigureGuardians
+                | TxType::GuardianAction
+                | TxType::CancelPendingTransfer => {
+                    let fee = tx::transaction_fee(raw).unwrap_or(0);
+                    let min_fee = std::cmp::max(1u64, (raw.len() as u64).saturating_mul(100));
+                    if fee < min_fee {
                         return Err(ValidationError::IncorrectTransactionFee {
                             index,
-                            declared,
-                            expected,
+                            declared: fee,
+                            expected: min_fee,
                         });
                     }
+                }
+                TxType::TransparentToShielded | TxType::ShieldedToTransparent => {
+                    // Validated during state transition
                 }
             }
         }

@@ -1,0 +1,434 @@
+{
+  "metadata": {
+    "title": "OwnChain Protocol v1 \u2014 Hybrid Golden Test Vectors",
+    "version": 1,
+    "hash_function": "BLAKE2b-256",
+    "pinned_orchard_crate": "0.16.0",
+    "orchard_empty_root_hex": "ae2935f1dfd8a24aed7c70df7de3a668eb7a49b1319880dde2bbd9031ae5d82f",
+    "devnet_chain_id_hex": "0459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc",
+    "testnet_chain_id_hex": "8ba087ef6031654d96f608d75e144642a0750c26e84cb39637caee484e3c4de1"
+  },
+  "merkle_commitments": {
+    "empty_transparent_tree": {
+      "domain": "OwnChain/Merkle/Empty/v1",
+      "root_hex": "cea17a93b5d27d6fe8c246417586086579571c8b29b1b3e5988d7e3bbc873f8b"
+    },
+    "empty_orchard_tree": {
+      "source": "orchard::tree::Anchor::empty_tree()",
+      "root_hex": "ae2935f1dfd8a24aed7c70df7de3a668eb7a49b1319880dde2bbd9031ae5d82f"
+    },
+    "empty_nullifier_tree": {
+      "domain": "OwnChain/Nullifier/Empty/v1",
+      "root_hex": "21fc037d2315759fece0ff09af49515016004c1ad49b62d0338a326c564fd765"
+    },
+    "pool_balance_commitments": {
+      "balance_0_atoms": {
+        "balance": 0,
+        "commitment_hex": "2f956d7ad7aef2f72f4b83dca90e55a842d4618a76701f9bc1f94179242c5ba8"
+      },
+      "balance_1_own": {
+        "balance": 100000000,
+        "commitment_hex": "ba3e50cd918754f128ef7ca50a4e9928dd07be30d98b032132346ea6f3539124"
+      },
+      "balance_10_own": {
+        "balance": 1000000000,
+        "commitment_hex": "d8031be232626057e714c7b88d00b3660b0ee2969fc39348d18fa41293253298"
+      }
+    },
+    "composite_genesis_state_root": {
+      "formula": "BLAKE2b-256(UTF8('OwnChain/CompositeStateRoot/v1') || T_root || O_root || NF_root || S_comm)",
+      "domain": "OwnChain/CompositeStateRoot/v1",
+      "domain_len": 30,
+      "transparent_root_hex": "cea17a93b5d27d6fe8c246417586086579571c8b29b1b3e5988d7e3bbc873f8b",
+      "orchard_root_hex": "ae2935f1dfd8a24aed7c70df7de3a668eb7a49b1319880dde2bbd9031ae5d82f",
+      "nullifier_root_hex": "21fc037d2315759fece0ff09af49515016004c1ad49b62d0338a326c564fd765",
+      "pool_commitment_hex": "2f956d7ad7aef2f72f4b83dca90e55a842d4618a76701f9bc1f94179242c5ba8",
+      "composite_state_root_hex": "a6a88639bbf0a133b9398c6e4ac1a16bb490afeedb338d1cedbbcf427e68277d"
+    },
+    "transparent_account_trees": {
+      "accounts_1": {
+        "count": 1,
+        "sorted_addresses_hex": [
+          "4d6cbb98f2efe3b7d315128af2c5f78d8204f5694fd0a28d76909a7f128c0ffe"
+        ],
+        "merkle_root_hex": "13f2b7b7c037d99ae1c4c08c9627c28271f32584a19670df12f7acbac3ab5482"
+      },
+      "accounts_2": {
+        "count": 2,
+        "sorted_addresses_hex": [
+          "4d6cbb98f2efe3b7d315128af2c5f78d8204f5694fd0a28d76909a7f128c0ffe",
+          "b5dafe83f6b1b5771b22fa85f4d0869420c8f6caa6df8e79bdc2437a20fb4663"
+        ],
+        "merkle_root_hex": "089dccdae780b80ceb0b3645ab562fe74572493d342e5fa37d8b54dd9d45410f"
+      },
+      "accounts_3": {
+        "count": 3,
+        "sorted_addresses_hex": [
+          "100166d3bbf0736ee980a3eea87f1adedadb331187b7aca6140b28e7df6e8b70",
+          "4d6cbb98f2efe3b7d315128af2c5f78d8204f5694fd0a28d76909a7f128c0ffe",
+          "b5dafe83f6b1b5771b22fa85f4d0869420c8f6caa6df8e79bdc2437a20fb4663"
+        ],
+        "merkle_root_hex": "61b0a6b94e97693ba957f972a1b44a9e6b1dde553354b7edf6627f8d1efdcd60"
+      },
+      "accounts_4": {
+        "count": 4,
+        "sorted_addresses_hex": [
+          "100166d3bbf0736ee980a3eea87f1adedadb331187b7aca6140b28e7df6e8b70",
+          "4d6cbb98f2efe3b7d315128af2c5f78d8204f5694fd0a28d76909a7f128c0ffe",
+          "b5dafe83f6b1b5771b22fa85f4d0869420c8f6caa6df8e79bdc2437a20fb4663",
+          "ff63184a01590f03d8ddeaf327086dd69a99cb454e1be48c4dffcf0e0dd78cb0"
+        ],
+        "merkle_root_hex": "0c2a2108d4c2edeb8fd0e9cc816a550f71fc6102b94ddc9fd4914f80ca50e082"
+      }
+    },
+    "nullifier_trees": {
+      "nullifiers_1": {
+        "count": 1,
+        "sorted_nullifiers_hex": [
+          "29c5ebc54ec78f43a4751abcbf21208abef48a0dfc0d08d137fba68bd9561b14"
+        ],
+        "merkle_root_hex": "9b61a3db2cdf4d863fb287fca20ce2e6e5bf4b485f9d331f54cd4e6ee3062a97"
+      },
+      "nullifiers_2": {
+        "count": 2,
+        "sorted_nullifiers_hex": [
+          "19c8a0567a80f7d501f272cc43cd270649b366aa1faa887b48f23da044ffc502",
+          "29c5ebc54ec78f43a4751abcbf21208abef48a0dfc0d08d137fba68bd9561b14"
+        ],
+        "merkle_root_hex": "c609ee3742f1f7e0fe11e38dc3358712cc9437588b5e7bcf54c404e30bb7d259"
+      },
+      "nullifiers_3": {
+        "count": 3,
+        "sorted_nullifiers_hex": [
+          "19c8a0567a80f7d501f272cc43cd270649b366aa1faa887b48f23da044ffc502",
+          "29c5ebc54ec78f43a4751abcbf21208abef48a0dfc0d08d137fba68bd9561b14",
+          "5be19f09608d3769795414b00759182a52398acf78b49095076d2f0a6e75920d"
+        ],
+        "merkle_root_hex": "aeae7fa9fa7796d0c5ec760a20b76a9e9ae2362cdeb9001aa90a557caebb255b"
+      },
+      "nullifiers_4": {
+        "count": 4,
+        "sorted_nullifiers_hex": [
+          "19c8a0567a80f7d501f272cc43cd270649b366aa1faa887b48f23da044ffc502",
+          "29c5ebc54ec78f43a4751abcbf21208abef48a0dfc0d08d137fba68bd9561b14",
+          "4caa546bad1d67c53c51ac7916aebd3debb5e3f193dc1fc19c1ac03ae0a5fbd0",
+          "5be19f09608d3769795414b00759182a52398acf78b49095076d2f0a6e75920d"
+        ],
+        "merkle_root_hex": "2e9dadaef88296b8d7d4c7943334579333c2ea4947335417b2d5fa81ea0ebefc"
+      }
+    }
+  },
+  "transactions": {
+    "type_0_coinbase": {
+      "tx_type": 0,
+      "name": "Coinbase",
+      "chain_id_hex": "0459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc",
+      "height": 1,
+      "recipient_hex": "4d6cbb98f2efe3b7d315128af2c5f78d8204f5694fd0a28d76909a7f128c0ffe",
+      "payout_atoms": 1000000000,
+      "canonical_signed_bytes_hex": "0001000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc01000000000000004d6cbb98f2efe3b7d315128af2c5f78d8204f5694fd0a28d76909a7f128c0ffe00ca9a3b00000000",
+      "canonical_size_bytes": 83,
+      "tx_id_hex": "8dcae0773a3d2d948b28cca9a14e3540ae288fcdb0e742bb2ed78852b825c3ea",
+      "fee_atoms": 0,
+      "expected_validation": "valid"
+    },
+    "type_1_transparent_transfer": {
+      "tx_type": 1,
+      "name": "TransparentTransfer",
+      "sender_pubkey_hex": "0fd76d01f112dbe3512c7465a9f94ca38cabdcd3b3f21896b9793cb7a6b61ec7",
+      "sender_address_hex": "4d6cbb98f2efe3b7d315128af2c5f78d8204f5694fd0a28d76909a7f128c0ffe",
+      "recipient_address_hex": "b5dafe83f6b1b5771b22fa85f4d0869420c8f6caa6df8e79bdc2437a20fb4663",
+      "amount_atoms": 100000000,
+      "fee_atoms": 19500,
+      "nonce": 0,
+      "canonical_unsigned_bytes_hex": "0101000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc0fd76d01f112dbe3512c7465a9f94ca38cabdcd3b3f21896b9793cb7a6b61ec7b5dafe83f6b1b5771b22fa85f4d0869420c8f6caa6df8e79bdc2437a20fb466300e1f5050000000000000000000000002c4c0000000000000000000000000000",
+      "signing_preimage_hex": "4f776e436861696e2f5478417574682f76310459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc0101000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc0fd76d01f112dbe3512c7465a9f94ca38cabdcd3b3f21896b9793cb7a6b61ec7b5dafe83f6b1b5771b22fa85f4d0869420c8f6caa6df8e79bdc2437a20fb466300e1f5050000000000000000000000002c4c0000000000000000000000000000",
+      "canonical_signed_bytes_hex": "0101000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc0fd76d01f112dbe3512c7465a9f94ca38cabdcd3b3f21896b9793cb7a6b61ec7b5dafe83f6b1b5771b22fa85f4d0869420c8f6caa6df8e79bdc2437a20fb466300e1f5050000000000000000000000002c4c000000000000000000000000000011111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+      "canonical_size_bytes": 195,
+      "min_fee_atoms": 19500,
+      "tx_id_hex": "568e4dad3d6aaab1363a58cb481a587e343b187fe3da98cee23dafcb6001a189",
+      "expected_validation": "valid"
+    },
+    "type_2_configure_guardians": {
+      "tx_type": 2,
+      "name": "ConfigureGuardians",
+      "account_pubkey_hex": "0fd76d01f112dbe3512c7465a9f94ca38cabdcd3b3f21896b9793cb7a6b61ec7",
+      "guardian_keys_hex": [
+        "01e7c69d5e579d3ce0c20a0a8afc0dc249950d932257dc8d5510d53b62b9d042",
+        "b229503b421de127d17712b2a065d444ea3bb82b2bbcc79575b9aeef2c5a36de",
+        "00aea4b20909c3b0428e162e36b37f73abb3ce45d80e966388e367b6e44aa16f",
+        "8af5d74d9eb374688c71491c1ced80e6178f0feb1cbcbdcfb750ebda9ae2495a",
+        "e9bca01e889b316e60f868c8a9487555ef0462a8a11c44246c1eae6fdd24a874",
+        "6dd969a4e8eb73803068aa69243623f36524f2812f7775cb27c134d1ca6d2ebf",
+        "3a34750becff4a960af9e2efd8f4e9d6f88650eb0c99b34d4cd6a45fe3610561"
+      ],
+      "new_recipient_delay": 10,
+      "withdrawal_delay": 144,
+      "allowance_limit_atoms": 500000000,
+      "allowance_window_len": 720,
+      "recovery_key_hex": "e6bdbe70872a627520762c013038df140eef92fe7c0534571bfe958366235662",
+      "canonical_signed_bytes_hex": "0201000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc0fd76d01f112dbe3512c7465a9f94ca38cabdcd3b3f21896b9793cb7a6b61ec7010000000000000050c300000000000001e7c69d5e579d3ce0c20a0a8afc0dc249950d932257dc8d5510d53b62b9d042b229503b421de127d17712b2a065d444ea3bb82b2bbcc79575b9aeef2c5a36de00aea4b20909c3b0428e162e36b37f73abb3ce45d80e966388e367b6e44aa16f8af5d74d9eb374688c71491c1ced80e6178f0feb1cbcbdcfb750ebda9ae2495ae9bca01e889b316e60f868c8a9487555ef0462a8a11c44246c1eae6fdd24a8746dd969a4e8eb73803068aa69243623f36524f2812f7775cb27c134d1ca6d2ebf3a34750becff4a960af9e2efd8f4e9d6f88650eb0c99b34d4cd6a45fe36105610a000000900000000065cd1d000000000000000000000000d002000000000000e6bdbe70872a627520762c013038df140eef92fe7c0534571bfe9583662356622222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222200",
+      "canonical_size_bytes": 436,
+      "min_fee_atoms": 43600,
+      "tx_id_hex": "af1b5aebfb3082639b2721cb649d3f4413737acb655544108b787091a2dc9cdb",
+      "expected_validation": "valid"
+    },
+    "type_3_guardian_action": {
+      "tx_type": 3,
+      "name": "GuardianAction",
+      "account_address_hex": "4d6cbb98f2efe3b7d315128af2c5f78d8204f5694fd0a28d76909a7f128c0ffe",
+      "action_type": 5,
+      "action_name": "Freeze",
+      "quorum_count": 4,
+      "canonical_signed_bytes_hex": "0301000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc4d6cbb98f2efe3b7d315128af2c5f78d8204f5694fd0a28d76909a7f128c0ffe05b88800000000000000000000040030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030013131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313102323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232320333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333",
+      "canonical_size_bytes": 341,
+      "min_fee_atoms": 34100,
+      "tx_id_hex": "671558f626e5d5d99cee28d51ecd254e79630d9d2b6db00e687d38b6a1681ce3",
+      "expected_validation": "valid"
+    },
+    "type_4_cancel_pending_transfer": {
+      "tx_type": 4,
+      "name": "CancelPendingTransfer",
+      "transfer_id_hex": "3c44005fc0ce4672473559c2887f5038129c5f325e28ff2af5d4df0cc893629b",
+      "sender_pubkey_hex": "0fd76d01f112dbe3512c7465a9f94ca38cabdcd3b3f21896b9793cb7a6b61ec7",
+      "quorum_count": 4,
+      "canonical_signed_bytes_hex": "0401000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc0fd76d01f112dbe3512c7465a9f94ca38cabdcd3b3f21896b9793cb7a6b61ec73c44005fc0ce4672473559c2887f5038129c5f325e28ff2af5d4df0cc893629b3075000000000000020000000000000040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040040041414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141014242424242424242424242424242424242424242424242424242424242424242424242424242424242424242424242424242424242424242424242424242424202434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343430344444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444",
+      "canonical_size_bytes": 440,
+      "min_fee_atoms": 44000,
+      "tx_id_hex": "31532eba16a19af73d3b08b3d64ecbd679ffa7b8cb4d86029477027aab9e4cc7",
+      "expected_validation": "valid"
+    },
+    "type_5_shielded_transfer": {
+      "tx_type": 5,
+      "name": "ShieldedTransfer",
+      "fee_atoms": 10000,
+      "nullifiers_hex": [
+        "29c5ebc54ec78f43a4751abcbf21208abef48a0dfc0d08d137fba68bd9561b14"
+      ],
+      "canonical_signed_bytes_hex": "0501000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc10270000000000004f72636861726442756e646c65466978747572655f4669786564506f73744e75365f325f50726f6f665f416e645f53696773",
+      "canonical_size_bytes": 93,
+      "min_fee_atoms": 9300,
+      "tx_id_hex": "b2263f9bd5fed8c4eb2ffa7b7ec1fb8cced438ef46e50fcc7f6b1fb2a6791a45",
+      "pool_accounting": "shielded_pool_balance -= 10_000 atoms (paid to miner)",
+      "expected_validation": "valid"
+    },
+    "type_6_transparent_to_shielded": {
+      "tx_type": 6,
+      "name": "TransparentToShielded",
+      "sender_pubkey_hex": "0fd76d01f112dbe3512c7465a9f94ca38cabdcd3b3f21896b9793cb7a6b61ec7",
+      "shielded_amount_atoms": 200000000,
+      "fee_atoms": 25000,
+      "nonce": 3,
+      "canonical_signed_bytes_hex": "0601000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5ccc0fd76d01f112dbe3512c7465a9f94ca38cabdcd3b3f21896b9793cb7a6b61ec7030000000000000000c2eb0b000000000000000000000000a861000000000000320000004f72636861726442756e646c65466978747572655f4669786564506f73744e75365f325f50726f6f665f416e645f536967736060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606000",
+      "canonical_size_bytes": 218,
+      "min_fee_atoms": 21800,
+      "tx_id_hex": "1b1fd2817775a8c203010a00b7205d72584be7059bb915a920e7202fe397ee52",
+      "balance_deltas": {
+        "transparent_sender_atoms": -200025000,
+        "shielded_pool_atoms": 200000000,
+        "miner_fee_atoms": 25000,
+        "net_issuance_change": 0
+      },
+      "expected_validation": "valid"
+    },
+    "type_7_shielded_to_transparent": {
+      "tx_type": 7,
+      "name": "ShieldedToTransparent",
+      "recipient_address_hex": "b5dafe83f6b1b5771b22fa85f4d0869420c8f6caa6df8e79bdc2437a20fb4663",
+      "release_amount_atoms": 150000000,
+      "fee_atoms": 20000,
+      "nullifiers_hex": [
+        "19c8a0567a80f7d501f272cc43cd270649b366aa1faa887b48f23da044ffc502"
+      ],
+      "canonical_signed_bytes_hex": "0701000459d324aafefe44f9281e585b91b8fb4fde3a1dfb945db6370c18c11b1a5cccb5dafe83f6b1b5771b22fa85f4d0869420c8f6caa6df8e79bdc2437a20fb466380d1f008000000000000000000000000204e000000000000320000004f72636861726442756e646c65466978747572655f4669786564506f73744e75365f325f50726f6f665f416e645f53696773",
+      "canonical_size_bytes": 145,
+      "min_fee_atoms": 14500,
+      "tx_id_hex": "3ac5f5381417f5343e5dc07433d5347a87a2b60c435ab41733895010009ee486",
+      "balance_deltas": {
+        "shielded_pool_atoms": -150020000,
+        "transparent_recipient_atoms": 150000000,
+        "miner_fee_atoms": 20000,
+        "net_issuance_change": 0
+      },
+      "expected_validation": "valid"
+    }
+  },
+  "cross_pool_accounting": {
+    "shielding_1_own": {
+      "description": "Shield 100,000,000 atoms from transparent account to Orchard pool",
+      "principal_atoms": 100000000,
+      "fee_atoms": 25000,
+      "transparent_sender_deduction": 100025000,
+      "shielded_pool_increase": 100000000,
+      "miner_fee": 25000,
+      "value_conservation": "(-100,025,000) + (+100,000,000) + (+25,000) == 0",
+      "expected_result": "valid"
+    },
+    "deshielding_1_own": {
+      "description": "Deshield 100,000,000 atoms from Orchard pool to transparent account",
+      "release_atoms": 100000000,
+      "fee_atoms": 25000,
+      "shielded_pool_deduction": 100025000,
+      "transparent_recipient_credit": 100000000,
+      "miner_fee": 25000,
+      "value_conservation": "(-100,025,000) + (+100,000,000) + (+25,000) == 0",
+      "expected_result": "valid"
+    },
+    "negative_shielded_pool_rejection": {
+      "description": "Attempt to deshield 500,000,000 atoms when pool balance is only 100,000,000 atoms",
+      "current_pool_atoms": 100000000,
+      "requested_spend_atoms": 500000000,
+      "expected_result": "invalid: negative shielded pool balance rejected"
+    },
+    "duplicate_nullifier_rejection": {
+      "description": "Attempt to reuse nullifier already recorded in nullifier set",
+      "nullifier_hex": "29c5ebc54ec78f43a4751abcbf21208abef48a0dfc0d08d137fba68bd9561b14",
+      "expected_result": "invalid: duplicate nullifier rejected"
+    }
+  },
+  "economic_rules": {
+    "parameters": {
+      "native_currency": "OWN",
+      "atoms_per_own": 100000000,
+      "starting_subsidy_atoms": 1000000000,
+      "halving_interval_blocks": 1050000,
+      "maximum_supply_atoms": 2100000000000000,
+      "coinbase_maturity_blocks": 100
+    },
+    "subsidy_schedule": {
+      "height_1_era_0": {
+        "height": 1,
+        "era": 0,
+        "subsidy_atoms": 1000000000
+      },
+      "height_1050000_era_0": {
+        "height": 1050000,
+        "era": 0,
+        "subsidy_atoms": 1000000000
+      },
+      "height_1050001_era_1": {
+        "height": 1050001,
+        "era": 1,
+        "subsidy_atoms": 500000000
+      },
+      "height_2100001_era_2": {
+        "height": 2100001,
+        "era": 2,
+        "subsidy_atoms": 250000000
+      },
+      "height_31500000_era_29": {
+        "height": 31500000,
+        "era": 29,
+        "subsidy_atoms": 1
+      },
+      "height_31500001_era_30_exhaustion": {
+        "height": 31500001,
+        "era": 30,
+        "subsidy_atoms": 0
+      }
+    },
+    "coinbase_maturity_boundaries": {
+      "height_99": {
+        "coinbase_height": 1,
+        "eval_height": 99,
+        "status": "immature",
+        "spendable": false
+      },
+      "height_100": {
+        "coinbase_height": 1,
+        "eval_height": 100,
+        "status": "immature",
+        "spendable": false
+      },
+      "height_101": {
+        "coinbase_height": 1,
+        "eval_height": 101,
+        "status": "mature",
+        "spendable": true
+      }
+    }
+  },
+  "guardian_rules": {
+    "quorum_matrix": {
+      "strengthen_delays": {
+        "action_type": 1,
+        "quorum": "3-of-7",
+        "threshold": 3
+      },
+      "strengthen_allowance": {
+        "action_type": 2,
+        "quorum": "3-of-7",
+        "threshold": 3
+      },
+      "weaken_delays": {
+        "action_type": 3,
+        "quorum": "4-of-7",
+        "threshold": 4
+      },
+      "weaken_allowance": {
+        "action_type": 4,
+        "quorum": "4-of-7",
+        "threshold": 4
+      },
+      "freeze": {
+        "action_type": 5,
+        "quorum": "4-of-7",
+        "threshold": 4
+      },
+      "unfreeze": {
+        "action_type": 6,
+        "quorum": "4-of-7",
+        "threshold": 4
+      },
+      "recovery": {
+        "action_type": 7,
+        "quorum": "4-of-7",
+        "threshold": 4
+      },
+      "replace_guardians": {
+        "action_type": 8,
+        "quorum": "4-of-7",
+        "threshold": 4
+      },
+      "replace_recovery_key": {
+        "action_type": 9,
+        "quorum": "4-of-7",
+        "threshold": 4
+      },
+      "cancel_pending_transfer": {
+        "action_type": 10,
+        "quorum": "4-of-7",
+        "threshold": 4
+      },
+      "cross_pool_shielding": {
+        "action": "transparent_to_shielded",
+        "quorum": "4-of-7",
+        "threshold": 4
+      }
+    },
+    "guardian_scope_rules": {
+      "applies_to_transparent_only": true,
+      "governs_shielded_notes": false,
+      "advertising_shielded_funds_as_protected": "forbidden"
+    }
+  },
+  "representative_scenario": [
+    {
+      "block_height": 1,
+      "action": "Coinbase reward 10 OWN to Alice",
+      "state_root_hex": "39ca62a374a93aa98fb325b39cb7e718227362887229b66caeeb877aeb49c548",
+      "alice_balance": 1000000000,
+      "shielded_pool_balance": 0,
+      "cumulative_issuance": 1000000000
+    },
+    {
+      "block_height": 102,
+      "action": "Alice shields 3 OWN into Orchard pool",
+      "state_root_hex": "f27d2b12e5f4f2d7a5e17e1e3d75bf9ed1ba2a0873d4af6fbcdc69637a38fcbf",
+      "alice_balance": 699975000,
+      "shielded_pool_balance": 300000000,
+      "miner_balance": 25000,
+      "cumulative_issuance": 1000000000
+    }
+  ]
+}
