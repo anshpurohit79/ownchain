@@ -668,8 +668,7 @@ fn validate_transactions(
         for raw in &block.transactions {
             let tag = *raw.first().unwrap_or(&0xff);
             let has_direct_bundle = match tag {
-                tx::TX_TYPE_COINBASE => raw.len() > 83,
-                tx::TX_TYPE_TRANSPARENT_TRANSFER => raw.len() != 195, // legacy M1-B OrchardTransfer
+                tx::TX_TYPE_COINBASE => false,
                 tx::TX_TYPE_SHIELDED_TRANSFER => true,
                 _ => false,
             };
@@ -824,77 +823,40 @@ fn validate_transactions(
             let env = &envelopes[index];
             match env.tx_type {
                 TxType::Coinbase => {
-                    if raw.len() == 83 {
-                        // Transparent coinbase: structural fields verified above;
-                        // value and tranche maturity verified in state execution.
-                        continue;
+                    if raw.len() != 83 {
+                        return Err(ValidationError::InvalidCoinbase {
+                            reason: format!(
+                                "invalid coinbase wire length: expected 83 (transparent-only), found {}",
+                                raw.len()
+                            ),
+                        });
                     }
-                    let validated = crate::orchard_tx::validate_transaction_stateless(
-                        raw,
-                        context.chain_id,
-                        vk,
-                    )
-                    .map_err(|error| ValidationError::InvalidOrchardTransaction { index, error })?;
-
-                    let action_count = validated.bundle().actions().len();
-                    total_actions = total_actions.checked_add(action_count).ok_or(
-                        ValidationError::TooManyBlockActions {
-                            actual: usize::MAX,
-                            limit: crate::orchard_tx::MAX_ACTIONS_PER_BLOCK,
-                        },
-                    )?;
+                    // Transparent coinbase: structural fields verified above;
+                    // value and tranche maturity verified in state execution.
+                    continue;
                 }
                 TxType::TransparentTransfer => {
                     if raw.len() != 195 {
-                        // Legacy M1-B OrchardTransfer
-                        let validated = crate::orchard_tx::validate_transaction_stateless(
-                            raw,
-                            context.chain_id,
-                            vk,
-                        )
-                        .map_err(|error| {
-                            ValidationError::InvalidOrchardTransaction { index, error }
-                        })?;
-
-                        let action_count = validated.bundle().actions().len();
-                        total_actions = total_actions.checked_add(action_count).ok_or(
-                            ValidationError::TooManyBlockActions {
-                                actual: usize::MAX,
-                                limit: crate::orchard_tx::MAX_ACTIONS_PER_BLOCK,
-                            },
-                        )?;
-
-                        let declared_fee = validated.fee_atoms().unwrap_or(0);
-                        match crate::orchard_tx::check_transaction_fee(
-                            action_count,
-                            raw.len(),
-                            declared_fee,
-                        ) {
-                            Ok(_) => {}
-                            Err(crate::orchard_tx::FeeError::Overflow) => {
-                                return Err(ValidationError::FeeCalculationOverflow { index });
-                            }
-                            Err(crate::orchard_tx::FeeError::Mismatch { declared, expected }) => {
-                                return Err(ValidationError::IncorrectTransactionFee {
-                                    index,
-                                    declared,
-                                    expected,
-                                });
-                            }
-                        }
-                    } else {
-                        let fee = tx::transaction_fee(raw).unwrap_or(0);
-                        let min_fee = std::cmp::max(1u64, (raw.len() as u64).saturating_mul(100));
-                        if fee < min_fee {
-                            return Err(ValidationError::IncorrectTransactionFee {
-                                index,
-                                declared: fee,
-                                expected: min_fee,
-                            });
-                        }
+                        return Err(ValidationError::MalformedTransaction {
+                            index,
+                            reason: format!(
+                                "invalid TransparentTransfer wire length: expected 195, found {}",
+                                raw.len()
+                            ),
+                        });
+                    }
+                    let fee = tx::transaction_fee(raw).unwrap_or(0);
+                    let min_fee = tx::min_fee(raw.len())
+                        .ok_or(ValidationError::FeeCalculationOverflow { index })?;
+                    if fee < min_fee {
+                        return Err(ValidationError::IncorrectTransactionFee {
+                            index,
+                            declared: fee,
+                            expected: min_fee,
+                        });
                     }
                 }
-                TxType::ShieldedTransfer | TxType::OrchardTransfer => {
+                TxType::ShieldedTransfer => {
                     let validated = crate::orchard_tx::validate_transaction_stateless(
                         raw,
                         context.chain_id,
@@ -933,7 +895,8 @@ fn validate_transactions(
                 | TxType::GuardianAction
                 | TxType::CancelPendingTransfer => {
                     let fee = tx::transaction_fee(raw).unwrap_or(0);
-                    let min_fee = std::cmp::max(1u64, (raw.len() as u64).saturating_mul(100));
+                    let min_fee = tx::min_fee(raw.len())
+                        .ok_or(ValidationError::FeeCalculationOverflow { index })?;
                     if fee < min_fee {
                         return Err(ValidationError::IncorrectTransactionFee {
                             index,
@@ -942,8 +905,17 @@ fn validate_transactions(
                         });
                     }
                 }
-                TxType::TransparentToShielded | TxType::ShieldedToTransparent => {
-                    // Validated during state transition
+                TxType::TransparentToShielded => {
+                    return Err(ValidationError::MalformedTransaction {
+                        index,
+                        reason: "consensus safety gate: Type 6 (TransparentToShielded) rejected because Orchard cryptographic verification (FixedPostNu6_2 Halo2 proofs, spend authorization, binding signature, value balance) is incomplete".into(),
+                    });
+                }
+                TxType::ShieldedToTransparent => {
+                    return Err(ValidationError::MalformedTransaction {
+                        index,
+                        reason: "consensus safety gate: Type 7 (ShieldedToTransparent) rejected because Orchard cryptographic verification (FixedPostNu6_2 Halo2 proofs, spend authorization, binding signature, value balance) is incomplete".into(),
+                    });
                 }
             }
         }

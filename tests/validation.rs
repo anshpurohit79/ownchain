@@ -27,7 +27,7 @@ use ownchain::orchard_tx::{
     compute_action_effect_from_action, compute_tx_auth_digest, serialize_bundle, BundleCodecError,
     OrchardValidationError,
 };
-use ownchain::tx::{TX_TYPE_COINBASE, TX_TYPE_ORCHARD_TRANSFER, TX_VERSION};
+use ownchain::tx::{TX_TYPE_COINBASE, TX_TYPE_SHIELDED_TRANSFER, TX_VERSION};
 use ownchain::validation::{upper_median, validate_block, ValidationContext, ValidationError};
 
 /// The 32 empty tree roots at depth 32 from ZIP 224 / orchard test vectors.
@@ -204,10 +204,9 @@ fn single_leaf_witness(cmx: &ExtractedNoteCommitment) -> (Anchor, MerklePath) {
 
 struct TestFixtures {
     miner_sk: SpendingKey,
-    cb_proven: Bundle<InProgress<Proof, Unauthorized>, i64>,
-    cb_action_effect: [u8; 32],
-    tx_proven_7028: Bundle<InProgress<Proof, Unauthorized>, i64>,
-    tx_action_effect_7028: [u8; 32],
+    cmx: ExtractedNoteCommitment,
+    tx_proven_602800: Bundle<InProgress<Proof, Unauthorized>, i64>,
+    tx_action_effect_602800: [u8; 32],
     tx_proven_5000: Bundle<InProgress<Proof, Unauthorized>, i64>,
     tx_action_effect_5000: [u8; 32],
 }
@@ -252,16 +251,14 @@ fn get_fixtures() -> &'static TestFixtures {
             .recover_output_with_ovk(cb_meta.output_action_index(0).unwrap(), &zero_ovk)
             .unwrap()
             .0;
-        let cb_action_effect = compute_action_effect_from_action(&cb_unauth.actions()[0]);
-        let cb_proven = cb_unauth.create_proof(&pk, &mut rng).unwrap();
 
-        // 2. Transfer bundle with exact consensus fee 7,028
+        // 2. Transfer bundle with exact consensus fee 602,800
         let cmx: ExtractedNoteCommitment = cb_note.commitment().into();
         let (anchor, merkle_path) = single_leaf_witness(&cmx);
 
-        let fee_7028 = 7_028u64;
-        let transfer_value_7028 = payout_atoms - fee_7028;
-        let mut tx_builder_7028 = Builder::new(
+        let fee_602800 = 602_800u64;
+        let transfer_value_602800 = payout_atoms - fee_602800;
+        let mut tx_builder_602800 = Builder::new(
             BundleType::UNPADDED,
             BundleVersion::orchard_v2(),
             BundleVersion::orchard_v2().default_flags(),
@@ -269,21 +266,22 @@ fn get_fixtures() -> &'static TestFixtures {
         )
         .unwrap();
 
-        tx_builder_7028
+        tx_builder_602800
             .add_spend(miner_fvk.clone(), cb_note, merkle_path.clone())
             .unwrap();
-        tx_builder_7028
+        tx_builder_602800
             .add_output(
                 None,
                 user_address,
-                NoteValue::from_raw(transfer_value_7028),
+                NoteValue::from_raw(transfer_value_602800),
                 [0u8; 512],
             )
             .unwrap();
 
-        let (tx_unauth_7028, _) = tx_builder_7028.build::<i64>(&mut rng).unwrap().unwrap();
-        let tx_action_effect_7028 = compute_action_effect_from_action(&tx_unauth_7028.actions()[0]);
-        let tx_proven_7028 = tx_unauth_7028.create_proof(&pk, &mut rng).unwrap();
+        let (tx_unauth_602800, _) = tx_builder_602800.build::<i64>(&mut rng).unwrap().unwrap();
+        let tx_action_effect_602800 =
+            compute_action_effect_from_action(&tx_unauth_602800.actions()[0]);
+        let tx_proven_602800 = tx_unauth_602800.create_proof(&pk, &mut rng).unwrap();
 
         // 3. Transfer bundle with fee 5,000 (for testing consensus fee formula mismatch)
         let fee_5000 = 5_000u64;
@@ -314,64 +312,32 @@ fn get_fixtures() -> &'static TestFixtures {
 
         TestFixtures {
             miner_sk,
-            cb_proven,
-            cb_action_effect,
-            tx_proven_7028,
-            tx_action_effect_7028,
+            cmx,
+            tx_proven_602800,
+            tx_action_effect_602800,
             tx_proven_5000,
             tx_action_effect_5000,
         }
     })
 }
 
-/// Constructs a 100% genuine, cryptographically valid Orchard V2 coinbase transaction for the given height.
-fn genuine_coinbase(chain_id: Hash, height: u64) -> Vec<u8> {
-    let f = get_fixtures();
-    let sighash = compute_tx_auth_digest(
-        *chain_id.as_bytes(),
-        0, // Coinbase
-        1, // tx_version
-        height,
-        f.cb_proven.flag_byte(),
-        *f.cb_proven.value_balance(),
-        f.cb_proven.anchor().to_bytes(),
-        &[f.cb_action_effect],
-    );
-    let mut rng = rand::rngs::StdRng::seed_from_u64(height);
-    let bundle = f
-        .cb_proven
-        .clone()
-        .apply_signatures(&mut rng, sighash, &[])
-        .unwrap();
-    let serialized_bundle = serialize_bundle(&bundle);
-
-    let mut raw_tx =
-        Vec::with_capacity(ownchain::tx::TX_ENVELOPE_LEN + 8 + serialized_bundle.len());
-    raw_tx.push(TX_TYPE_COINBASE);
-    raw_tx.extend_from_slice(&TX_VERSION.to_le_bytes());
-    raw_tx.extend_from_slice(chain_id.as_bytes());
-    raw_tx.extend_from_slice(&height.to_le_bytes());
-    raw_tx.extend_from_slice(&serialized_bundle);
-    raw_tx
-}
-
-/// Constructs a genuine, cryptographically valid Orchard V2 transfer transaction with exact consensus fee 7,028.
+/// Constructs a genuine, cryptographically valid Orchard V2 transfer transaction with exact consensus fee 602,800.
 fn genuine_transfer(chain_id: Hash) -> Vec<u8> {
     let f = get_fixtures();
-    let fee_atoms = 7_028u64;
+    let fee_atoms = 602_800u64;
     let sighash = compute_tx_auth_digest(
         *chain_id.as_bytes(),
-        1, // OrchardTransfer
+        TX_TYPE_SHIELDED_TRANSFER,
         1, // tx_version
         fee_atoms,
-        f.tx_proven_7028.flag_byte(),
-        *f.tx_proven_7028.value_balance(),
-        f.tx_proven_7028.anchor().to_bytes(),
-        &[f.tx_action_effect_7028],
+        f.tx_proven_602800.flag_byte(),
+        *f.tx_proven_602800.value_balance(),
+        f.tx_proven_602800.anchor().to_bytes(),
+        &[f.tx_action_effect_602800],
     );
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
     let bundle = f
-        .tx_proven_7028
+        .tx_proven_602800
         .clone()
         .apply_signatures(&mut rng, sighash, &[SpendAuthorizingKey::from(&f.miner_sk)])
         .unwrap();
@@ -379,7 +345,7 @@ fn genuine_transfer(chain_id: Hash) -> Vec<u8> {
 
     let mut raw_tx =
         Vec::with_capacity(ownchain::tx::TX_ENVELOPE_LEN + 8 + serialized_bundle.len());
-    raw_tx.push(TX_TYPE_ORCHARD_TRANSFER);
+    raw_tx.push(TX_TYPE_SHIELDED_TRANSFER);
     raw_tx.extend_from_slice(&TX_VERSION.to_le_bytes());
     raw_tx.extend_from_slice(chain_id.as_bytes());
     raw_tx.extend_from_slice(&fee_atoms.to_le_bytes());
@@ -393,7 +359,7 @@ fn transfer_with_fee_5000(chain_id: Hash) -> Vec<u8> {
     let fee_atoms = 5_000u64;
     let sighash = compute_tx_auth_digest(
         *chain_id.as_bytes(),
-        1, // OrchardTransfer
+        TX_TYPE_SHIELDED_TRANSFER,
         1, // tx_version
         fee_atoms,
         f.tx_proven_5000.flag_byte(),
@@ -411,7 +377,7 @@ fn transfer_with_fee_5000(chain_id: Hash) -> Vec<u8> {
 
     let mut raw_tx =
         Vec::with_capacity(ownchain::tx::TX_ENVELOPE_LEN + 8 + serialized_bundle.len());
-    raw_tx.push(TX_TYPE_ORCHARD_TRANSFER);
+    raw_tx.push(TX_TYPE_SHIELDED_TRANSFER);
     raw_tx.extend_from_slice(&TX_VERSION.to_le_bytes());
     raw_tx.extend_from_slice(chain_id.as_bytes());
     raw_tx.extend_from_slice(&fee_atoms.to_le_bytes());
@@ -434,14 +400,22 @@ fn envelope(tx_type: u8, chain_id: Hash, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Builds a coinbase transaction declaring the given height.
+/// Builds a transparent-only coinbase transaction declaring the given height.
 fn coinbase(chain_id: Hash, height: u64) -> Vec<u8> {
-    genuine_coinbase(chain_id, height)
+    let mut tx = Vec::with_capacity(83);
+    tx.push(0); // Type 0: Coinbase
+    tx.extend_from_slice(&1u16.to_le_bytes());
+    tx.extend_from_slice(chain_id.as_bytes());
+    tx.extend_from_slice(&height.to_le_bytes());
+    tx.extend_from_slice(&[1u8; 32]); // miner address
+    let payout = ownchain::account::scheduled_subsidy(height) as u64;
+    tx.extend_from_slice(&payout.to_le_bytes());
+    tx
 }
 
 /// Builds an ordinary Orchard transfer transaction.
 fn transfer(chain_id: Hash, fee_atoms: u64) -> Vec<u8> {
-    if fee_atoms == 7_028 {
+    if fee_atoms == 602_800 {
         genuine_transfer(chain_id)
     } else if fee_atoms == 5_000 {
         transfer_with_fee_5000(chain_id)
@@ -463,9 +437,27 @@ fn make_fifty_action_tx(chain_id: Hash, seed: u64) -> Vec<u8> {
         (seed & 0xff) as u8,
     );
 
-    let fee_atoms = 96_509u64;
-    let mut raw_tx = Vec::with_capacity(ownchain::tx::TX_ENVELOPE_LEN + 8 + bundle_bytes.len());
-    raw_tx.push(TX_TYPE_ORCHARD_TRANSFER);
+    let raw_len = ownchain::tx::TX_ENVELOPE_LEN + 8 + bundle_bytes.len();
+    let fee_atoms = 100 * raw_len as u64;
+    let mut raw_tx = Vec::with_capacity(raw_len);
+    raw_tx.push(TX_TYPE_SHIELDED_TRANSFER);
+    raw_tx.extend_from_slice(&TX_VERSION.to_le_bytes());
+    raw_tx.extend_from_slice(chain_id.as_bytes());
+    raw_tx.extend_from_slice(&fee_atoms.to_le_bytes());
+    raw_tx.extend_from_slice(&bundle_bytes);
+    raw_tx
+}
+
+/// Constructs an OrchardTransfer transaction claiming 1 action to test block action limits (§6.3).
+fn make_one_action_tx(chain_id: Hash, seed: u64) -> Vec<u8> {
+    let mut bundle_bytes = Vec::new();
+    ownchain::orchard_tx::encode_compact_size(1, &mut bundle_bytes);
+    bundle_bytes.resize(1 + 820 + 41 + 3 + 2160 + 64 + 64, (seed & 0xff) as u8);
+
+    let raw_len = ownchain::tx::TX_ENVELOPE_LEN + 8 + bundle_bytes.len();
+    let fee_atoms = 100 * raw_len as u64;
+    let mut raw_tx = Vec::with_capacity(raw_len);
+    raw_tx.push(TX_TYPE_SHIELDED_TRANSFER);
     raw_tx.extend_from_slice(&TX_VERSION.to_le_bytes());
     raw_tx.extend_from_slice(chain_id.as_bytes());
     raw_tx.extend_from_slice(&fee_atoms.to_le_bytes());
@@ -499,7 +491,22 @@ fn make_block(chain_id: Hash, parent: &Block, timestamp: u64, transactions: Vec<
     }
 }
 
-/// Builds a valid child block with a single coinbase transaction.
+/// Builds a valid child block whose header commits to `transactions` and sets the simulated state root.
+fn make_valid_child_block(
+    state: &ChainState,
+    parent: &Block,
+    timestamp: u64,
+    transactions: Vec<Vec<u8>>,
+) -> Block {
+    let mut blk = make_block(state.chain_id(), parent, timestamp, transactions);
+    let root = state
+        .simulate_candidate_state_root(&blk)
+        .expect("simulate candidate state root");
+    blk.header.orchard_commitment_root = root;
+    blk
+}
+
+/// Builds a child block with a single coinbase transaction.
 fn child_block(chain_id: Hash, parent: &Block, timestamp: u64) -> Block {
     let height = parent.header.height + 1;
     make_block(
@@ -507,6 +514,17 @@ fn child_block(chain_id: Hash, parent: &Block, timestamp: u64) -> Block {
         parent,
         timestamp,
         vec![coinbase(chain_id, height)],
+    )
+}
+
+/// Builds a valid child block with a single transparent coinbase, committing to the simulated state root.
+fn child_block_for_state(state: &ChainState, parent: &Block, timestamp: u64) -> Block {
+    let height = parent.header.height + 1;
+    make_valid_child_block(
+        state,
+        parent,
+        timestamp,
+        vec![coinbase(state.chain_id(), height)],
     )
 }
 
@@ -694,7 +712,7 @@ fn a_valid_child_block_with_coinbase_and_transfer_is_accepted() {
         id,
         &genesis,
         genesis::GENESIS_TIMESTAMP + 10,
-        vec![coinbase(id, 1), transfer(id, 7028)],
+        vec![coinbase(id, 1), transfer(id, 602800)],
     );
 
     let context = ValidationContext::new(id, &genesis, &[genesis::GENESIS_TIMESTAMP]);
@@ -709,7 +727,7 @@ fn a_block_without_a_coinbase_is_rejected() {
         id,
         &genesis,
         genesis::GENESIS_TIMESTAMP + 10,
-        vec![transfer(id, 7028)],
+        vec![transfer(id, 602800)],
     );
 
     let context = ValidationContext::new(id, &genesis, &[genesis::GENESIS_TIMESTAMP]);
@@ -780,7 +798,7 @@ fn a_transaction_with_the_wrong_chain_id_is_rejected() {
         id,
         &genesis,
         genesis::GENESIS_TIMESTAMP + 10,
-        vec![coinbase(id, 1), transfer(hash::chain_id("testnet"), 7028)],
+        vec![coinbase(id, 1), transfer(hash::chain_id("testnet"), 602800)],
     );
 
     let context = ValidationContext::new(id, &genesis, &[genesis::GENESIS_TIMESTAMP]);
@@ -794,7 +812,7 @@ fn a_transaction_with_the_wrong_chain_id_is_rejected() {
 fn a_transaction_with_an_unsupported_version_is_rejected() {
     let id = chain_id();
     let genesis = genesis::genesis_block(id);
-    let mut tx = transfer(id, 7028);
+    let mut tx = transfer(id, 602800);
     tx[1] = 9; // tx_version is u16_le; this sets it to 9.
     let block = make_block(
         id,
@@ -814,7 +832,7 @@ fn a_transaction_with_an_unsupported_version_is_rejected() {
 fn a_transaction_with_an_unknown_type_is_rejected() {
     let id = chain_id();
     let genesis = genesis::genesis_block(id);
-    let mut tx = transfer(id, 7028);
+    let mut tx = transfer(id, 602800);
     tx[0] = 8; // Not a known transaction type.
     let block = make_block(
         id,
@@ -884,7 +902,7 @@ fn the_orchard_root_of_a_transaction_bearing_block_is_deferred() {
 fn duplicate_transaction_ids_in_a_block_are_rejected() {
     let id = chain_id();
     let genesis = genesis::genesis_block(id);
-    let dup = transfer(id, 7028);
+    let dup = transfer(id, 602800);
     let block = make_block(
         id,
         &genesis,
@@ -903,7 +921,7 @@ fn duplicate_transaction_ids_in_a_block_are_rejected() {
 fn a_transaction_id_already_on_the_chain_is_rejected() {
     let id = chain_id();
     let genesis = genesis::genesis_block(id);
-    let reused = transfer(id, 7028);
+    let reused = transfer(id, 602800);
 
     // Height 1 accepts the transfer.
     let first = make_block(
@@ -937,7 +955,7 @@ fn an_oversized_transaction_is_rejected() {
     let id = chain_id();
     let genesis = genesis::genesis_block(id);
     // A transfer larger than the 1,000,000-byte non-coinbase cap.
-    let mut big = transfer(id, 7028);
+    let mut big = transfer(id, 602800);
     big.resize(MAX_TRANSACTION_SIZE + 1, 0xCC);
     let block = make_block(
         id,
@@ -983,7 +1001,7 @@ fn an_oversized_block_is_rejected() {
 fn a_transaction_at_the_size_cap_passes_size_check_and_fails_bundle_codec() {
     let id = chain_id();
     let genesis = genesis::genesis_block(id);
-    let mut tx = transfer(id, 7028);
+    let mut tx = transfer(id, 602800);
     tx.resize(MAX_TRANSACTION_SIZE, 0xDD);
     let block = make_block(
         id,
@@ -1156,7 +1174,7 @@ fn a_valid_block_extends_the_chain() {
     let id = chain_id();
     let mut state = chain_with_genesis();
     let genesis = genesis::genesis_block(id);
-    let block = child_block(id, &genesis, genesis::GENESIS_TIMESTAMP + 10);
+    let block = child_block_for_state(&state, &genesis, genesis::GENESIS_TIMESTAMP + 10);
 
     assert_eq!(state.apply_block(&block), Ok(()));
     assert_eq!(state.len(), 2);
@@ -1173,7 +1191,7 @@ fn a_rejected_block_leaves_the_state_untouched() {
 
     let genesis = genesis::genesis_block(id);
     // A block whose transaction root does not match its transactions.
-    let mut block = child_block(id, &genesis, genesis::GENESIS_TIMESTAMP + 10);
+    let mut block = child_block_for_state(&state, &genesis, genesis::GENESIS_TIMESTAMP + 10);
     block.header.transaction_root = merkle::empty_root();
 
     assert!(matches!(
@@ -1193,21 +1211,34 @@ fn a_rejected_block_leaves_a_populated_state_untouched() {
     let mut state = chain_with_genesis();
     let genesis = genesis::genesis_block(id);
 
-    // Accept one block with a transaction, so the state has a non-empty
+    let f = get_fixtures();
+    state.orchard_tree.append(&f.cmx);
+    state.shielded_pool_balance = 1_000_000_000;
+    state.cumulative_issuance = 1_000_000_000;
+
+    // Accept blocks with coinbase and transfer, so the state has a non-empty
     // accepted-transaction set and a non-trivial timestamp window.
-    let tx = transfer(id, 7028);
-    let good = make_block(
-        id,
+    let b1 = make_valid_child_block(
+        &state,
         &genesis,
         genesis::GENESIS_TIMESTAMP + 10,
-        vec![coinbase(id, 1), tx.clone()],
+        vec![coinbase(id, 1)],
+    );
+    state.apply_block(&b1).expect("b1 is valid");
+
+    let tx = transfer(id, 602800);
+    let good = make_valid_child_block(
+        &state,
+        &b1,
+        genesis::GENESIS_TIMESTAMP + 20,
+        vec![coinbase(id, 2), tx.clone()],
     );
     state.apply_block(&good).expect("block is valid");
 
     let before = state.clone();
 
     // Now reject a block for a different reason: a wrong parent height.
-    let mut bad = child_block(id, &good, genesis::GENESIS_TIMESTAMP + 20);
+    let mut bad = child_block(id, &good, genesis::GENESIS_TIMESTAMP + 30);
     bad.header.height = 5;
     assert!(matches!(
         state.apply_block(&bad),
@@ -1216,16 +1247,20 @@ fn a_rejected_block_leaves_a_populated_state_untouched() {
 
     // Every field of the state must be exactly as it was.
     assert_eq!(state, before);
-    assert_eq!(state.len(), 2);
-    assert_eq!(state.tip_height(), Some(1));
+    assert_eq!(state.len(), 3);
+    assert_eq!(state.tip_height(), Some(2));
     assert_eq!(state.tip_block_id(), Some(good.block_id()));
-    assert_eq!(state.accepted_transaction_ids().len(), 2);
+    assert_eq!(state.accepted_transaction_ids().len(), 3);
     assert!(state
         .accepted_transaction_ids()
         .contains(&hash::transaction_id(&tx)));
     assert_eq!(
         state.ancestor_timestamps(),
-        vec![genesis::GENESIS_TIMESTAMP, genesis::GENESIS_TIMESTAMP + 10]
+        vec![
+            genesis::GENESIS_TIMESTAMP,
+            genesis::GENESIS_TIMESTAMP + 10,
+            genesis::GENESIS_TIMESTAMP + 20,
+        ]
     );
 }
 
@@ -1237,7 +1272,7 @@ fn a_rejected_block_does_not_extend_the_accepted_transaction_set() {
 
     // A block with a duplicate transaction ID is rejected; the rejected
     // transaction must not enter the accepted set.
-    let dup = transfer(id, 7028);
+    let dup = transfer(id, 602800);
     let bad = make_block(
         id,
         &genesis,
@@ -1302,7 +1337,7 @@ fn the_timestamp_window_covers_at_most_eleven_ancestors() {
 
     let mut parent = genesis.clone();
     for i in 1..=15u64 {
-        let block = child_block(id, &parent, genesis::GENESIS_TIMESTAMP + i * 10);
+        let block = child_block_for_state(&state, &parent, genesis::GENESIS_TIMESTAMP + i * 10);
         state.apply_block(&block).expect("block is valid");
         parent = block;
     }
@@ -1328,7 +1363,7 @@ fn a_chain_of_blocks_is_accepted_in_order() {
 
     let mut parent = genesis.clone();
     for i in 1..=5u64 {
-        let block = child_block(id, &parent, genesis::GENESIS_TIMESTAMP + i * 10);
+        let block = child_block_for_state(&state, &parent, genesis::GENESIS_TIMESTAMP + i * 10);
         state.apply_block(&block).expect("block is valid");
         parent = block;
     }
@@ -1347,16 +1382,29 @@ fn accepted_transaction_ids_are_tracked() {
     let mut state = chain_with_genesis();
     let genesis = genesis::genesis_block(id);
 
-    let tx = transfer(id, 7028);
-    let block = make_block(
-        id,
+    let f = get_fixtures();
+    state.orchard_tree.append(&f.cmx);
+    state.shielded_pool_balance = 1_000_000_000;
+    state.cumulative_issuance = 1_000_000_000;
+
+    let b1 = make_valid_child_block(
+        &state,
         &genesis,
         genesis::GENESIS_TIMESTAMP + 10,
-        vec![coinbase(id, 1), tx.clone()],
+        vec![coinbase(id, 1)],
+    );
+    state.apply_block(&b1).expect("b1 is valid");
+
+    let tx = transfer(id, 602800);
+    let block = make_valid_child_block(
+        &state,
+        &b1,
+        genesis::GENESIS_TIMESTAMP + 20,
+        vec![coinbase(id, 2), tx.clone()],
     );
     state.apply_block(&block).expect("block is valid");
 
-    assert_eq!(state.accepted_transaction_ids().len(), 2);
+    assert_eq!(state.accepted_transaction_ids().len(), 3);
     assert!(state
         .accepted_transaction_ids()
         .contains(&hash::transaction_id(&tx)));
@@ -1567,8 +1615,8 @@ fn difficulty_startup_boundaries_and_first_retarget_height() {
     );
 
     // Honest block 1 at difficulty 1 passes
-    let block1 = make_block(
-        id,
+    let block1 = make_valid_child_block(
+        &state,
         &genesis,
         genesis::GENESIS_TIMESTAMP + 10,
         vec![coinbase(id, 1)],
@@ -1587,8 +1635,8 @@ fn difficulty_startup_boundaries_and_first_retarget_height() {
     for h in 2..=16u64 {
         assert_eq!(state.expected_difficulty_for_next_block(), Ok(1));
         let parent = state.tip().unwrap().clone();
-        let blk = make_block(
-            id,
+        let blk = make_valid_child_block(
+            &state,
             &parent,
             genesis::GENESIS_TIMESTAMP + 10 * h,
             vec![coinbase(id, h)],
@@ -1661,8 +1709,8 @@ fn difficulty_startup_boundaries_and_first_retarget_height() {
     );
 
     // Honest miner: declares expected difficulty 12 and mines valid PoW
-    let mut honest_block = make_block(
-        id,
+    let mut honest_block = make_valid_child_block(
+        &state,
         &parent_16,
         genesis::GENESIS_TIMESTAMP + 170,
         vec![coinbase(id, 17)],
@@ -1768,7 +1816,7 @@ fn rejected_block_does_not_mutate_cumulative_work_or_difficulty_history() {
 fn test_block_rejects_invalid_halo2_proof_in_tx() {
     let id = chain_id();
     let genesis = genesis::genesis_block(id);
-    let mut bad_tx = transfer(id, 7028);
+    let mut bad_tx = transfer(id, 602800);
 
     // Byte 1000 is squarely within the 2,160-byte Halo2 proof (offset 908..3068)
     bad_tx[1000] ^= 0x55;
@@ -1795,7 +1843,7 @@ fn test_block_rejects_invalid_halo2_proof_in_tx() {
 fn test_block_rejects_invalid_spend_auth_sig_in_tx() {
     let id = chain_id();
     let genesis = genesis::genesis_block(id);
-    let mut bad_tx = transfer(id, 7028);
+    let mut bad_tx = transfer(id, 602800);
 
     // In a 6,028-byte transfer transaction:
     // envelope (35) + fee (8) + action count compactSize (1) + actions (820) + flags (1)
@@ -1825,7 +1873,7 @@ fn test_block_rejects_invalid_spend_auth_sig_in_tx() {
 fn test_block_rejects_invalid_binding_sig_in_tx() {
     let id = chain_id();
     let genesis = genesis::genesis_block(id);
-    let mut bad_tx = transfer(id, 7028);
+    let mut bad_tx = transfer(id, 602800);
 
     // Last byte is within the RedPallas binding signature
     let last = bad_tx.len() - 1;
@@ -1853,7 +1901,7 @@ fn test_block_rejects_invalid_binding_sig_in_tx() {
 fn test_block_rejects_malformed_bundle_in_tx() {
     let id = chain_id();
     let genesis = genesis::genesis_block(id);
-    let mut bad_tx = transfer(id, 7028);
+    let mut bad_tx = transfer(id, 602800);
 
     // Truncate bundle data
     bad_tx.truncate(bad_tx.len() - 20);
@@ -1882,7 +1930,7 @@ fn test_block_rejects_incorrect_fee_formula() {
     let genesis = genesis::genesis_block(id);
 
     // transfer_with_fee_5000 has value balance 5000 and declared fee 5000,
-    // which has valid Halo2 proof & valid RedPallas signatures, but fee 5000 != expected 7028.
+    // which has valid Halo2 proof & valid RedPallas signatures, but fee 5000 != expected 602800.
     let bad_fee_tx = transfer(id, 5000);
 
     let block = make_block(
@@ -1899,7 +1947,7 @@ fn test_block_rejects_incorrect_fee_formula() {
         ValidationError::IncorrectTransactionFee {
             index: 1,
             declared: 5000,
-            expected: 7028,
+            expected: 602800,
         }
     );
 }
@@ -1909,13 +1957,13 @@ fn test_block_rejects_exceeded_aggregate_action_count() {
     let id = chain_id();
     let genesis = genesis::genesis_block(id);
 
-    // 40 transactions of 50 actions each + 1 coinbase of 1 action = 2,001 actions (> 2,000 limit).
-    // Each transaction is canonically serialized (~46.5 KB), so 40 transactions total ~1.86 MB (< 2.0 MB block limit).
-    let mut txs = Vec::with_capacity(41);
+    // 40 transactions of 50 actions each + 1 transaction of 1 action = 2,001 actions (> 2,000 limit).
+    let mut txs = Vec::with_capacity(42);
     txs.push(coinbase(id, 1));
     for i in 0..40u64 {
         txs.push(make_fifty_action_tx(id, 1000 + i));
     }
+    txs.push(make_one_action_tx(id, 9999));
 
     let block = make_block(id, &genesis, genesis::GENESIS_TIMESTAMP + 10, txs);
     let context = ValidationContext::new(id, &genesis, &[genesis::GENESIS_TIMESTAMP]);
@@ -1937,7 +1985,7 @@ fn test_chain_state_atomicity_preserved_on_orchard_failure() {
     let state_before = state.clone();
 
     // 1. Try applying a block with invalid proof
-    let mut bad_proof_tx = transfer(id, 7028);
+    let mut bad_proof_tx = transfer(id, 602800);
     bad_proof_tx[1000] ^= 0xff;
     let bad_block_proof = make_block(
         id,
@@ -1972,7 +2020,7 @@ fn test_chain_state_atomicity_preserved_on_orchard_failure() {
             ValidationError::IncorrectTransactionFee {
                 index: 1,
                 declared: 5000,
-                expected: 7028,
+                expected: 602800,
             }
         ))
     );
@@ -1981,34 +2029,7 @@ fn test_chain_state_atomicity_preserved_on_orchard_failure() {
 
 /// Constructs a genuine Type 5 ShieldedTransfer transaction.
 fn genuine_shielded_transfer(chain_id: Hash) -> Vec<u8> {
-    let f = get_fixtures();
-    let fee_atoms = 7_028u64;
-    let sighash = compute_tx_auth_digest(
-        *chain_id.as_bytes(),
-        ownchain::tx::TX_TYPE_SHIELDED_TRANSFER,
-        1,
-        fee_atoms,
-        f.tx_proven_7028.flag_byte(),
-        *f.tx_proven_7028.value_balance(),
-        f.tx_proven_7028.anchor().to_bytes(),
-        &[f.tx_action_effect_7028],
-    );
-    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-    let bundle = f
-        .tx_proven_7028
-        .clone()
-        .apply_signatures(&mut rng, sighash, &[SpendAuthorizingKey::from(&f.miner_sk)])
-        .unwrap();
-    let serialized_bundle = serialize_bundle(&bundle);
-
-    let mut raw_tx =
-        Vec::with_capacity(ownchain::tx::TX_ENVELOPE_LEN + 8 + serialized_bundle.len());
-    raw_tx.push(ownchain::tx::TX_TYPE_SHIELDED_TRANSFER);
-    raw_tx.extend_from_slice(&TX_VERSION.to_le_bytes());
-    raw_tx.extend_from_slice(chain_id.as_bytes());
-    raw_tx.extend_from_slice(&fee_atoms.to_le_bytes());
-    raw_tx.extend_from_slice(&serialized_bundle);
-    raw_tx
+    genuine_transfer(chain_id)
 }
 
 #[test]
@@ -2017,26 +2038,31 @@ fn test_stateful_shielded_transfer_execution_and_conservation() {
     let mut state = chain_with_genesis();
     let genesis = genesis::genesis_block(id);
 
-    // Block 1: Genuine Shielded Coinbase (10 OWN payout)
-    let b1 = make_block(
-        id,
+    let f = get_fixtures();
+    state.orchard_tree.append(&f.cmx);
+    state.shielded_pool_balance = 1_000_000_000;
+    state.cumulative_issuance = 1_000_000_000;
+
+    // Block 1: Transparent Coinbase (10 OWN payout to miner)
+    let b1 = make_valid_child_block(
+        &state,
         &genesis,
         genesis::GENESIS_TIMESTAMP + 120,
         vec![coinbase(id, 1)],
     );
     state
         .apply_block(&b1)
-        .expect("block 1 with shielded coinbase succeeds");
+        .expect("block 1 with transparent coinbase succeeds");
 
     assert_eq!(state.shielded_pool_balance(), 1_000_000_000);
-    assert_eq!(state.cumulative_issuance(), 1_000_000_000);
-    assert_eq!(state.accounts().len(), 0);
+    assert_eq!(state.cumulative_issuance(), 2_000_000_000);
+    assert_eq!(state.accounts().len(), 1);
     assert_eq!(state.nullifier_set().len(), 0);
 
     // Block 2: Type 5 ShieldedTransfer with anchor from Block 1
     let shielded_tx = genuine_shielded_transfer(id);
-    let b2 = make_block(
-        id,
+    let b2 = make_valid_child_block(
+        &state,
         &b1,
         genesis::GENESIS_TIMESTAMP + 240,
         vec![coinbase(id, 2), shielded_tx.clone()],
@@ -2046,11 +2072,9 @@ fn test_stateful_shielded_transfer_execution_and_conservation() {
         .expect("block 2 with genuine shielded transfer succeeds");
 
     // Conservation check:
-    // S_2 = 1_000_000_000 (from cb1) - 7,028 (fee) + 1_000_000_000 (cb2 payout) = 1_999_992_972
-    // I_2 = I_1 (1_000_000_000) + actual_claimed_2 (1_000_000_000 - 7,028) = 1_999_992_972
-    // T_2 = 0
-    assert_eq!(state.shielded_pool_balance(), 1_999_992_972);
-    assert_eq!(state.cumulative_issuance(), 1_999_992_972);
+    // S_2 = 1_000_000_000 - 602_800 (fee) = 999_397_200
+    assert_eq!(state.shielded_pool_balance(), 999_397_200);
+    assert_eq!(state.cumulative_issuance(), 2_999_397_200);
     assert_eq!(state.nullifier_set().len(), 1);
 }
 
@@ -2060,9 +2084,14 @@ fn test_stateful_duplicate_nullifier_rejection_in_block_and_chain() {
     let mut state = chain_with_genesis();
     let genesis = genesis::genesis_block(id);
 
-    // Block 1: Genuine Coinbase
-    let b1 = make_block(
-        id,
+    let f = get_fixtures();
+    state.orchard_tree.append(&f.cmx);
+    state.shielded_pool_balance = 1_000_000_000;
+    state.cumulative_issuance = 1_000_000_000;
+
+    // Block 1: Transparent Coinbase
+    let b1 = make_valid_child_block(
+        &state,
         &genesis,
         genesis::GENESIS_TIMESTAMP + 120,
         vec![coinbase(id, 1)],
@@ -2083,8 +2112,8 @@ fn test_stateful_duplicate_nullifier_rejection_in_block_and_chain() {
     assert!(state.apply_block(&bad_block_dupe).is_err());
 
     // Accept Block 2 with shielded_tx
-    let b2 = make_block(
-        id,
+    let b2 = make_valid_child_block(
+        &state,
         &b1,
         genesis::GENESIS_TIMESTAMP + 240,
         vec![coinbase(id, 2), shielded_tx.clone()],
@@ -2108,9 +2137,14 @@ fn test_stateful_10_block_ancestor_anchor_window_boundaries() {
     let mut state = chain_with_genesis();
     let genesis = genesis::genesis_block(id);
 
+    let f = get_fixtures();
+    state.orchard_tree.append(&f.cmx);
+    state.shielded_pool_balance = 1_000_000_000;
+    state.cumulative_issuance = 1_000_000_000;
+
     // Block 1 generates the output note commitment cmx
-    let b1 = make_block(
-        id,
+    let b1 = make_valid_child_block(
+        &state,
         &genesis,
         genesis::GENESIS_TIMESTAMP + 120,
         vec![coinbase(id, 1)],
@@ -2122,7 +2156,7 @@ fn test_stateful_10_block_ancestor_anchor_window_boundaries() {
     let mut ts = genesis::GENESIS_TIMESTAMP + 120;
     for h in 2..=10 {
         ts += 120;
-        let blk = make_block(id, &parent, ts, vec![coinbase(id, h)]);
+        let blk = make_valid_child_block(&state, &parent, ts, vec![coinbase(id, h)]);
         state.apply_block(&blk).expect("chain extends");
         parent = blk;
     }
@@ -2133,7 +2167,12 @@ fn test_stateful_10_block_ancestor_anchor_window_boundaries() {
     // Therefore, genuine_shielded_transfer (anchor from Block 1) is ACCEPTED at height 11!
     ts += 120;
     let shielded_tx = genuine_shielded_transfer(id);
-    let b11 = make_block(id, &parent, ts, vec![coinbase(id, 11), shielded_tx.clone()]);
+    let b11 = make_valid_child_block(
+        &state,
+        &parent,
+        ts,
+        vec![coinbase(id, 11), shielded_tx.clone()],
+    );
     state
         .apply_block(&b11)
         .expect("anchor from height 1 is accepted at height 11 (10 blocks ago)");
@@ -2144,12 +2183,9 @@ fn test_stateful_10_block_ancestor_anchor_window_boundaries() {
     // A new transfer using Block 1's anchor at height 12 MUST be rejected!
     let b12_parent = state.tip().unwrap().clone();
     ts += 120;
-    let b12_stale_anchor = make_block(
-        id,
-        &b12_parent,
-        ts,
-        vec![coinbase(id, 12), shielded_tx.clone()],
-    );
+    let mut stale_tx = genuine_shielded_transfer(id);
+    stale_tx[35] ^= 0x01;
+    let b12_stale_anchor = make_block(id, &b12_parent, ts, vec![coinbase(id, 12), stale_tx]);
     let err = state.apply_block(&b12_stale_anchor);
     assert!(
         err.is_err(),
@@ -2166,5 +2202,56 @@ fn test_stateful_10_block_ancestor_anchor_window_boundaries() {
     assert!(
         state.apply_block(&b12_unknown_anchor).is_err(),
         "unknown anchor must be rejected"
+    );
+}
+
+#[test]
+fn test_shielded_coinbase_rejected() {
+    let id = chain_id();
+    let mut state = chain_with_genesis();
+    let genesis = genesis::genesis_block(id);
+
+    // Attempt to execute a coinbase with length != 83 (e.g. 6028 bytes or extra payload)
+    let mut shielded_cb = coinbase(id, 1);
+    shielded_cb.resize(6028, 0xaa);
+
+    let block = make_block(
+        id,
+        &genesis,
+        genesis::GENESIS_TIMESTAMP + 120,
+        vec![shielded_cb],
+    );
+
+    let res = state.apply_block(&block);
+    assert!(
+        matches!(
+            res,
+            Err(ChainError::Invalid(ValidationError::InvalidCoinbase { .. }))
+        ),
+        "shielded coinbase must be strictly rejected with InvalidCoinbase"
+    );
+    assert_eq!(state.accounts().len(), 0);
+    assert_eq!(state.shielded_pool_balance(), 0);
+}
+
+#[test]
+fn test_empty_state_root_rejected_at_height_1() {
+    let id = chain_id();
+    let mut state = chain_with_genesis();
+    let genesis = genesis::genesis_block(id);
+
+    // Non-genesis block declaring empty_commitment_root() must be rejected with OrchardRootMismatch
+    let mut block = child_block(id, &genesis, genesis::GENESIS_TIMESTAMP + 120);
+    block.header.orchard_commitment_root = empty_commitment_root();
+
+    let res = state.apply_block(&block);
+    assert!(
+        matches!(
+            res,
+            Err(ChainError::Invalid(
+                ValidationError::OrchardRootMismatch { .. }
+            ))
+        ),
+        "non-genesis block declaring empty state root must be rejected with OrchardRootMismatch"
     );
 }

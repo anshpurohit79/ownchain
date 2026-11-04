@@ -34,9 +34,6 @@ pub const TX_TYPE_COINBASE: u8 = 0;
 /// Transaction type tag for a transparent transfer (Type 1).
 pub const TX_TYPE_TRANSPARENT_TRANSFER: u8 = 1;
 
-/// Historical alias for shielded Orchard transfers (from early M1-B harness).
-pub const TX_TYPE_ORCHARD_TRANSFER: u8 = 1;
-
 /// Transaction type tag for configure guardians (Type 2).
 pub const TX_TYPE_CONFIGURE_GUARDIANS: u8 = 2;
 
@@ -74,8 +71,6 @@ pub enum TxType {
     TransparentToShielded,
     /// Deshielding transfer from Orchard pool to transparent account (Type 7).
     ShieldedToTransparent,
-    /// Historical alias for shielded transfers from milestone M1-B.
-    OrchardTransfer,
 }
 
 impl TxType {
@@ -105,7 +100,6 @@ impl TxType {
             TxType::ShieldedTransfer => TX_TYPE_SHIELDED_TRANSFER,
             TxType::TransparentToShielded => TX_TYPE_TRANSPARENT_TO_SHIELDED,
             TxType::ShieldedToTransparent => TX_TYPE_SHIELDED_TO_TRANSPARENT,
-            TxType::OrchardTransfer => TX_TYPE_ORCHARD_TRANSFER,
         }
     }
 }
@@ -161,6 +155,13 @@ pub enum EnvelopeError {
         /// The height of the block containing it.
         expected: u64,
     },
+    /// The transaction payload length does not match the canonical length for its type.
+    InvalidPayloadLength {
+        /// The expected payload length in bytes.
+        expected: usize,
+        /// The actual payload length found.
+        actual: usize,
+    },
 }
 
 impl core::fmt::Display for EnvelopeError {
@@ -197,6 +198,12 @@ impl core::fmt::Display for EnvelopeError {
                     "coinbase height {found} does not match block height {expected}"
                 )
             }
+            EnvelopeError::InvalidPayloadLength { expected, actual } => {
+                write!(
+                    f,
+                    "invalid payload length: expected {expected} bytes, found {actual}"
+                )
+            }
         }
     }
 }
@@ -211,7 +218,7 @@ pub fn parse_envelope(tx: &[u8], expected_chain_id: Hash) -> Result<TxEnvelope, 
         return Err(EnvelopeError::TooShort { actual: tx.len() });
     }
 
-    let mut tx_type = TxType::from_tag(tx[0]).ok_or(EnvelopeError::UnknownType { tag: tx[0] })?;
+    let tx_type = TxType::from_tag(tx[0]).ok_or(EnvelopeError::UnknownType { tag: tx[0] })?;
 
     let version = u16::from_le_bytes([tx[1], tx[2]]);
     if version != TX_VERSION {
@@ -238,8 +245,6 @@ pub fn parse_envelope(tx: &[u8], expected_chain_id: Hash) -> Result<TxEnvelope, 
 
     match tx_type {
         TxType::Coinbase => {
-            // Either transparent `height (8) || recipient (32) || payout (8)` (48 bytes)
-            // or shielded `height:u64_le || orchard_bundle` (>8 bytes)
             if payload.len() < 8 {
                 return Err(EnvelopeError::TruncatedCoinbaseHeight);
             }
@@ -248,17 +253,14 @@ pub fn parse_envelope(tx: &[u8], expected_chain_id: Hash) -> Result<TxEnvelope, 
             }
         }
         TxType::TransparentTransfer => {
-            // If payload is not exactly 160 bytes (TransparentTransfer),
-            // check if it is a legacy OrchardTransfer (payload.len() > 8)
             if payload.len() != 160 {
-                if payload.len() > 8 {
-                    tx_type = TxType::OrchardTransfer;
-                } else {
-                    return Err(EnvelopeError::TruncatedTransferFee);
-                }
+                return Err(EnvelopeError::InvalidPayloadLength {
+                    expected: 160,
+                    actual: payload.len(),
+                });
             }
         }
-        TxType::OrchardTransfer | TxType::ShieldedTransfer => {
+        TxType::ShieldedTransfer => {
             if payload.len() < 8 {
                 return Err(EnvelopeError::TruncatedTransferFee);
             }
@@ -311,10 +313,6 @@ pub fn transaction_fee(tx: &[u8]) -> Option<u64> {
                 // fee is at payload offset 80..88 (sender 32, recipient 32, amount 16)
                 let bytes = payload.get(80..88)?;
                 Some(u64::from_le_bytes(bytes.try_into().ok()?))
-            } else if payload.len() >= 8 {
-                // legacy OrchardTransfer
-                let bytes = payload.get(..8)?;
-                Some(u64::from_le_bytes(bytes.try_into().ok()?))
             } else {
                 None
             }
@@ -350,5 +348,30 @@ pub fn transaction_fee(tx: &[u8]) -> Option<u64> {
             Some(u64::from_le_bytes(bytes.try_into().ok()?))
         }
         _ => None,
+    }
+}
+
+/// Computes the consensus minimum fee for a canonical signed transaction of `tx_len` bytes:
+///
+/// `minimum_fee = max(1 atom, 100 * canonical signed transaction byte length)`
+///
+/// Uses checked arithmetic to prevent integer overflow.
+pub fn min_fee(tx_len: usize) -> Option<u64> {
+    let len_u64 = u64::try_from(tx_len).ok()?;
+    let calculated = len_u64.checked_mul(100)?;
+    Some(calculated.max(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_min_fee_calculation() {
+        assert_eq!(min_fee(0), Some(1));
+        assert_eq!(min_fee(1), Some(100));
+        assert_eq!(min_fee(195), Some(19_500));
+        assert_eq!(min_fee(436), Some(43_600));
+        assert_eq!(min_fee(usize::MAX), None);
     }
 }

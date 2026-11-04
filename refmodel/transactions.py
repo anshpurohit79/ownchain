@@ -284,13 +284,16 @@ class ConfigureGuardiansTx:
 
     def canonical_unsigned_bytes(self) -> bytes:
         envelope = TxEnvelope(self.tx_type, self.version, self.chain_id).serialize()
-        return envelope + self.unsigned_payload()
+        quorum_count = struct.pack("<B", len(self.guardian_sigs))
+        indices = b"".join(struct.pack("<B", idx) for idx, _ in sorted(self.guardian_sigs, key=lambda x: x[0]))
+        return envelope + self.unsigned_payload() + quorum_count + indices
 
     def signing_preimage(self) -> bytes:
         return DOM_TX_AUTH + self.chain_id + self.canonical_unsigned_bytes()
 
     def serialize(self) -> bytes:
-        raw = self.canonical_unsigned_bytes() + self.owner_sig
+        envelope = TxEnvelope(self.tx_type, self.version, self.chain_id).serialize()
+        raw = envelope + self.unsigned_payload() + self.owner_sig
         raw += struct.pack("<B", len(self.guardian_sigs))
         for idx, sig in sorted(self.guardian_sigs, key=lambda x: x[0]):
             raw += struct.pack("<B", idx) + sig
@@ -335,13 +338,16 @@ class GuardianActionTx:
 
     def canonical_unsigned_bytes(self) -> bytes:
         envelope = TxEnvelope(self.tx_type, self.version, self.chain_id).serialize()
-        return envelope + self.unsigned_payload()
+        quorum_count = struct.pack("<B", len(self.guardian_sigs))
+        indices = b"".join(struct.pack("<B", idx) for idx, _ in sorted(self.guardian_sigs, key=lambda x: x[0]))
+        return envelope + self.unsigned_payload() + quorum_count + indices
 
     def signing_preimage(self) -> bytes:
         return DOM_TX_AUTH + self.chain_id + self.canonical_unsigned_bytes()
 
     def serialize(self) -> bytes:
-        raw = self.canonical_unsigned_bytes()
+        envelope = TxEnvelope(self.tx_type, self.version, self.chain_id).serialize()
+        raw = envelope + self.unsigned_payload()
         raw += struct.pack("<B", len(self.guardian_sigs))
         for idx, sig in sorted(self.guardian_sigs, key=lambda x: x[0]):
             raw += struct.pack("<B", idx) + sig
@@ -390,13 +396,16 @@ class CancelPendingTransferTx:
 
     def canonical_unsigned_bytes(self) -> bytes:
         envelope = TxEnvelope(self.tx_type, self.version, self.chain_id).serialize()
-        return envelope + self.unsigned_payload()
+        quorum_count = struct.pack("<B", len(self.guardian_sigs))
+        indices = b"".join(struct.pack("<B", idx) for idx, _ in sorted(self.guardian_sigs, key=lambda x: x[0]))
+        return envelope + self.unsigned_payload() + quorum_count + indices
 
     def signing_preimage(self) -> bytes:
         return DOM_TX_AUTH + self.chain_id + self.canonical_unsigned_bytes()
 
     def serialize(self) -> bytes:
-        raw = self.canonical_unsigned_bytes() + self.sender_sig
+        envelope = TxEnvelope(self.tx_type, self.version, self.chain_id).serialize()
+        raw = envelope + self.unsigned_payload() + self.sender_sig
         raw += struct.pack("<B", len(self.guardian_sigs))
         for idx, sig in sorted(self.guardian_sigs, key=lambda x: x[0]):
             raw += struct.pack("<B", idx) + sig
@@ -479,13 +488,16 @@ class TransparentToShieldedTx:
 
     def canonical_unsigned_bytes(self) -> bytes:
         envelope = TxEnvelope(self.tx_type, self.version, self.chain_id).serialize()
-        return envelope + self.unsigned_payload()
+        quorum_count = struct.pack("<B", len(self.guardian_sigs))
+        indices = b"".join(struct.pack("<B", idx) for idx, _ in sorted(self.guardian_sigs, key=lambda x: x[0]))
+        return envelope + self.unsigned_payload() + quorum_count + indices
 
     def signing_preimage(self) -> bytes:
         return DOM_TX_AUTH + self.chain_id + self.canonical_unsigned_bytes()
 
     def serialize(self) -> bytes:
-        raw = self.canonical_unsigned_bytes() + self.sender_sig
+        envelope = TxEnvelope(self.tx_type, self.version, self.chain_id).serialize()
+        raw = envelope + self.unsigned_payload() + self.sender_sig
         raw += struct.pack("<B", len(self.guardian_sigs))
         for idx, sig in sorted(self.guardian_sigs, key=lambda x: x[0]):
             raw += struct.pack("<B", idx) + sig

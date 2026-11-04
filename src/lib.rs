@@ -18,6 +18,7 @@
 //! mempool, and stateful Orchard consensus accounting belong to later milestones.
 
 pub mod account;
+pub mod auth;
 pub mod block;
 pub mod chain;
 pub mod difficulty;

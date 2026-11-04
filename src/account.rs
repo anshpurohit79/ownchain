@@ -2,8 +2,6 @@
 //!
 //! Defined in `docs/protocol-v1.md` §7.3 and ADR-004.
 
-use std::collections::BTreeSet;
-
 use crate::hash::Hash;
 
 /// The initial scheduled block subsidy in atoms (10 OWN).
@@ -64,13 +62,14 @@ pub struct PendingTransfer {
 }
 
 impl PendingTransfer {
-    /// Serializes pending transfer into canonical 64 bytes.
-    pub fn serialize(&self) -> [u8; 64] {
-        let mut out = [0u8; 64];
+    /// Serializes pending transfer into canonical 88 bytes matching `protocol-v1.md` §7.3:
+    /// `transfer_id[32] || recipient[32] || amount[16] || release_height[8]`.
+    pub fn serialize(&self) -> [u8; 88] {
+        let mut out = [0u8; 88];
         out[..32].copy_from_slice(self.transfer_id.as_bytes());
         out[32..64].copy_from_slice(self.recipient.as_bytes());
-        out[64 - 16 - 8..64 - 8].copy_from_slice(&self.amount.to_le_bytes());
-        out[64 - 8..].copy_from_slice(&self.release_height.to_le_bytes());
+        out[64..80].copy_from_slice(&self.amount.to_le_bytes());
+        out[80..88].copy_from_slice(&self.release_height.to_le_bytes());
         out
     }
 }
@@ -147,8 +146,6 @@ pub struct AccountState {
     pub pending_transfers: Vec<PendingTransfer>,
     /// Coinbase tranches awaiting maturity.
     pub coinbase_tranches: Vec<CoinbaseTranche>,
-    /// Set of recipient addresses that have previously received funds.
-    pub confirmed_recipients: BTreeSet<Hash>,
 }
 
 impl Default for AccountState {
@@ -175,7 +172,6 @@ impl AccountState {
             guardians: [[0u8; 32]; 7],
             pending_transfers: Vec::new(),
             coinbase_tranches: Vec::new(),
-            confirmed_recipients: BTreeSet::new(),
         }
     }
 
@@ -262,14 +258,26 @@ mod tests {
 
     #[test]
     fn test_scheduled_subsidy_schedule() {
+        // Genesis height 0 has zero subsidy
         assert_eq!(scheduled_subsidy(0), 0);
+
+        // Era 0: 10 OWN (1,000,000,000 atoms)
         assert_eq!(scheduled_subsidy(1), 1_000_000_000);
-        assert_eq!(scheduled_subsidy(1_050_000), 1_000_000_000);
-        assert_eq!(scheduled_subsidy(1_050_001), 500_000_000);
-        assert_eq!(scheduled_subsidy(2_100_000), 500_000_000);
-        assert_eq!(scheduled_subsidy(2_100_001), 250_000_000);
-        assert_eq!(scheduled_subsidy(31_500_000), 1);
-        assert_eq!(scheduled_subsidy(31_500_001), 0);
+        assert_eq!(scheduled_subsidy(1_049_999), 1_000_000_000); // Immediately before 1st halving
+        assert_eq!(scheduled_subsidy(1_050_000), 1_000_000_000); // At 1st halving boundary
+
+        // Era 1: 5 OWN (500,000,000 atoms)
+        assert_eq!(scheduled_subsidy(1_050_001), 500_000_000); // Immediately after 1st halving
+        assert_eq!(scheduled_subsidy(2_099_999), 500_000_000); // Immediately before 2nd halving
+        assert_eq!(scheduled_subsidy(2_100_000), 500_000_000); // At 2nd halving boundary
+
+        // Era 2: 2.5 OWN (250,000,000 atoms)
+        assert_eq!(scheduled_subsidy(2_100_001), 250_000_000); // Immediately after 2nd halving
+
+        // Exhaustion boundary at Era 30 (height 31,500,001)
+        assert_eq!(scheduled_subsidy(31_499_999), 1); // Era 29 penultimate block
+        assert_eq!(scheduled_subsidy(31_500_000), 1); // Era 29 last block (1 atom)
+        assert_eq!(scheduled_subsidy(31_500_001), 0); // Era 30 first block: exhausted!
         assert_eq!(scheduled_subsidy(100_000_000), 0);
     }
 
@@ -293,5 +301,42 @@ mod tests {
         assert_eq!(acc.spendable_balance(100).unwrap(), 300_000_000);
         // At height 101: coinbase matures -> spendable = 900M
         assert_eq!(acc.spendable_balance(101).unwrap(), 900_000_000);
+    }
+
+    #[test]
+    fn test_pending_transfer_canonical_serialization_88_bytes() {
+        let transfer_id = Hash::new([0x11; 32]);
+        let recipient = Hash::new([0x22; 32]);
+        let amount = 0x0102030405060708090a0b0c0d0e0f10u128;
+        let release_height = 0xa1a2a3a4a5a6a7a8u64;
+
+        let pending = PendingTransfer {
+            transfer_id,
+            recipient,
+            amount,
+            release_height,
+        };
+
+        let bytes = pending.serialize();
+        assert_eq!(bytes.len(), 88);
+
+        // Verify non-overlapping layout and field recovery
+        assert_eq!(&bytes[..32], transfer_id.as_bytes());
+        assert_eq!(&bytes[32..64], recipient.as_bytes());
+        assert_eq!(
+            u128::from_le_bytes(bytes[64..80].try_into().unwrap()),
+            amount
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[80..88].try_into().unwrap()),
+            release_height
+        );
+    }
+
+    #[test]
+    fn test_empty_account_state_canonical_size_346_bytes() {
+        let acc = AccountState::new();
+        let bytes = acc.serialize();
+        assert_eq!(bytes.len(), 346);
     }
 }

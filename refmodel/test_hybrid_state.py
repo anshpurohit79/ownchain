@@ -1120,14 +1120,75 @@ class TestHybridConsensusState(unittest.TestCase):
     # -----------------------------------------------------------------------
     def test_29_halving_boundaries_and_exhaustion(self):
         """Test exact subsidy values across halving eras and exhaustion."""
+        # Genesis height 0 has zero subsidy
         self.assertEqual(scheduled_subsidy(0), 0)
+
+        # Era 0: 10 OWN (1,000,000,000 atoms)
         self.assertEqual(scheduled_subsidy(1), 1_000_000_000)
-        self.assertEqual(scheduled_subsidy(1_050_000), 1_000_000_000)
-        self.assertEqual(scheduled_subsidy(1_050_001), 500_000_000)
-        self.assertEqual(scheduled_subsidy(2_100_000), 500_000_000)
+        self.assertEqual(scheduled_subsidy(1_049_999), 1_000_000_000)  # Immediately before 1st halving
+        self.assertEqual(scheduled_subsidy(1_050_000), 1_000_000_000)  # At 1st halving boundary
+
+        # Era 1: 5 OWN (500,000,000 atoms)
+        self.assertEqual(scheduled_subsidy(1_050_001), 500_000_000)  # Immediately after 1st halving
+        self.assertEqual(scheduled_subsidy(2_099_999), 500_000_000)  # Immediately before 2nd halving
+        self.assertEqual(scheduled_subsidy(2_100_000), 500_000_000)  # At 2nd halving boundary
+
+        # Era 2: 2.5 OWN (250,000,000 atoms)
+        self.assertEqual(scheduled_subsidy(2_100_001), 250_000_000)  # Immediately after 2nd halving
+
+        # Exhaustion boundary at Era 30 (height 31,500,001)
         self.assertEqual(scheduled_subsidy(30_450_001), 1)
-        self.assertEqual(scheduled_subsidy(31_500_000), 1)
-        self.assertEqual(scheduled_subsidy(31_500_001), 0)
+        self.assertEqual(scheduled_subsidy(31_499_999), 1)  # Era 29 penultimate block
+        self.assertEqual(scheduled_subsidy(31_500_000), 1)  # Era 29 last block (1 atom)
+        self.assertEqual(scheduled_subsidy(31_500_001), 0)  # Era 30 first block: exhausted!
+        self.assertEqual(scheduled_subsidy(100_000_000), 0)
+
+        # Halving boundary consensus enforcement in end_block
+        state_h1050k = HybridChainState(DEVNET_CHAIN_ID)
+        state_h1050k.height = 1_050_000
+        # Claiming exact 10 OWN subsidy at height 1,050,000 succeeds
+        miner_acc = state_h1050k.get_or_create_account(self.addr_miner)
+        miner_acc.balance = 1_000_000_000
+        state_h1050k.end_block(0, 1_000_000_000)
+        self.assertEqual(state_h1050k.cumulative_issuance, 1_000_000_000)
+
+        # Overclaiming by 1 atom at height 1,050,000 fails
+        state_over = HybridChainState(DEVNET_CHAIN_ID)
+        state_over.height = 1_050_000
+        with self.assertRaises(HybridStateError):
+            state_over.end_block(0, 1_000_000_001)
+
+        # At height 1,050,001 (Era 1): claiming 5 OWN succeeds
+        state_h1050k1 = HybridChainState(DEVNET_CHAIN_ID)
+        state_h1050k1.height = 1_050_001
+        miner_acc1 = state_h1050k1.get_or_create_account(self.addr_miner)
+        miner_acc1.balance = 500_000_000
+        state_h1050k1.end_block(0, 500_000_000)
+        self.assertEqual(state_h1050k1.cumulative_issuance, 500_000_000)
+
+        # At height 1,050,001: attempting to claim Era 0 subsidy (10 OWN) fails
+        state_era0_fail = HybridChainState(DEVNET_CHAIN_ID)
+        state_era0_fail.height = 1_050_001
+        with self.assertRaises(HybridStateError):
+            state_era0_fail.end_block(0, 1_000_000_000)
+
+        # Cumulative issuance cap (21M OWN) enforcement
+        state_cap = HybridChainState(DEVNET_CHAIN_ID)
+        state_cap.height = 1
+        state_cap.cumulative_issuance = MAX_SUPPLY_ATOMS - 500
+        cap_miner = state_cap.get_or_create_account(self.addr_miner)
+        cap_miner.balance = MAX_SUPPLY_ATOMS - 500
+        # Claiming remaining 500 atoms succeeds
+        cap_miner.balance += 500
+        state_cap.end_block(0, 500)
+        self.assertEqual(state_cap.cumulative_issuance, MAX_SUPPLY_ATOMS)
+
+        # Claiming 1 atom beyond 21M OWN cap fails
+        state_cap_over = HybridChainState(DEVNET_CHAIN_ID)
+        state_cap_over.height = 1
+        state_cap_over.cumulative_issuance = MAX_SUPPLY_ATOMS
+        with self.assertRaises(HybridStateError):
+            state_cap_over.end_block(0, 1)
 
 
 

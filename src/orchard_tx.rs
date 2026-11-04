@@ -537,15 +537,11 @@ pub fn compute_bundle_auth_digest<A: Authorization>(
 }
 
 /// Computes the exact public consensus fee in atoms for an Orchard transaction (§4):
-/// `max(1_000, 1_000 * action_count + canonical_transaction_size_in_bytes)`.
+/// `max(1, 100 * canonical_transaction_size_in_bytes)`.
 ///
 /// Uses checked arithmetic; returns `None` on overflow.
-pub fn consensus_fee(action_count: usize, canonical_tx_size: usize) -> Option<u64> {
-    let count_u64 = u64::try_from(action_count).ok()?;
-    let size_u64 = u64::try_from(canonical_tx_size).ok()?;
-    let action_fee = count_u64.checked_mul(1_000)?;
-    let base = action_fee.checked_add(size_u64)?;
-    Some(core::cmp::max(1_000, base))
+pub fn consensus_fee(_action_count: usize, canonical_tx_size: usize) -> Option<u64> {
+    crate::tx::min_fee(canonical_tx_size)
 }
 
 /// Errors produced when checking an Orchard transaction fee against the consensus formula (§4).
@@ -578,14 +574,14 @@ impl fmt::Display for FeeError {
 
 impl std::error::Error for FeeError {}
 
-/// Checks that a declared fee matches the exact consensus fee formula (§4).
+/// Checks that a declared fee matches or exceeds the exact consensus fee formula (§4).
 pub fn check_transaction_fee(
     action_count: usize,
     canonical_tx_size: usize,
     declared_fee: u64,
 ) -> Result<u64, FeeError> {
     let expected = consensus_fee(action_count, canonical_tx_size).ok_or(FeeError::Overflow)?;
-    if declared_fee != expected {
+    if declared_fee < expected {
         return Err(FeeError::Mismatch {
             declared: declared_fee,
             expected,
@@ -833,7 +829,7 @@ pub fn validate_bundle_structure_stateless(
                 });
             }
         }
-        TxType::OrchardTransfer | TxType::ShieldedTransfer => {
+        TxType::ShieldedTransfer => {
             if n_actions == 0 || n_actions > MAX_ACTIONS_PER_TX {
                 return Err(OrchardValidationError::InvalidTransferActionCount {
                     actual: n_actions,
@@ -946,7 +942,7 @@ impl ValidatedOrchardTx {
     /// Returns the fee in atoms if this is an ordinary transfer.
     pub fn fee_atoms(&self) -> Option<u64> {
         match self.envelope.tx_type {
-            TxType::OrchardTransfer | TxType::ShieldedTransfer => Some(self.payload_prefix),
+            TxType::ShieldedTransfer => Some(self.payload_prefix),
             _ => None,
         }
     }
@@ -996,7 +992,7 @@ pub fn validate_transaction_stateless(
     // 2. Parse outer envelope
     let envelope = tx::parse_envelope(tx_bytes, expected_chain_id)?;
 
-    if envelope.tx_type == TxType::OrchardTransfer && tx_bytes.len() > MAX_TRANSACTION_SIZE {
+    if envelope.tx_type == TxType::ShieldedTransfer && tx_bytes.len() > MAX_TRANSACTION_SIZE {
         return Err(OrchardValidationError::TransactionTooLarge {
             actual: tx_bytes.len(),
             limit: MAX_TRANSACTION_SIZE,
@@ -1009,7 +1005,7 @@ pub fn validate_transaction_stateless(
         TxType::Coinbase => {
             tx::coinbase_height(tx_bytes).ok_or(EnvelopeError::TruncatedCoinbaseHeight)?
         }
-        TxType::OrchardTransfer | TxType::ShieldedTransfer => {
+        TxType::ShieldedTransfer => {
             tx::transfer_fee(tx_bytes).ok_or(EnvelopeError::TruncatedTransferFee)?
         }
         _ => {
@@ -1071,11 +1067,11 @@ mod tests {
 
     #[test]
     fn test_consensus_fee_formula() {
-        assert_eq!(consensus_fee(0, 0), Some(1_000));
-        assert_eq!(consensus_fee(1, 0), Some(1_000));
-        assert_eq!(consensus_fee(1, 100), Some(1_100));
-        assert_eq!(consensus_fee(2, 500), Some(2_500));
-        assert_eq!(consensus_fee(50, 10_000), Some(60_000));
+        assert_eq!(consensus_fee(0, 0), Some(1));
+        assert_eq!(consensus_fee(1, 0), Some(1));
+        assert_eq!(consensus_fee(1, 100), Some(10_000));
+        assert_eq!(consensus_fee(2, 500), Some(50_000));
+        assert_eq!(consensus_fee(50, 10_000), Some(1_000_000));
         assert_eq!(consensus_fee(usize::MAX, usize::MAX), None);
     }
 
@@ -1138,12 +1134,12 @@ mod tests {
 
     #[test]
     fn test_fee_error_and_check_transaction_fee() {
-        assert_eq!(check_transaction_fee(1, 6028, 7028), Ok(7028));
+        assert_eq!(check_transaction_fee(1, 6028, 602_800), Ok(602_800));
         assert_eq!(
             check_transaction_fee(1, 6028, 5000),
             Err(FeeError::Mismatch {
                 declared: 5000,
-                expected: 7028,
+                expected: 602_800,
             })
         );
         assert_eq!(
@@ -1153,11 +1149,11 @@ mod tests {
 
         let err = FeeError::Mismatch {
             declared: 5000,
-            expected: 7028,
+            expected: 602_800,
         };
         assert_eq!(
             format!("{err}"),
-            "declared fee 5000 atoms does not match expected consensus fee 7028 atoms"
+            "declared fee 5000 atoms does not match expected consensus fee 602800 atoms"
         );
         let ovf = FeeError::Overflow;
         assert_eq!(format!("{ovf}"), "consensus fee calculation overflowed");

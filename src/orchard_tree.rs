@@ -5,7 +5,7 @@
 //! hashing.
 
 use orchard::note::ExtractedNoteCommitment;
-use orchard::tree::{MerkleHashOrchard, MerklePath};
+use orchard::tree::MerkleHashOrchard;
 
 use crate::hash::Hash;
 use crate::orchard_root::empty_commitment_root;
@@ -177,7 +177,8 @@ pub const EMPTY_ROOTS: [[u8; 32]; 32] = [
 /// Depth-32 incremental Orchard commitment tree.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct OrchardTree {
-    leaves: Vec<ExtractedNoteCommitment>,
+    frontier: [Option<MerkleHashOrchard>; 32],
+    count: u64,
     current_root: Hash,
 }
 
@@ -191,46 +192,85 @@ impl OrchardTree {
     /// Creates an empty depth-32 Orchard commitment tree.
     pub fn new() -> Self {
         Self {
-            leaves: Vec::new(),
+            frontier: [None; 32],
+            count: 0,
             current_root: empty_commitment_root(),
         }
     }
 
     /// Appends an extracted note commitment to the tree.
     pub fn append(&mut self, cmx: &ExtractedNoteCommitment) {
-        let pos = self.leaves.len() as u32;
-        // Compute auth path for appending leaf at pos:
-        let empty_path = EMPTY_ROOTS.map(|b| MerkleHashOrchard::from_bytes(&b).unwrap());
-        let mut auth_path = empty_path;
-
-        // If this is position 0, auth_path is entirely empty roots:
-        if pos == 0 {
-            let path = MerklePath::from_parts(0, auth_path);
-            let anchor = path.root(*cmx);
-            self.current_root = Hash::new(anchor.to_bytes());
-        } else if pos == 1 {
-            // For position 1, sibling at level 0 is leaf 0:
-            auth_path[0] = MerkleHashOrchard::from_cmx(&self.leaves[0]);
-            let path = MerklePath::from_parts(1, auth_path);
-            let anchor = path.root(*cmx);
-            self.current_root = Hash::new(anchor.to_bytes());
-        } else {
-            // General case for small trees:
-            // Sibling at level 0:
-            if (pos & 1) == 1 {
-                auth_path[0] = MerkleHashOrchard::from_cmx(&self.leaves[(pos - 1) as usize]);
+        let mut cur = MerkleHashOrchard::from_cmx(cmx);
+        let mut c = self.count;
+        for lvl in 0..32 {
+            if (c & 1) == 0 {
+                self.frontier[lvl] = Some(cur);
+                break;
+            } else {
+                let left = self.frontier[lvl]
+                    .take()
+                    .expect("frontier node missing at level");
+                cur = MerkleHashOrchard::combine_batch((lvl as u8).into(), [(&left, &cur)])
+                    .pop()
+                    .unwrap();
+                c >>= 1;
             }
-            let path = MerklePath::from_parts(pos, auth_path);
-            let anchor = path.root(*cmx);
-            self.current_root = Hash::new(anchor.to_bytes());
+        }
+        self.count += 1;
+        self.current_root = self.compute_root();
+    }
+
+    fn compute_root(&self) -> Hash {
+        if self.count == 0 {
+            return empty_commitment_root();
         }
 
-        self.leaves.push(*cmx);
+        let empty_roots = EMPTY_ROOTS.map(|b| MerkleHashOrchard::from_bytes(&b).unwrap());
+
+        let mut root_val: Option<(usize, MerkleHashOrchard)> = None;
+        for lvl in 0..32 {
+            if let Some(node) = self.frontier[lvl] {
+                match root_val {
+                    None => {
+                        root_val = Some((lvl, node));
+                    }
+                    Some((cur_lvl, mut cur_node)) => {
+                        for (l, empty_root) in
+                            empty_roots.iter().enumerate().take(lvl).skip(cur_lvl)
+                        {
+                            cur_node = MerkleHashOrchard::combine_batch(
+                                (l as u8).into(),
+                                [(&cur_node, empty_root)],
+                            )
+                            .pop()
+                            .unwrap();
+                        }
+                        let combined = MerkleHashOrchard::combine_batch(
+                            (lvl as u8).into(),
+                            [(&node, &cur_node)],
+                        )
+                        .pop()
+                        .unwrap();
+                        root_val = Some((lvl + 1, combined));
+                    }
+                }
+            }
+        }
+
+        let (cur_lvl, mut cur_node) = root_val.unwrap();
+        for (l, empty_root) in empty_roots.iter().enumerate().skip(cur_lvl) {
+            cur_node =
+                MerkleHashOrchard::combine_batch((l as u8).into(), [(&cur_node, empty_root)])
+                    .pop()
+                    .unwrap();
+        }
+
+        Hash::new(cur_node.to_bytes())
     }
 
     /// Returns the number of leaves appended so far.
     pub fn count(&self) -> u64 {
-        self.leaves.len() as u64
+        self.count
     }
 
     /// Computes the current depth-32 Orchard root as a 32-byte [`Hash`].
@@ -243,6 +283,84 @@ impl OrchardTree {
 mod tests {
     use super::*;
     use orchard::note::ExtractedNoteCommitment;
+    use orchard::tree::MerklePath;
+
+    #[test]
+    fn test_five_commitments_golden_vector() {
+        let commitments = [
+            [
+                0x68, 0x13, 0x5c, 0xf4, 0x99, 0x33, 0x22, 0x90, 0x99, 0xa4, 0x4e, 0xc9, 0x9a, 0x75,
+                0xe1, 0xe1, 0xcb, 0x46, 0x40, 0xf9, 0xb5, 0xbd, 0xec, 0x6b, 0x32, 0x23, 0x85, 0x6f,
+                0xea, 0x16, 0x39, 0x0a,
+            ],
+            [
+                0x78, 0x31, 0x50, 0x08, 0xfb, 0x29, 0x98, 0xb4, 0x30, 0xa5, 0x73, 0x1d, 0x67, 0x26,
+                0x20, 0x7d, 0xc0, 0xf0, 0xec, 0x81, 0xea, 0x64, 0xaf, 0x5c, 0xf6, 0x12, 0x95, 0x69,
+                0x01, 0xe7, 0x2f, 0x0e,
+            ],
+            [
+                0xee, 0x94, 0x88, 0x05, 0x3a, 0x30, 0xc5, 0x96, 0xb4, 0x30, 0x14, 0x10, 0x5d, 0x34,
+                0x77, 0xe6, 0xf5, 0x78, 0xc8, 0x92, 0x40, 0xd1, 0xd1, 0xee, 0x17, 0x43, 0xb7, 0x7b,
+                0xb6, 0xad, 0xc4, 0x0a,
+            ],
+            [
+                0x9d, 0xdc, 0xe7, 0xf0, 0x65, 0x01, 0xf3, 0x63, 0x76, 0x8c, 0x5b, 0xca, 0x3f, 0x26,
+                0x46, 0x60, 0x83, 0x4d, 0x4d, 0xf4, 0x46, 0xd1, 0x3e, 0xfc, 0xd7, 0xc6, 0xf1, 0x7b,
+                0x16, 0x7a, 0xac, 0x1a,
+            ],
+            [
+                0xbd, 0x86, 0x16, 0x81, 0x1c, 0x6f, 0x5f, 0x76, 0x9e, 0xa4, 0x53, 0x9b, 0xba, 0xff,
+                0x0f, 0x19, 0x8a, 0x6c, 0xdf, 0x3b, 0x28, 0x0d, 0xd4, 0x99, 0x26, 0x16, 0x3b, 0xd5,
+                0x3f, 0x53, 0xa1, 0x21,
+            ],
+        ];
+
+        let expected_anchor = [
+            0xc8, 0x75, 0xbe, 0x2d, 0x60, 0x87, 0x3f, 0x8b, 0xcd, 0xeb, 0x91, 0x28, 0x2e, 0x64,
+            0x2e, 0x0c, 0xc6, 0x5f, 0xf7, 0xd0, 0x64, 0x2d, 0x13, 0x7b, 0x28, 0xcf, 0x28, 0xcc,
+            0x9c, 0x52, 0x7f, 0x0e,
+        ];
+
+        let mut tree = OrchardTree::new();
+        assert_eq!(tree.count(), 0);
+        assert_eq!(tree.root(), empty_commitment_root());
+
+        for cmx_bytes in &commitments {
+            let cmx = ExtractedNoteCommitment::from_bytes(cmx_bytes).unwrap();
+            tree.append(&cmx);
+        }
+
+        assert_eq!(tree.count(), 5);
+        assert_eq!(tree.root().as_bytes(), &expected_anchor);
+    }
+
+    #[test]
+    fn test_power_of_two_progression() {
+        let mut tree = OrchardTree::new();
+        let cmx_bytes = [
+            0x68, 0x13, 0x5c, 0xf4, 0x99, 0x33, 0x22, 0x90, 0x99, 0xa4, 0x4e, 0xc9, 0x9a, 0x75,
+            0xe1, 0xe1, 0xcb, 0x46, 0x40, 0xf9, 0xb5, 0xbd, 0xec, 0x6b, 0x32, 0x23, 0x85, 0x6f,
+            0xea, 0x16, 0x39, 0x0a,
+        ];
+        let cmx = ExtractedNoteCommitment::from_bytes(&cmx_bytes).unwrap();
+
+        let mut roots = Vec::new();
+        for i in 1..=64 {
+            tree.append(&cmx);
+            assert_eq!(tree.count(), i);
+            let r = tree.root();
+            assert_ne!(r, empty_commitment_root());
+            roots.push(r);
+        }
+
+        // Roots at different counts should be distinct (tree grows and changes)
+        assert_ne!(roots[0], roots[1]); // 1 vs 2
+        assert_ne!(roots[1], roots[3]); // 2 vs 4
+        assert_ne!(roots[3], roots[7]); // 4 vs 8
+        assert_ne!(roots[7], roots[15]); // 8 vs 16
+        assert_ne!(roots[15], roots[31]); // 16 vs 32
+        assert_ne!(roots[31], roots[63]); // 32 vs 64
+    }
 
     #[test]
     fn test_empty_orchard_tree_root() {

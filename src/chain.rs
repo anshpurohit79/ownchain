@@ -95,13 +95,27 @@ pub struct ChainState {
     difficulty_samples: Vec<crate::difficulty::DifficultySample>,
 
     // Hybrid consensus state components:
-    accounts: BTreeMap<Hash, AccountState>,
-    nullifier_set: BTreeSet<Hash>,
-    shielded_pool_balance: u128,
-    cumulative_issuance: u128,
-    orchard_tree: OrchardTree,
-    historical_anchors: BTreeMap<u64, Hash>,
+    pub accounts: BTreeMap<Hash, AccountState>,
+    pub nullifier_set: BTreeSet<Hash>,
+    pub shielded_pool_balance: u128,
+    pub cumulative_issuance: u128,
+    pub orchard_tree: OrchardTree,
+    pub historical_anchors: BTreeMap<u64, Hash>,
     history: BTreeMap<u64, ChainStateSnapshot>,
+}
+
+/// Candidate state transition evaluated against chain state.
+#[derive(Clone, Debug)]
+pub struct CandidateStateTransition {
+    pub accounts: BTreeMap<Hash, AccountState>,
+    pub nullifier_set: BTreeSet<Hash>,
+    pub shielded_pool_balance: u128,
+    pub cumulative_issuance: u128,
+    pub orchard_tree: OrchardTree,
+    pub historical_anchors: BTreeMap<u64, Hash>,
+    pub accepted_transaction_ids: Vec<Hash>,
+    pub computed_state_root: Hash,
+    pub next_cumulative_work: crate::difficulty::U256,
 }
 
 impl ChainState {
@@ -348,10 +362,12 @@ impl ChainState {
         validate_block(block, &context)
     }
 
-    /// Validates and atomically accepts a candidate block.
-    pub fn apply_block(&mut self, block: &Block) -> Result<(), ChainError> {
-        // 1. Structural validation first
-        self.validate(block)?;
+    /// Evaluates a candidate block and computes the candidate post-state transition without mutating the chain.
+    pub fn evaluate_candidate(
+        &self,
+        block: &Block,
+    ) -> Result<CandidateStateTransition, ChainError> {
+        // 1. Structural encoding check
         block.to_bytes()?;
 
         let next_cumulative_work = if block.header.height == 0 {
@@ -414,7 +430,6 @@ impl ChainState {
                     .balance
                     .checked_sub(amount)
                     .ok_or_else(|| ChainError::State("underflow during pending release".into()))?;
-                sender.confirmed_recipients.insert(recipient);
                 let rec = candidate_accounts.entry(recipient).or_default();
                 rec.balance = rec
                     .balance
@@ -423,8 +438,10 @@ impl ChainState {
             }
 
             // B. Build valid 10-block ancestor-anchor window [max(0, H-10), H-1]
+            // saturating_sub is safe here: heights are small and clamping at 0 only affects
+            // genesis-adjacent blocks where the window is naturally truncated.
             let min_anchor_h = h.saturating_sub(10);
-            let max_anchor_h = h.saturating_sub(1);
+            let max_anchor_h = h.saturating_sub(1); // h >= 1 in this branch, so no saturation
             let mut valid_anchors = BTreeSet::new();
             for anch_h in min_anchor_h..=max_anchor_h {
                 if let Some(anc) = candidate_anchors.get(&anch_h) {
@@ -458,189 +475,219 @@ impl ChainState {
                                 reason: "coinbase must be at index 0".into(),
                             }));
                         }
-                        if raw_tx.len() == 83 {
-                            // Transparent Coinbase
-                            let cb_h = u64::from_le_bytes(raw_tx[35..43].try_into().unwrap());
-                            if cb_h != h {
-                                return Err(ChainError::Invalid(
-                                    ValidationError::CoinbaseHeightMismatch {
-                                        found: cb_h,
-                                        expected: h,
-                                    },
-                                ));
-                            }
-                            let recipient = Hash::new(raw_tx[43..75].try_into().unwrap());
-                            let payout =
-                                u64::from_le_bytes(raw_tx[75..83].try_into().unwrap()) as u128;
-                            coinbase_payout = payout;
-
-                            let miner = candidate_accounts.entry(recipient).or_default();
-                            miner.balance = miner.balance.checked_add(payout).ok_or_else(|| {
-                                ChainError::State("miner balance overflow".into())
-                            })?;
-                            miner.coinbase_tranches.push(CoinbaseTranche {
-                                coinbase_tx_id: tx_id,
-                                amount: payout,
-                                unlock_height: h + COINBASE_MATURITY_BLOCKS,
-                            });
-                        } else {
-                            // Shielded Coinbase (with Orchard bundle)
-                            let cb_h = tx::coinbase_height(raw_tx).ok_or_else(|| {
-                                ChainError::State("truncated shielded coinbase height".into())
-                            })?;
-                            if cb_h != h {
-                                return Err(ChainError::Invalid(
-                                    ValidationError::CoinbaseHeightMismatch {
-                                        found: cb_h,
-                                        expected: h,
-                                    },
-                                ));
-                            }
-                            let bundle = deserialize_bundle(&raw_tx[43..])
-                                .map_err(|e| ChainError::State(format!("bundle error: {e:?}")))?;
-                            let vb = *bundle.value_balance();
-                            if vb >= 0 {
-                                return Err(ChainError::State(
-                                    "shielded coinbase valueBalance must be negative".into(),
-                                ));
-                            }
-                            let payout = (-vb) as u128;
-                            coinbase_payout = payout;
-                            candidate_pool_balance =
-                                candidate_pool_balance.checked_add(payout).ok_or_else(|| {
-                                    ChainError::State("pool balance overflow from coinbase".into())
-                                })?;
-                            for action in bundle.actions() {
-                                candidate_tree.append(action.cmx());
-                            }
+                        if raw_tx.len() != 83 {
+                            return Err(ChainError::Invalid(ValidationError::InvalidCoinbase {
+                                reason: format!(
+                                    "invalid coinbase wire length: expected 83 (transparent-only), found {}",
+                                    raw_tx.len()
+                                ),
+                            }));
                         }
+                        // Transparent Coinbase
+                        let cb_h = u64::from_le_bytes(raw_tx[35..43].try_into().unwrap());
+                        if cb_h != h {
+                            return Err(ChainError::Invalid(
+                                ValidationError::CoinbaseHeightMismatch {
+                                    found: cb_h,
+                                    expected: h,
+                                },
+                            ));
+                        }
+                        let recipient = Hash::new(raw_tx[43..75].try_into().unwrap());
+                        let payout = u64::from_le_bytes(raw_tx[75..83].try_into().unwrap()) as u128;
+                        coinbase_payout = payout;
+
+                        let miner = candidate_accounts.entry(recipient).or_default();
+                        miner.balance = miner
+                            .balance
+                            .checked_add(payout)
+                            .ok_or_else(|| ChainError::State("miner balance overflow".into()))?;
+                        let unlock_height = h
+                            .checked_add(COINBASE_MATURITY_BLOCKS)
+                            .ok_or_else(|| ChainError::State("maturity height overflow".into()))?;
+                        miner.coinbase_tranches.push(CoinbaseTranche {
+                            coinbase_tx_id: tx_id,
+                            amount: payout,
+                            unlock_height,
+                        });
                     }
 
                     tx::TX_TYPE_TRANSPARENT_TRANSFER => {
+                        if raw_tx.len() != 195 {
+                            return Err(ChainError::State(format!(
+                                "invalid Type 1 TransparentTransfer wire length: expected 195, got {}",
+                                raw_tx.len()
+                            )));
+                        }
+                        let unsigned_tx = &raw_tx[..131];
+                        let sig_bytes: [u8; 64] = raw_tx[131..195].try_into().unwrap();
+
                         let payload = &raw_tx[tx::TX_ENVELOPE_LEN..];
-                        if payload.len() == 160 {
-                            // Type 1: TransparentTransfer
-                            let mut sender_key = [0u8; 32];
-                            sender_key.copy_from_slice(&payload[..32]);
-                            let sender_addr = derive_address(&sender_key);
+                        let mut sender_key = [0u8; 32];
+                        sender_key.copy_from_slice(&payload[..32]);
 
-                            let recipient = Hash::new(payload[32..64].try_into().unwrap());
-                            let amount = u128::from_le_bytes(payload[64..80].try_into().unwrap());
-                            let fee_atoms =
-                                u64::from_le_bytes(payload[80..88].try_into().unwrap()) as u128;
-                            let nonce = u64::from_le_bytes(payload[88..96].try_into().unwrap());
+                        // Strict Ed25519 signature verification over canonical signing preimage
+                        let preimage =
+                            crate::auth::compute_signing_preimage(self.chain_id, unsigned_tx);
+                        crate::auth::verify_signature(&sender_key, &preimage, &sig_bytes).map_err(
+                            |e| ChainError::State(format!("signature verification failed: {e}")),
+                        )?;
 
-                            let min_fee = (100 * raw_tx.len() as u128).max(1);
-                            if fee_atoms < min_fee {
-                                return Err(ChainError::State(
-                                    "fee below consensus minimum".into(),
-                                ));
+                        let sender_addr = derive_address(&sender_key);
+
+                        let recipient = Hash::new(payload[32..64].try_into().unwrap());
+                        let amount = u128::from_le_bytes(payload[64..80].try_into().unwrap());
+                        let fee_atoms =
+                            u64::from_le_bytes(payload[80..88].try_into().unwrap()) as u128;
+                        let nonce = u64::from_le_bytes(payload[88..96].try_into().unwrap());
+
+                        let min_fee = crate::tx::min_fee(raw_tx.len()).ok_or_else(|| {
+                            ChainError::State("transaction too large for fee calculation".into())
+                        })? as u128;
+                        if fee_atoms < min_fee {
+                            return Err(ChainError::State("fee below consensus minimum".into()));
+                        }
+
+                        let sender = candidate_accounts
+                            .get_mut(&sender_addr)
+                            .ok_or_else(|| ChainError::State("sender account not found".into()))?;
+
+                        if sender.is_frozen {
+                            return Err(ChainError::State("sender account is frozen".into()));
+                        }
+                        if sender.nonce != nonce {
+                            return Err(ChainError::State(format!(
+                                "nonce mismatch: expected {}, got {}",
+                                sender.nonce, nonce
+                            )));
+                        }
+
+                        let total_cost = amount.checked_add(fee_atoms).ok_or_else(|| {
+                            ChainError::State("transfer total cost overflow".into())
+                        })?;
+
+                        let spendable = sender.spendable_balance(h).map_err(|_| {
+                            ChainError::State("negative spendable balance calculation".into())
+                        })?;
+                        if spendable < total_cost {
+                            return Err(ChainError::State(format!(
+                                "insufficient spendable balance: {spendable} < {total_cost}"
+                            )));
+                        }
+
+                        // Allowance window check
+                        if sender.allowance_limit > 0 && sender.allowance_window_len > 0 {
+                            if h >= sender.allowance_window_start + sender.allowance_window_len {
+                                sender.allowance_window_start = h;
+                                sender.allowance_spent = 0;
                             }
-
-                            let sender =
-                                candidate_accounts.get_mut(&sender_addr).ok_or_else(|| {
-                                    ChainError::State("sender account not found".into())
-                                })?;
-
-                            if sender.is_frozen {
-                                return Err(ChainError::State("sender account is frozen".into()));
+                            if sender.allowance_spent + total_cost > sender.allowance_limit {
+                                return Err(ChainError::State("allowance limit exceeded".into()));
                             }
-                            if sender.nonce != nonce {
-                                return Err(ChainError::State(format!(
-                                    "nonce mismatch: expected {}, got {}",
-                                    sender.nonce, nonce
-                                )));
-                            }
+                            sender.allowance_spent += total_cost; // allowance_spent + total_cost <= allowance_limit checked above
+                        }
 
-                            let total_cost = amount.checked_add(fee_atoms).ok_or_else(|| {
-                                ChainError::State("transfer total cost overflow".into())
+                        sender.nonce += 1; // nonce increments once per tx; bounded by block tx count
+                                           // Bounds guaranteed: spendable >= total_cost >= fee_atoms (checked above), so balance >= fee_atoms.
+                        sender.balance -= fee_atoms;
+                        block_fees = block_fees.checked_add(fee_atoms).ok_or_else(|| {
+                            ChainError::State("block fee accumulation overflow".into())
+                        })?;
+
+                        if sender.guardian_enabled {
+                            // Locked in pending transfer
+                            let mut inp = [0u8; 40];
+                            inp[..32].copy_from_slice(tx_id.as_bytes());
+                            inp[32..].copy_from_slice(b"/pending");
+                            let pending_id = hash::hash(&inp);
+
+                            let release_height = h
+                                .checked_add(sender.new_recipient_delay as u64)
+                                .ok_or_else(|| {
+                                ChainError::State("release height overflow".into())
                             })?;
 
-                            let spendable = sender.spendable_balance(h).map_err(|_| {
-                                ChainError::State("negative spendable balance calculation".into())
-                            })?;
-                            if spendable < total_cost {
-                                return Err(ChainError::State(format!(
-                                    "insufficient spendable balance: {spendable} < {total_cost}"
-                                )));
-                            }
-
-                            // Allowance window check
-                            if sender.allowance_limit > 0 && sender.allowance_window_len > 0 {
-                                if h >= sender.allowance_window_start + sender.allowance_window_len
-                                {
-                                    sender.allowance_window_start = h;
-                                    sender.allowance_spent = 0;
-                                }
-                                if sender.allowance_spent + total_cost > sender.allowance_limit {
-                                    return Err(ChainError::State(
-                                        "allowance limit exceeded".into(),
-                                    ));
-                                }
-                                sender.allowance_spent += total_cost;
-                            }
-
-                            sender.nonce += 1;
-                            sender.balance -= fee_atoms;
-                            block_fees += fee_atoms;
-
-                            if sender.guardian_enabled
-                                && !sender.confirmed_recipients.contains(&recipient)
-                            {
-                                // Locked in pending transfer
-                                let mut inp = [0u8; 40];
-                                inp[..32].copy_from_slice(tx_id.as_bytes());
-                                inp[32..].copy_from_slice(b"/pending");
-                                let pending_id = hash::hash(&inp);
-
-                                sender.pending_transfers.push(PendingTransfer {
-                                    transfer_id: pending_id,
-                                    recipient,
-                                    amount,
-                                    release_height: h + sender.new_recipient_delay as u64,
-                                });
-                            } else {
-                                sender.balance -= amount;
-                                sender.confirmed_recipients.insert(recipient);
-                                let rec = candidate_accounts.entry(recipient).or_default();
-                                rec.balance = rec.balance.checked_add(amount).ok_or_else(|| {
-                                    ChainError::State("recipient balance overflow".into())
-                                })?;
-                            }
+                            sender.pending_transfers.push(PendingTransfer {
+                                transfer_id: pending_id,
+                                recipient,
+                                amount,
+                                release_height,
+                            });
                         } else {
-                            // Legacy M1-B OrchardTransfer
-                            let fee = tx::transfer_fee(raw_tx).unwrap_or(0) as u128;
-                            candidate_pool_balance = candidate_pool_balance.saturating_sub(fee);
-                            block_fees += fee;
-                            if payload.len() > 8 {
-                                if let Ok(bundle) = deserialize_bundle(&payload[8..]) {
-                                    for action in bundle.actions() {
-                                        candidate_tree.append(action.cmx());
-                                    }
-                                }
-                            }
+                            sender.balance =
+                                sender.balance.checked_sub(amount).ok_or_else(|| {
+                                    ChainError::State("sender balance underflow".into())
+                                })?;
+                            let rec = candidate_accounts.entry(recipient).or_default();
+                            rec.balance = rec.balance.checked_add(amount).ok_or_else(|| {
+                                ChainError::State("recipient balance overflow".into())
+                            })?;
                         }
                     }
 
                     tx::TX_TYPE_CONFIGURE_GUARDIANS => {
-                        let payload = &raw_tx[tx::TX_ENVELOPE_LEN..];
-                        if payload.len() < 336 + 64 + 1 {
+                        if raw_tx.len() < 436 {
                             return Err(ChainError::State(
                                 "truncated configure guardians payload".into(),
                             ));
                         }
+                        let unsigned_prefix = &raw_tx[..371];
+                        let owner_sig: [u8; 64] = raw_tx[371..435].try_into().unwrap();
+                        let guardian_section = &raw_tx[435..];
+
+                        let payload = &raw_tx[tx::TX_ENVELOPE_LEN..];
                         let mut account_key = [0u8; 32];
                         account_key.copy_from_slice(&payload[..32]);
+
                         let account_addr = derive_address(&account_key);
 
                         let nonce = u64::from_le_bytes(payload[32..40].try_into().unwrap());
                         let fee_atoms =
                             u64::from_le_bytes(payload[40..48].try_into().unwrap()) as u128;
 
-                        let min_fee = (100 * raw_tx.len() as u128).max(1);
+                        let min_fee = crate::tx::min_fee(raw_tx.len()).ok_or_else(|| {
+                            ChainError::State("transaction too large for fee calculation".into())
+                        })? as u128;
                         if fee_atoms < min_fee {
                             return Err(ChainError::State("fee below minimum".into()));
                         }
+
+                        // Validate all 7 new guardian keys strictly and ensure uniqueness
+                        let mut new_guardians = [[0u8; 32]; 7];
+                        for i in 0..7 {
+                            new_guardians[i]
+                                .copy_from_slice(&payload[48 + i * 32..48 + (i + 1) * 32]);
+                        }
+                        crate::auth::validate_guardian_keys_set(&new_guardians).map_err(|e| {
+                            ChainError::State(format!("invalid new guardian keys: {e}"))
+                        })?;
+
+                        let mut recovery_key = [0u8; 32];
+                        recovery_key.copy_from_slice(&payload[304..336]);
+                        crate::auth::validate_pubkey(&recovery_key)
+                            .map_err(|e| ChainError::State(format!("invalid recovery key: {e}")))?;
+
+                        // Parse guardian signature entries
+                        let guardian_entries = crate::auth::parse_guardian_sigs(guardian_section)
+                            .map_err(|e| {
+                            ChainError::State(format!("malformed guardian signatures: {e}"))
+                        })?;
+
+                        // Canonical unsigned tx bytes binds declared quorum count and guardian indices
+                        let unsigned_tx = crate::auth::canonical_unsigned_with_guardians(
+                            unsigned_prefix,
+                            &guardian_entries,
+                        );
+                        let preimage =
+                            crate::auth::compute_signing_preimage(self.chain_id, &unsigned_tx);
+
+                        // Strict owner signature verification over canonical signing preimage
+                        crate::auth::verify_signature(&account_key, &preimage, &owner_sig)
+                            .map_err(|e| {
+                                ChainError::State(format!(
+                                    "owner signature verification failed: {e}"
+                                ))
+                            })?;
 
                         let account = candidate_accounts.entry(account_addr).or_default();
 
@@ -657,22 +704,34 @@ impl ChainState {
                             return Err(ChainError::State("insufficient balance for fee".into()));
                         }
 
-                        let sigs_offset = 32 + 8 + 8 + 224 + 4 + 4 + 16 + 8 + 32 + 64; // = 400
-                        let sigs_count = payload.get(sigs_offset).copied().unwrap_or(0) as usize;
-                        if account.guardian_enabled && sigs_count < 4 {
+                        if account.guardian_enabled {
+                            // Reconfiguration requires at least 4 distinct signatures from OLD guardians
+                            crate::auth::verify_guardian_quorum(
+                                &account.guardians,
+                                &preimage,
+                                &guardian_entries,
+                                4,
+                            )
+                            .map_err(|e| {
+                                ChainError::State(format!(
+                                    "reconfiguration guardian verification failed: {e}"
+                                ))
+                            })?;
+                        } else if !guardian_entries.is_empty() {
                             return Err(ChainError::State(
-                                "reconfiguring active guardians requires 4-of-7 quorum".into(),
+                                "initial guardian configuration must not carry guardian signatures"
+                                    .into(),
                             ));
                         }
 
-                        account.nonce += 1;
+                        account.nonce += 1; // nonce increments once per tx; bounded by block tx count
+                                            // Bounds guaranteed: spendable >= fee_atoms (checked above), so balance >= fee_atoms.
                         account.balance -= fee_atoms;
-                        block_fees += fee_atoms;
+                        block_fees = block_fees.checked_add(fee_atoms).ok_or_else(|| {
+                            ChainError::State("block fee accumulation overflow".into())
+                        })?;
 
-                        for i in 0..7 {
-                            account.guardians[i]
-                                .copy_from_slice(&payload[48 + i * 32..48 + (i + 1) * 32]);
-                        }
+                        account.guardians = new_guardians;
                         account.new_recipient_delay =
                             u32::from_le_bytes(payload[272..276].try_into().unwrap());
                         account.withdrawal_delay =
@@ -681,7 +740,7 @@ impl ChainState {
                             u128::from_le_bytes(payload[280..296].try_into().unwrap());
                         account.allowance_window_len =
                             u64::from_le_bytes(payload[296..304].try_into().unwrap());
-                        account.recovery_key.copy_from_slice(&payload[304..336]);
+                        account.recovery_key = recovery_key;
                         account.guardian_enabled = true;
                     }
 
@@ -696,6 +755,12 @@ impl ChainState {
                         let action_type = payload[32];
                         let fee_atoms =
                             u64::from_le_bytes(payload[33..41].try_into().unwrap()) as u128;
+                        let min_fee = crate::tx::min_fee(raw_tx.len()).ok_or_else(|| {
+                            ChainError::State("transaction too large for fee calculation".into())
+                        })? as u128;
+                        if fee_atoms < min_fee {
+                            return Err(ChainError::State("fee below minimum".into()));
+                        }
                         let params_len =
                             u32::from_le_bytes(payload[41..45].try_into().unwrap()) as usize;
                         if payload.len() < 45 + params_len + 1 {
@@ -704,16 +769,25 @@ impl ChainState {
                             ));
                         }
                         let params = &payload[45..45 + params_len];
-                        let sigs_count = payload[45 + params_len] as usize;
 
-                        let req_quorum = if action_type == 1 || action_type == 2 {
-                            3
-                        } else {
-                            4
-                        };
-                        if sigs_count < req_quorum {
-                            return Err(ChainError::State("insufficient guardian quorum".into()));
-                        }
+                        // Validate action type and exact parameter lengths
+                        crate::auth::validate_guardian_action_params(action_type, params).map_err(
+                            |e| ChainError::State(format!("invalid guardian action params: {e}")),
+                        )?;
+
+                        let unsigned_end = tx::TX_ENVELOPE_LEN + 45 + params_len;
+                        let unsigned_prefix = &raw_tx[..unsigned_end];
+                        let guardian_section = &raw_tx[unsigned_end..];
+
+                        let guardian_entries = crate::auth::parse_guardian_sigs(guardian_section)
+                            .map_err(|e| {
+                            ChainError::State(format!("malformed guardian signatures: {e}"))
+                        })?;
+
+                        let req_quorum =
+                            crate::auth::guardian_action_quorum(action_type).map_err(|e| {
+                                ChainError::State(format!("invalid guardian action quorum: {e}"))
+                            })?;
 
                         let target = candidate_accounts.get_mut(&target_addr).ok_or_else(|| {
                             ChainError::State("target account not found or has no guardians".into())
@@ -724,6 +798,25 @@ impl ChainState {
                             ));
                         }
 
+                        // Canonical unsigned tx bytes binds declared quorum count and guardian indices
+                        let unsigned_tx = crate::auth::canonical_unsigned_with_guardians(
+                            unsigned_prefix,
+                            &guardian_entries,
+                        );
+                        let preimage =
+                            crate::auth::compute_signing_preimage(self.chain_id, &unsigned_tx);
+
+                        // Cryptographic verification of guardian signatures over preimage
+                        crate::auth::verify_guardian_quorum(
+                            &target.guardians,
+                            &preimage,
+                            &guardian_entries,
+                            req_quorum,
+                        )
+                        .map_err(|e| {
+                            ChainError::State(format!("guardian quorum verification failed: {e}"))
+                        })?;
+
                         let spendable = target
                             .spendable_balance(h)
                             .map_err(|_| ChainError::State("spendable balance error".into()))?;
@@ -731,12 +824,15 @@ impl ChainState {
                             return Err(ChainError::State("insufficient balance for fee".into()));
                         }
 
+                        // Bounds guaranteed: spendable >= fee_atoms (checked above), so balance >= fee_atoms.
                         target.balance -= fee_atoms;
-                        block_fees += fee_atoms;
+                        block_fees = block_fees.checked_add(fee_atoms).ok_or_else(|| {
+                            ChainError::State("block fee accumulation overflow".into())
+                        })?;
 
                         match action_type {
-                            1 => {
-                                // Strengthen delays
+                            crate::auth::ACTION_STRENGTHEN_DELAYS => {
+                                // Strengthen delays: cannot decrease
                                 let new_delay = u32::from_le_bytes(params[..4].try_into().unwrap());
                                 if new_delay < target.new_recipient_delay {
                                     return Err(ChainError::State(
@@ -745,104 +841,108 @@ impl ChainState {
                                 }
                                 target.new_recipient_delay = new_delay;
                             }
-                            2 => {
-                                // Strengthen allowance
-                                if params.len() >= 16 {
-                                    let new_lim =
-                                        u128::from_le_bytes(params[..16].try_into().unwrap());
-                                    if target.allowance_limit > 0
-                                        && new_lim > target.allowance_limit
-                                    {
-                                        return Err(ChainError::State(
-                                            "cannot increase limit with 3-of-7 quorum".into(),
-                                        ));
-                                    }
-                                    target.allowance_limit = new_lim;
+                            crate::auth::ACTION_STRENGTHEN_ALLOWANCE => {
+                                // Strengthen allowance: cannot increase limit or shorten window
+                                let new_lim = u128::from_le_bytes(params[..16].try_into().unwrap());
+                                let new_len =
+                                    u64::from_le_bytes(params[16..24].try_into().unwrap());
+                                if target.allowance_limit > 0 && new_lim > target.allowance_limit {
+                                    return Err(ChainError::State(
+                                        "cannot increase limit with 3-of-7 quorum".into(),
+                                    ));
                                 }
-                                if params.len() >= 24 {
-                                    let new_len =
-                                        u64::from_le_bytes(params[16..24].try_into().unwrap());
-                                    if target.allowance_window_len > 0
-                                        && new_len < target.allowance_window_len
-                                    {
-                                        return Err(ChainError::State(
-                                            "cannot shorten window with 3-of-7 quorum".into(),
-                                        ));
-                                    }
-                                    target.allowance_window_len = new_len;
+                                if target.allowance_window_len > 0
+                                    && new_len < target.allowance_window_len
+                                {
+                                    return Err(ChainError::State(
+                                        "cannot shorten window with 3-of-7 quorum".into(),
+                                    ));
                                 }
+                                target.allowance_limit = new_lim;
+                                target.allowance_window_len = new_len;
                             }
-                            3 => {
+                            crate::auth::ACTION_WEAKEN_DELAYS => {
+                                // Weaken delays
                                 target.new_recipient_delay =
                                     u32::from_le_bytes(params[..4].try_into().unwrap());
                             }
-                            4 => {
-                                if params.len() >= 16 {
-                                    target.allowance_limit =
-                                        u128::from_le_bytes(params[..16].try_into().unwrap());
-                                }
-                                if params.len() >= 24 {
-                                    target.allowance_window_len =
-                                        u64::from_le_bytes(params[16..24].try_into().unwrap());
-                                }
+                            crate::auth::ACTION_WEAKEN_ALLOWANCE => {
+                                // Weaken allowance
+                                target.allowance_limit =
+                                    u128::from_le_bytes(params[..16].try_into().unwrap());
+                                target.allowance_window_len =
+                                    u64::from_le_bytes(params[16..24].try_into().unwrap());
                             }
-                            5 => target.is_frozen = true,
-                            6 => target.is_frozen = false,
-                            7 => {
-                                // Recovery
+                            crate::auth::ACTION_FREEZE => target.is_frozen = true,
+                            crate::auth::ACTION_UNFREEZE => target.is_frozen = false,
+                            crate::auth::ACTION_EMERGENCY_RECOVERY => {
+                                // Emergency recovery: transfer spendable balance to recovery key
                                 let rec_addr = derive_address(&target.recovery_key);
                                 let recoverable = target.spendable_balance(h).map_err(|_| {
                                     ChainError::State("spendable balance error".into())
                                 })?;
+                                // Bounds guaranteed: recoverable = spendable_balance <= balance.
                                 target.balance -= recoverable;
                                 let rec = candidate_accounts.entry(rec_addr).or_default();
-                                rec.balance += recoverable;
+                                rec.balance =
+                                    rec.balance.checked_add(recoverable).ok_or_else(|| {
+                                        ChainError::State("recovery balance overflow".into())
+                                    })?;
                             }
-                            8 => {
-                                if params.len() < 224 {
-                                    return Err(ChainError::State(
-                                        "replace guardians requires 224 bytes".into(),
-                                    ));
-                                }
+                            crate::auth::ACTION_REPLACE_GUARDIANS => {
+                                let mut new_guardians = [[0u8; 32]; 7];
                                 for i in 0..7 {
-                                    target.guardians[i]
-                                        .copy_from_slice(&params[i * 32..(i + 1) * 32]);
+                                    new_guardians[i].copy_from_slice(&params[i * 32..(i + 1) * 32]);
                                 }
+                                crate::auth::validate_guardian_keys_set(&new_guardians).map_err(
+                                    |e| {
+                                        ChainError::State(format!(
+                                            "invalid replacement guardian keys: {e}"
+                                        ))
+                                    },
+                                )?;
+                                target.guardians = new_guardians;
                             }
-                            9 => {
-                                if params.len() < 32 {
-                                    return Err(ChainError::State(
-                                        "replace recovery key requires 32 bytes".into(),
-                                    ));
-                                }
-                                target.recovery_key.copy_from_slice(&params[..32]);
+                            crate::auth::ACTION_REPLACE_RECOVERY_KEY => {
+                                let mut new_rec = [0u8; 32];
+                                new_rec.copy_from_slice(&params[..32]);
+                                crate::auth::validate_pubkey(&new_rec).map_err(|e| {
+                                    ChainError::State(format!(
+                                        "invalid replacement recovery key: {e}"
+                                    ))
+                                })?;
+                                target.recovery_key = new_rec;
                             }
-                            _ => {}
+                            _ => unreachable!(),
                         }
                     }
 
                     tx::TX_TYPE_CANCEL_PENDING => {
-                        let payload = &raw_tx[tx::TX_ENVELOPE_LEN..];
-                        if payload.len() < 32 + 32 + 8 + 8 + 64 + 1 {
+                        if raw_tx.len() < 180 {
                             return Err(ChainError::State(
                                 "truncated cancel pending payload".into(),
                             ));
                         }
+                        let unsigned_prefix = &raw_tx[..115];
+                        let sender_sig: [u8; 64] = raw_tx[115..179].try_into().unwrap();
+                        let guardian_section = &raw_tx[179..];
+
+                        let payload = &raw_tx[tx::TX_ENVELOPE_LEN..];
                         let mut sender_key = [0u8; 32];
                         sender_key.copy_from_slice(&payload[..32]);
+
                         let sender_addr = derive_address(&sender_key);
 
                         let transfer_id = Hash::new(payload[32..64].try_into().unwrap());
                         let fee_atoms =
                             u64::from_le_bytes(payload[64..72].try_into().unwrap()) as u128;
-                        let nonce = u64::from_le_bytes(payload[72..80].try_into().unwrap());
-                        let sigs_count = payload[80 + 64] as usize;
-
-                        if sigs_count < 4 {
-                            return Err(ChainError::State(
-                                "cancel pending transfer requires 4-of-7 quorum".into(),
-                            ));
+                        let min_fee = crate::tx::min_fee(raw_tx.len()).ok_or_else(|| {
+                            ChainError::State("transaction too large for fee calculation".into())
+                        })? as u128;
+                        if fee_atoms < min_fee {
+                            return Err(ChainError::State("fee below minimum".into()));
                         }
+                        let nonce = u64::from_le_bytes(payload[72..80].try_into().unwrap());
 
                         let sender = candidate_accounts
                             .get_mut(&sender_addr)
@@ -850,9 +950,48 @@ impl ChainState {
                         if sender.is_frozen {
                             return Err(ChainError::State("sender account is frozen".into()));
                         }
+                        if !sender.guardian_enabled {
+                            return Err(ChainError::State(
+                                "sender account does not have guardians enabled".into(),
+                            ));
+                        }
                         if sender.nonce != nonce {
                             return Err(ChainError::State("nonce mismatch".into()));
                         }
+
+                        // Parse guardian signature entries
+                        let guardian_entries = crate::auth::parse_guardian_sigs(guardian_section)
+                            .map_err(|e| {
+                            ChainError::State(format!("malformed guardian signatures: {e}"))
+                        })?;
+
+                        // Canonical unsigned tx bytes binds declared quorum count and guardian indices
+                        let unsigned_tx = crate::auth::canonical_unsigned_with_guardians(
+                            unsigned_prefix,
+                            &guardian_entries,
+                        );
+                        let preimage =
+                            crate::auth::compute_signing_preimage(self.chain_id, &unsigned_tx);
+
+                        // Strict sender signature verification over canonical signing preimage
+                        crate::auth::verify_signature(&sender_key, &preimage, &sender_sig)
+                            .map_err(|e| {
+                                ChainError::State(format!(
+                                    "sender signature verification failed: {e}"
+                                ))
+                            })?;
+
+                        // Strict 4-of-7 guardian quorum verification
+                        crate::auth::verify_guardian_quorum(
+                            &sender.guardians,
+                            &preimage,
+                            &guardian_entries,
+                            4,
+                        )
+                        .map_err(|e| {
+                            ChainError::State(format!("guardian quorum verification failed: {e}"))
+                        })?;
+
                         let spendable = sender
                             .spendable_balance(h)
                             .map_err(|_| ChainError::State("spendable balance error".into()))?;
@@ -869,9 +1008,12 @@ impl ChainState {
                             })?;
 
                         sender.pending_transfers.remove(found_idx);
-                        sender.nonce += 1;
+                        sender.nonce += 1; // nonce increments once per tx; bounded by block tx count
+                                           // Bounds guaranteed: spendable >= fee_atoms (checked above), so balance >= fee_atoms.
                         sender.balance -= fee_atoms;
-                        block_fees += fee_atoms;
+                        block_fees = block_fees.checked_add(fee_atoms).ok_or_else(|| {
+                            ChainError::State("block fee accumulation overflow".into())
+                        })?;
                     }
 
                     tx::TX_TYPE_SHIELDED_TRANSFER => {
@@ -914,8 +1056,11 @@ impl ChainState {
                             ));
                         }
 
+                        // Bounds guaranteed: candidate_pool_balance >= fee_atoms (checked above).
                         candidate_pool_balance -= fee_atoms;
-                        block_fees += fee_atoms;
+                        block_fees = block_fees.checked_add(fee_atoms).ok_or_else(|| {
+                            ChainError::State("block fee accumulation overflow".into())
+                        })?;
                         candidate_nullifiers.extend(tx_nfs);
 
                         for act in bundle.actions() {
@@ -924,117 +1069,19 @@ impl ChainState {
                     }
 
                     tx::TX_TYPE_TRANSPARENT_TO_SHIELDED => {
-                        let payload = &raw_tx[tx::TX_ENVELOPE_LEN..];
-                        if payload.len() < 32 + 8 + 16 + 8 + 4 {
-                            return Err(ChainError::State("truncated shielding payload".into()));
-                        }
-                        let mut sender_key = [0u8; 32];
-                        sender_key.copy_from_slice(&payload[..32]);
-                        let sender_addr = derive_address(&sender_key);
-
-                        let nonce = u64::from_le_bytes(payload[32..40].try_into().unwrap());
-                        let shielded_amount =
-                            u128::from_le_bytes(payload[40..56].try_into().unwrap());
-                        let fee_atoms =
-                            u64::from_le_bytes(payload[56..64].try_into().unwrap()) as u128;
-                        let bundle_len =
-                            u32::from_le_bytes(payload[64..68].try_into().unwrap()) as usize;
-                        let bundle_bytes = &payload[68..68 + bundle_len];
-
-                        let sigs_offset = 68 + bundle_len + 64;
-                        let sigs_count = payload.get(sigs_offset).copied().unwrap_or(0) as usize;
-
-                        let sender = candidate_accounts
-                            .get_mut(&sender_addr)
-                            .ok_or_else(|| ChainError::State("sender account not found".into()))?;
-                        if sender.is_frozen {
-                            return Err(ChainError::State("sender account is frozen".into()));
-                        }
-                        if sender.nonce != nonce {
-                            return Err(ChainError::State("nonce mismatch".into()));
-                        }
-                        if sender.guardian_enabled && sigs_count < 4 {
-                            return Err(ChainError::State(
-                                "shielding from protected account requires 4-of-7 quorum".into(),
-                            ));
-                        }
-
-                        let total_cost = shielded_amount
-                            .checked_add(fee_atoms)
-                            .ok_or_else(|| ChainError::State("total cost overflow".into()))?;
-                        let spendable = sender
-                            .spendable_balance(h)
-                            .map_err(|_| ChainError::State("spendable balance error".into()))?;
-                        if spendable < total_cost {
-                            return Err(ChainError::State(
-                                "insufficient spendable balance to shield".into(),
-                            ));
-                        }
-
-                        sender.nonce += 1;
-                        sender.balance -= total_cost;
-                        candidate_pool_balance += shielded_amount;
-                        block_fees += fee_atoms;
-
-                        if !bundle_bytes.is_empty() {
-                            let bundle = deserialize_bundle(bundle_bytes)
-                                .map_err(|e| ChainError::State(format!("bundle error: {e:?}")))?;
-                            for act in bundle.actions() {
-                                candidate_tree.append(act.cmx());
-                            }
-                        }
+                        // Fail-closed consensus safety gate: Type 6 is rejected before altering any consensus state
+                        // pending full Orchard cryptographic proof verification (FixedPostNu6_2 Halo2 proof, spend auth, binding signature, value balance).
+                        return Err(ChainError::State(
+                            "consensus safety gate: Type 6 (TransparentToShielded) rejected pending full Orchard cryptographic proof verification".into(),
+                        ));
                     }
 
                     tx::TX_TYPE_SHIELDED_TO_TRANSPARENT => {
-                        let payload = &raw_tx[tx::TX_ENVELOPE_LEN..];
-                        if payload.len() < 32 + 16 + 8 {
-                            return Err(ChainError::State("truncated deshielding payload".into()));
-                        }
-                        let recipient = Hash::new(payload[..32].try_into().unwrap());
-                        let release_amount =
-                            u128::from_le_bytes(payload[32..48].try_into().unwrap());
-                        let fee_atoms =
-                            u64::from_le_bytes(payload[48..56].try_into().unwrap()) as u128;
-                        let bundle = deserialize_bundle(&payload[56..])
-                            .map_err(|e| ChainError::State(format!("bundle error: {e:?}")))?;
-
-                        let anchor = Hash::new(bundle.anchor().to_bytes());
-                        if !valid_anchors.contains(&anchor) {
-                            return Err(ChainError::State(
-                                "anchor not in 10-block ancestor window".into(),
-                            ));
-                        }
-
-                        let mut tx_nfs = Vec::new();
-                        for act in bundle.actions() {
-                            let nf = Hash::new(act.nullifier().to_bytes());
-                            if tx_nfs.contains(&nf) {
-                                return Err(ChainError::State(
-                                    "duplicate nullifier within transaction".into(),
-                                ));
-                            }
-                            if candidate_nullifiers.contains(&nf) {
-                                return Err(ChainError::State("nullifier double-spend".into()));
-                            }
-                            tx_nfs.push(nf);
-                        }
-
-                        let total_deduction = release_amount
-                            .checked_add(fee_atoms)
-                            .ok_or_else(|| ChainError::State("total deduction overflow".into()))?;
-                        if candidate_pool_balance < total_deduction {
-                            return Err(ChainError::State(
-                                "insufficient shielded pool balance to deshield".into(),
-                            ));
-                        }
-
-                        candidate_pool_balance -= total_deduction;
-                        let rec = candidate_accounts.entry(recipient).or_default();
-                        rec.balance = rec.balance.checked_add(release_amount).ok_or_else(|| {
-                            ChainError::State("recipient balance overflow".into())
-                        })?;
-                        block_fees += fee_atoms;
-                        candidate_nullifiers.extend(tx_nfs);
+                        // Fail-closed consensus safety gate: Type 7 is rejected before altering any consensus state
+                        // pending full Orchard cryptographic proof verification (FixedPostNu6_2 Halo2 proof, spend auth, binding signature, value balance, output tree).
+                        return Err(ChainError::State(
+                            "consensus safety gate: Type 7 (ShieldedToTransparent) rejected pending full Orchard cryptographic proof verification".into(),
+                        ));
                     }
 
                     _ => {
@@ -1053,28 +1100,44 @@ impl ChainState {
 
             // D. Subsidy Claim & Cumulative Issuance Accounting
             let sched = scheduled_subsidy(h);
-            let actual_claimed = coinbase_payout.saturating_sub(block_fees);
+            // The coinbase payout must cover all aggregate block fees; the miner may only
+            // claim the difference as subsidy. An underpayment (payout < fees) is invalid.
+            let actual_claimed = coinbase_payout.checked_sub(block_fees).ok_or_else(|| {
+                ChainError::State(format!(
+                    "coinbase underpayment: payout {coinbase_payout} < aggregate block fees {block_fees}"
+                ))
+            })?;
             if actual_claimed > sched {
                 return Err(ChainError::State(format!(
                     "claimed subsidy {actual_claimed} exceeds scheduled limit {sched}"
                 )));
             }
-            if candidate_issuance + actual_claimed > MAX_SUPPLY_ATOMS {
+            let new_issuance = candidate_issuance
+                .checked_add(actual_claimed)
+                .ok_or_else(|| ChainError::State("cumulative issuance overflow".into()))?;
+            if new_issuance > MAX_SUPPLY_ATOMS {
                 return Err(ChainError::State(
                     "cumulative issuance exceeds 21M OWN cap".into(),
                 ));
             }
-            candidate_issuance += actual_claimed;
+            candidate_issuance = new_issuance;
 
             // E. Global Monetary Conservation Invariant: T + S = I
-            let t_total: u128 = candidate_accounts.values().map(|a| a.balance).sum();
+            // Checked aggregation: account balances are summed with overflow protection.
+            let mut t_total: u128 = 0;
+            for acc in candidate_accounts.values() {
+                t_total = t_total.checked_add(acc.balance).ok_or_else(|| {
+                    ChainError::State("transparent balance aggregation overflow".into())
+                })?;
+            }
             let s_total = candidate_pool_balance;
             let i_total = candidate_issuance;
-
-            if t_total + s_total != i_total {
+            let t_plus_s = t_total
+                .checked_add(s_total)
+                .ok_or_else(|| ChainError::State("T + S overflow".into()))?;
+            if t_plus_s != i_total {
                 return Err(ChainError::State(format!(
-                    "monetary conservation violated: T({t_total}) + S({s_total}) = {} != I({i_total})",
-                    t_total + s_total
+                    "monetary conservation violated: T({t_total}) + S({s_total}) = {t_plus_s} != I({i_total})"
                 )));
             }
 
@@ -1104,27 +1167,59 @@ impl ChainState {
         let s_comm = pool_balance_commitment(candidate_pool_balance);
         let computed_state_root = composite_state_root(&t_root, &o_root, &nf_root, &s_comm);
 
+        Ok(CandidateStateTransition {
+            accounts: candidate_accounts,
+            nullifier_set: candidate_nullifiers,
+            shielded_pool_balance: candidate_pool_balance,
+            cumulative_issuance: candidate_issuance,
+            orchard_tree: candidate_tree,
+            historical_anchors: candidate_anchors,
+            accepted_transaction_ids: candidate_tx_ids,
+            computed_state_root,
+            next_cumulative_work,
+        })
+    }
+
+    /// Simulates block application and returns the expected post-state composite state root.
+    pub fn simulate_candidate_state_root(&self, block: &Block) -> Result<Hash, ChainError> {
+        let cand = self.evaluate_candidate(block)?;
+        Ok(cand.computed_state_root)
+    }
+
+    /// Validates and atomically accepts a candidate block.
+    pub fn apply_block(&mut self, block: &Block) -> Result<(), ChainError> {
+        self.validate(block)?;
+        let cand = self.evaluate_candidate(block)?;
+
         // Header slot 6 holds composite state root.
-        // For genesis (h=0) or legacy test blocks, empty_commitment_root() is also accepted for backward-compatibility.
-        if block.header.orchard_commitment_root != computed_state_root
-            && block.header.orchard_commitment_root != empty_commitment_root()
-        {
+        // For genesis (h=0), empty_commitment_root() or genesis_state_root() is accepted.
+        // For H >= 1, the declared orchard_commitment_root must strictly match computed_state_root.
+        if block.header.height == 0 {
+            if block.header.orchard_commitment_root != cand.computed_state_root
+                && block.header.orchard_commitment_root != empty_commitment_root()
+            {
+                return Err(ChainError::Invalid(ValidationError::OrchardRootMismatch {
+                    computed: cand.computed_state_root,
+                    declared: block.header.orchard_commitment_root,
+                }));
+            }
+        } else if block.header.orchard_commitment_root != cand.computed_state_root {
             return Err(ChainError::Invalid(ValidationError::OrchardRootMismatch {
-                computed: computed_state_root,
+                computed: cand.computed_state_root,
                 declared: block.header.orchard_commitment_root,
             }));
         }
 
         // 3. Atomically Commit Candidate State to Chain
-        self.accounts = candidate_accounts;
-        self.nullifier_set = candidate_nullifiers;
-        self.shielded_pool_balance = candidate_pool_balance;
-        self.cumulative_issuance = candidate_issuance;
-        self.orchard_tree = candidate_tree;
-        self.historical_anchors = candidate_anchors;
-        self.accepted_transaction_ids = candidate_tx_ids;
+        self.accounts = cand.accounts;
+        self.nullifier_set = cand.nullifier_set;
+        self.shielded_pool_balance = cand.shielded_pool_balance;
+        self.cumulative_issuance = cand.cumulative_issuance;
+        self.orchard_tree = cand.orchard_tree;
+        self.historical_anchors = cand.historical_anchors;
+        self.accepted_transaction_ids = cand.accepted_transaction_ids;
 
-        self.cumulative_work.push(next_cumulative_work);
+        self.cumulative_work.push(cand.next_cumulative_work);
         self.difficulty_samples
             .push(crate::difficulty::DifficultySample {
                 height: block.header.height,
@@ -1134,7 +1229,7 @@ impl ChainState {
         self.blocks.push(block.clone());
 
         // Save historical snapshot for reorg rollback
-        self.history.insert(h, self.snapshot());
+        self.history.insert(block.header.height, self.snapshot());
 
         Ok(())
     }
@@ -1189,6 +1284,8 @@ impl ChainState {
 
     /// Returns the timestamps of the last `TIMESTAMP_WINDOW` ancestor blocks, oldest first.
     pub fn ancestor_timestamps(&self) -> Vec<u64> {
+        // saturating_sub is safe: blocks.len() is bounded by chain length and clamping at 0
+        // only yields an empty/small window for short chains.
         let start = self.blocks.len().saturating_sub(TIMESTAMP_WINDOW);
         self.blocks[start..]
             .iter()
