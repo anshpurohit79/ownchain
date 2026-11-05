@@ -1587,11 +1587,14 @@ fn test_type6_transparent_to_shielded_authentication() {
     assert_eq!(auth_info.sender_address, alice.address);
     assert_eq!(auth_info.shielded_amount, 50_000_000);
 
-    // BUT consensus execution must reject Type 6 fail-closed pending full Orchard verification
+    // Consensus execution rejects mock Type 6 with invalid bundle
     let cb102 = make_coinbase(id, 102, miner.address, 20_000);
     let b102 = make_candidate_block(&state, ts, vec![cb102, t2s_unprotected]);
     let err = state.apply_block(&b102).unwrap_err();
-    assert!(err.to_string().contains("consensus safety gate: Type 6"));
+    assert!(
+        err.to_string().contains("invalid Orchard transaction")
+            || err.to_string().contains("bundle")
+    );
 
     // Verify State Atomicity: Alice's balance, nonce, and pool balance must be unchanged
     let alice_acc = state.account(&alice.address).unwrap();
@@ -1645,13 +1648,14 @@ fn test_type6_transparent_to_shielded_authentication() {
         ownchain::auth::verify_type6_authorization(id, &t2s_protected, true, &guardians).unwrap();
     assert_eq!(auth_info_prot.guardian_entries.len(), 4);
 
-    // BUT consensus execution must reject Type 6 fail-closed pending full Orchard verification
+    // Consensus execution rejects mock Type 6 with invalid bundle
     let cb103 = make_coinbase(id, 103, miner.address, 50_000);
     let b103 = make_candidate_block(&state, ts, vec![cb103, t2s_protected]);
     let err_prot = state.apply_block(&b103).unwrap_err();
-    assert!(err_prot
-        .to_string()
-        .contains("consensus safety gate: Type 6"));
+    assert!(
+        err_prot.to_string().contains("invalid Orchard transaction")
+            || err_prot.to_string().contains("bundle")
+    );
 
     // Verify State Atomicity: Alice's balance, nonce, and pool balance must be unchanged
     let alice_acc_post = state.account(&alice.address).unwrap();

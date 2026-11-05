@@ -1211,11 +1211,217 @@ impl ChainState {
                     }
 
                     tx::TX_TYPE_TRANSPARENT_TO_SHIELDED => {
-                        // Fail-closed consensus safety gate: Type 6 is rejected before altering any consensus state
-                        // pending full Orchard cryptographic proof verification (FixedPostNu6_2 Halo2 proof, spend auth, binding signature, value balance).
-                        return Err(ChainError::State(
-                            "consensus safety gate: Type 6 (TransparentToShielded) rejected pending full Orchard cryptographic proof verification".into(),
-                        ));
+                        let payload = &raw_tx[tx::TX_ENVELOPE_LEN..];
+                        if payload.len() < 133 {
+                            return Err(ChainError::State(
+                                "truncated transparent-to-shielded payload".into(),
+                            ));
+                        }
+
+                        let tx_version = u16::from_le_bytes(raw_tx[1..3].try_into().unwrap());
+
+                        let mut sender_key = [0u8; 32];
+                        sender_key.copy_from_slice(&payload[..32]);
+                        crate::auth::parse_strict_pubkey(&sender_key).map_err(|e| {
+                            ChainError::State(format!("invalid sender public key: {e}"))
+                        })?;
+                        let sender_addr = derive_address(&sender_key);
+
+                        let nonce = u64::from_le_bytes(payload[32..40].try_into().unwrap());
+                        let shielded_amount =
+                            u128::from_le_bytes(payload[40..56].try_into().unwrap());
+                        if shielded_amount == 0 {
+                            return Err(ChainError::State(
+                                "shielded amount must be greater than zero".into(),
+                            ));
+                        }
+
+                        let fee_atoms =
+                            u64::from_le_bytes(payload[56..64].try_into().unwrap()) as u128;
+                        let min_fee = crate::tx::min_fee(raw_tx.len()).ok_or_else(|| {
+                            ChainError::State("transaction too large for fee calculation".into())
+                        })? as u128;
+                        if fee_atoms < min_fee {
+                            return Err(ChainError::State("fee below minimum".into()));
+                        }
+
+                        let bundle_len =
+                            u32::from_le_bytes(payload[64..68].try_into().unwrap()) as usize;
+                        let fixed_prefix_len = 68usize;
+                        let bundle_end = fixed_prefix_len
+                            .checked_add(bundle_len)
+                            .ok_or_else(|| ChainError::State("bundle length overflow".into()))?;
+                        let sender_sig_end = bundle_end.checked_add(64).ok_or_else(|| {
+                            ChainError::State("sender signature end overflow".into())
+                        })?;
+
+                        if payload.len() < sender_sig_end + 1 {
+                            return Err(ChainError::State(
+                                "truncated transparent-to-shielded bundle/signatures".into(),
+                            ));
+                        }
+
+                        let bundle_bytes = &payload[fixed_prefix_len..bundle_end];
+                        let bundle = deserialize_bundle(bundle_bytes)
+                            .map_err(|e| ChainError::State(format!("bundle error: {e:?}")))?;
+
+                        // Bundle structural consensus invariants
+                        let n_actions = bundle.actions().len();
+                        if n_actions == 0 || n_actions > crate::orchard_tx::MAX_ACTIONS_PER_TX {
+                            return Err(ChainError::State(format!(
+                                "invalid action count {n_actions}"
+                            )));
+                        }
+
+                        if *bundle.flags() != orchard::bundle::Flags::SPENDS_DISABLED {
+                            return Err(ChainError::State(
+                                "Type 6 bundle must have SPENDS_DISABLED flags".into(),
+                            ));
+                        }
+
+                        if *bundle.anchor() != orchard::tree::Anchor::empty_tree() {
+                            return Err(ChainError::State(
+                                "Type 6 bundle anchor must be empty tree root".into(),
+                            ));
+                        }
+
+                        let vb = *bundle.value_balance();
+                        if vb >= 0 {
+                            return Err(ChainError::State(
+                                "Type 6 value balance must be negative".into(),
+                            ));
+                        }
+
+                        let expected_vb = -i64::try_from(shielded_amount).map_err(|_| {
+                            ChainError::State("shielded amount exceeds i64 bounds".into())
+                        })?;
+                        if vb != expected_vb {
+                            return Err(ChainError::State(format!(
+                                "value balance mismatch: got {vb}, expected {expected_vb}"
+                            )));
+                        }
+
+                        let mut sender_sig = [0u8; 64];
+                        sender_sig.copy_from_slice(&payload[bundle_end..sender_sig_end]);
+
+                        let guardian_section = &payload[sender_sig_end..];
+                        let guardian_entries = crate::auth::parse_guardian_sigs(guardian_section)
+                            .map_err(|e| {
+                            ChainError::State(format!("malformed guardian signatures: {e}"))
+                        })?;
+
+                        // Compute cross-pool authorization digest
+                        let auth_digest = crate::orchard_tx::compute_type6_bundle_auth_digest(
+                            *self.chain_id.as_bytes(),
+                            tx_version,
+                            sender_key,
+                            nonce,
+                            shielded_amount,
+                            fee_atoms as u64,
+                            &bundle,
+                        );
+
+                        // Strict sender Ed25519 signature verification over auth_digest
+                        crate::auth::verify_signature(&sender_key, &auth_digest, &sender_sig)
+                            .map_err(|e| {
+                                ChainError::State(format!(
+                                    "sender signature verification failed: {e}"
+                                ))
+                            })?;
+
+                        // Binding signature verification over auth_digest
+                        bundle
+                            .binding_validating_key()
+                            .verify(&auth_digest, bundle.authorization().binding_signature())
+                            .map_err(|_| {
+                                ChainError::State("binding signature verification failed".into())
+                            })?;
+
+                        let sender = candidate_accounts
+                            .get_mut(&sender_addr)
+                            .ok_or_else(|| ChainError::State("sender account not found".into()))?;
+
+                        if sender.is_frozen {
+                            return Err(ChainError::State("sender account is frozen".into()));
+                        }
+                        if sender.nonce != nonce {
+                            return Err(ChainError::State(format!(
+                                "nonce mismatch: expected {}, got {}",
+                                sender.nonce, nonce
+                            )));
+                        }
+
+                        let total_cost = shielded_amount
+                            .checked_add(fee_atoms)
+                            .ok_or_else(|| ChainError::State("total cost overflow".into()))?;
+
+                        let spendable = sender
+                            .spendable_balance(h)
+                            .map_err(|_| ChainError::State("spendable balance error".into()))?;
+                        let incoming = same_block_incoming.get(&sender_addr).copied().unwrap_or(0);
+                        let effective_spendable =
+                            spendable.checked_sub(incoming).ok_or_else(|| {
+                                ChainError::State(
+                                    "insufficient spendable balance (same-block incoming locked)"
+                                        .into(),
+                                )
+                            })?;
+                        if effective_spendable < total_cost {
+                            return Err(ChainError::State(format!(
+                                "insufficient spendable balance: {effective_spendable} < {total_cost}"
+                            )));
+                        }
+
+                        // Allowance window check (for total_cost = shielded_amount + fee_atoms)
+                        check_and_apply_allowance(sender, h, total_cost)?;
+
+                        // Guardian authorization verification
+                        if sender.guardian_enabled {
+                            if guardian_entries.len() < 4 {
+                                return Err(ChainError::State(
+                                    "protected account requires at least 4 guardian signatures"
+                                        .into(),
+                                ));
+                            }
+                            crate::orchard_tx::verify_type6_guardian_signatures(
+                                &auth_digest,
+                                &guardian_entries,
+                                &sender.guardians,
+                            )
+                            .map_err(|e| {
+                                ChainError::State(format!("guardian verification failed: {e}"))
+                            })?;
+                        } else if !guardian_entries.is_empty() {
+                            return Err(ChainError::State(
+                                "unprotected account must not carry guardian signatures".into(),
+                            ));
+                        }
+
+                        // State transitions
+                        sender.nonce = sender
+                            .nonce
+                            .checked_add(1)
+                            .ok_or_else(|| ChainError::State("nonce overflow".into()))?;
+
+                        sender.balance = sender
+                            .balance
+                            .checked_sub(total_cost)
+                            .ok_or_else(|| ChainError::State("sender balance underflow".into()))?;
+
+                        candidate_pool_balance = candidate_pool_balance
+                            .checked_add(shielded_amount)
+                            .ok_or_else(|| {
+                                ChainError::State("shielded pool balance overflow".into())
+                            })?;
+
+                        block_fees = block_fees.checked_add(fee_atoms).ok_or_else(|| {
+                            ChainError::State("block fee accumulation overflow".into())
+                        })?;
+
+                        // Append output commitments to Orchard tree (dummy nullifiers are ignored)
+                        for act in bundle.actions() {
+                            candidate_tree.append(act.cmx());
+                        }
                     }
 
                     tx::TX_TYPE_SHIELDED_TO_TRANSPARENT => {

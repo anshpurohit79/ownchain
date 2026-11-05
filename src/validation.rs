@@ -910,10 +910,20 @@ fn validate_transactions(
                     }
                 }
                 TxType::TransparentToShielded => {
-                    return Err(ValidationError::MalformedTransaction {
-                        index,
-                        reason: "consensus safety gate: Type 6 (TransparentToShielded) rejected because Orchard cryptographic verification (FixedPostNu6_2 Halo2 proofs, spend authorization, binding signature, value balance) is incomplete".into(),
-                    });
+                    let validated = crate::orchard_tx::validate_type6_transaction_stateless(
+                        raw,
+                        context.chain_id,
+                        vk,
+                    )
+                    .map_err(|error| ValidationError::InvalidOrchardTransaction { index, error })?;
+
+                    let action_count = validated.bundle.actions().len();
+                    total_actions = total_actions.checked_add(action_count).ok_or(
+                        ValidationError::TooManyBlockActions {
+                            actual: usize::MAX,
+                            limit: crate::orchard_tx::MAX_ACTIONS_PER_BLOCK,
+                        },
+                    )?;
                 }
                 TxType::ShieldedToTransparent => {
                     return Err(ValidationError::MalformedTransaction {
