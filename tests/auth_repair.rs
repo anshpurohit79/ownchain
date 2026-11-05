@@ -1750,3 +1750,217 @@ fn test_state_atomicity_on_unauthenticated_transaction() {
     );
     assert_eq!(state.tip_height(), before_state.tip_height());
 }
+
+// ---------------------------------------------------------------------------
+// 11. Strict Ed25519 Public-Key Registration & Parsing Regression Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_strict_pubkey_registration_helpers() {
+    use ownchain::auth::{
+        parse_strict_pubkey, validate_pubkey, verify_address_derivation, AuthError,
+    };
+
+    // 1. Valid ordinary Ed25519 key
+    let sk = SigningKey::from_bytes(&[77u8; 32]);
+    let valid_vk = sk.verifying_key().to_bytes();
+    assert!(parse_strict_pubkey(&valid_vk).is_ok());
+    assert!(validate_pubkey(&valid_vk).is_ok());
+
+    let addr = derive_address(&valid_vk);
+    assert!(verify_address_derivation(&valid_vk, addr).is_ok());
+
+    // 2. Identity point (order 1): (0, 1) encoded as [1, 0, ..., 0]
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    assert_eq!(
+        parse_strict_pubkey(&identity),
+        Err(AuthError::InvalidPublicKey)
+    );
+    assert_eq!(validate_pubkey(&identity), Err(AuthError::InvalidPublicKey));
+    let id_addr = derive_address(&identity);
+    assert_eq!(
+        verify_address_derivation(&identity, id_addr),
+        Err(AuthError::InvalidPublicKey)
+    );
+
+    // 3. Small-order point: all zeros [0u8; 32]
+    let all_zeros = [0u8; 32];
+    assert_eq!(
+        parse_strict_pubkey(&all_zeros),
+        Err(AuthError::InvalidPublicKey)
+    );
+    assert_eq!(
+        validate_pubkey(&all_zeros),
+        Err(AuthError::InvalidPublicKey)
+    );
+
+    // 4. Order-2 point: (0, -1) encoded as [0xec, 0xff, ..., 0x7f]
+    let mut order2 = [0xffu8; 32];
+    order2[0] = 0xec;
+    order2[31] = 0x7f;
+    assert_eq!(
+        parse_strict_pubkey(&order2),
+        Err(AuthError::InvalidPublicKey)
+    );
+    assert_eq!(validate_pubkey(&order2), Err(AuthError::InvalidPublicKey));
+
+    // 5. Non-canonical encodings: y >= 2^255 - 19
+    // y = 0 + p = 2^255 - 19 => [0xed, 0xff, ..., 0x7f]
+    let mut non_canon_0 = [0xffu8; 32];
+    non_canon_0[0] = 0xed;
+    non_canon_0[31] = 0x7f;
+    assert_eq!(
+        parse_strict_pubkey(&non_canon_0),
+        Err(AuthError::InvalidPublicKey)
+    );
+    assert_eq!(
+        validate_pubkey(&non_canon_0),
+        Err(AuthError::InvalidPublicKey)
+    );
+
+    // y = 1 + p = 2^255 - 18 => [0xee, 0xff, ..., 0x7f]
+    let mut non_canon_1 = [0xffu8; 32];
+    non_canon_1[0] = 0xee;
+    non_canon_1[31] = 0x7f;
+    assert_eq!(
+        parse_strict_pubkey(&non_canon_1),
+        Err(AuthError::InvalidPublicKey)
+    );
+    assert_eq!(
+        validate_pubkey(&non_canon_1),
+        Err(AuthError::InvalidPublicKey)
+    );
+}
+
+#[test]
+fn test_weak_guardian_keys_rejected_in_set_and_consensus() {
+    use ownchain::auth::{validate_guardian_keys_set, AuthError};
+
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, ts) = setup_funded_chain();
+
+    // 7 valid guardian keys
+    let g_keys: Vec<TestKeypair> = (10..17).map(TestKeypair::from_seed).collect();
+    let mut guardians = [[0u8; 32]; 7];
+    for (i, k) in g_keys.iter().enumerate() {
+        guardians[i] = k.pubkey;
+    }
+    assert!(validate_guardian_keys_set(&guardians).is_ok());
+
+    // Replace one guardian key with the identity key
+    let mut bad_guardians = guardians;
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    bad_guardians[3] = identity;
+    assert_eq!(
+        validate_guardian_keys_set(&bad_guardians),
+        Err(AuthError::InvalidPublicKey)
+    );
+
+    // Replace one with order-2 key
+    let mut order2 = [0xffu8; 32];
+    order2[0] = 0xec;
+    order2[31] = 0x7f;
+    bad_guardians[3] = order2;
+    assert_eq!(
+        validate_guardian_keys_set(&bad_guardians),
+        Err(AuthError::InvalidPublicKey)
+    );
+
+    // Type 2 configuration with weak guardian key is rejected by consensus
+    let recovery = TestKeypair::from_seed(99);
+    let tx_type2 = make_configure_guardians(
+        id,
+        &alice,
+        0,
+        50_000,
+        &bad_guardians,
+        10,
+        144,
+        0,
+        0,
+        &recovery.pubkey,
+        &[],
+    );
+    let cb = make_coinbase(id, 102, miner.address, 50_000);
+    let block = make_candidate_block(&state, ts + 120, vec![cb, tx_type2]);
+    assert!(state.apply_block(&block).is_err());
+}
+
+#[test]
+fn test_weak_recovery_keys_rejected_in_type2_and_type3() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, mut ts) = setup_funded_chain();
+
+    let g_keys: Vec<TestKeypair> = (10..17).map(TestKeypair::from_seed).collect();
+    let mut guardians = [[0u8; 32]; 7];
+    for (i, k) in g_keys.iter().enumerate() {
+        guardians[i] = k.pubkey;
+    }
+
+    // 1. Weak recovery key in Type 2 setup is rejected
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+
+    let bad_type2 = make_configure_guardians(
+        id,
+        &alice,
+        0,
+        50_000,
+        &guardians,
+        10,
+        144,
+        0,
+        0,
+        &identity,
+        &[],
+    );
+    ts += 120;
+    let cb = make_coinbase(id, 102, miner.address, 50_000);
+    let block = make_candidate_block(&state, ts, vec![cb, bad_type2]);
+    assert!(state.apply_block(&block).is_err());
+
+    // Successfully configure with valid recovery key
+    let valid_recovery = TestKeypair::from_seed(99);
+    let good_type2 = make_configure_guardians(
+        id,
+        &alice,
+        0,
+        50_000,
+        &guardians,
+        10,
+        144,
+        0,
+        0,
+        &valid_recovery.pubkey,
+        &[],
+    );
+    let good_block = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 102, miner.address, 50_000), good_type2],
+    );
+    state.apply_block(&good_block).unwrap();
+
+    // 2. Type 3 Action 9 (Replace Recovery Key) with weak recovery key is rejected
+    ts += 120;
+    let signers: Vec<(u8, &TestKeypair)> = (0..4).map(|i| (i as u8, &g_keys[i])).collect();
+    let bad_replace_rec = make_guardian_action(
+        id,
+        alice.address,
+        ACTION_REPLACE_RECOVERY_KEY,
+        50_000,
+        &identity, // weak key
+        &signers,
+    );
+    let block_action = make_candidate_block(
+        &state,
+        ts,
+        vec![
+            make_coinbase(id, 103, miner.address, 50_000),
+            bad_replace_rec,
+        ],
+    );
+    assert!(state.apply_block(&block_action).is_err());
+}

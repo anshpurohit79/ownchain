@@ -31,7 +31,6 @@ use core::fmt;
 use crate::block::{Block, MAX_BLOCK_SIZE, MAX_TRANSACTION_SIZE, TX_COUNT_LEN, TX_LENGTH_LEN};
 use crate::hash::Hash;
 use crate::header::{HEADER_LEN, VERSION_INITIAL};
-use crate::orchard_root::empty_commitment_root;
 use crate::tx::{self, TxType};
 
 /// The number of ancestor blocks the timestamp rule considers.
@@ -616,11 +615,11 @@ fn validate_genesis(block: &Block, context: &ValidationContext<'_>) -> Result<()
         });
     }
 
-    let expected_orchard_root = empty_commitment_root();
-    if header.orchard_commitment_root != expected_orchard_root {
+    let expected_state_root = crate::merkle::genesis_state_root();
+    if header.orchard_commitment_root != expected_state_root {
         return Err(ValidationError::InvalidGenesis {
             reason: format!(
-                "orchard commitment root is {}, expected {expected_orchard_root}",
+                "state root is {}, expected {expected_state_root}",
                 header.orchard_commitment_root
             ),
         });
@@ -963,7 +962,7 @@ fn validate_orchard_root(block: &Block) -> Result<(), ValidationError> {
         return Ok(());
     }
 
-    let expected = empty_commitment_root();
+    let expected = crate::merkle::genesis_state_root();
     if block.header.orchard_commitment_root != expected {
         return Err(ValidationError::OrchardRootMismatch {
             computed: expected,

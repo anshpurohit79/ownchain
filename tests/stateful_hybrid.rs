@@ -1030,3 +1030,1214 @@ fn test_monetary_conservation_mixed_block_with_fees() {
     let t_total: u128 = state.accounts().values().map(|a| a.balance).sum();
     assert_eq!(t_total, 1_499_980_500);
 }
+
+// ---------------------------------------------------------------------------
+// 12. Transfer Maturity and Confirmed Recipient Semantics (M1-H Review 3)
+// ---------------------------------------------------------------------------
+
+fn setup_funded_state() -> (ChainState, TestKeypair, TestKeypair, u64) {
+    let id = devnet_chain_id();
+    let genesis = genesis::genesis_block(id);
+    let mut state = ChainState::from_genesis(&genesis).unwrap();
+
+    let miner = TestKeypair::from_seed(1);
+    let alice = TestKeypair::from_seed(2);
+
+    let cb1 = make_coinbase(id, 1, miner.address, 1_000_000_000);
+    let b1 = make_hybrid_block(&state, genesis::GENESIS_TIMESTAMP + 120, vec![cb1]);
+    state.apply_block(&b1).unwrap();
+
+    let mut ts = genesis::GENESIS_TIMESTAMP + 120;
+    for h in 2..=100 {
+        ts += 120;
+        let cb = make_coinbase(id, h, miner.address, 0);
+        let blk = make_hybrid_block(&state, ts, vec![cb]);
+        state.apply_block(&blk).unwrap();
+    }
+
+    // Fund Alice with 800M atoms at height 101
+    ts += 120;
+    let fund_tx = make_transparent_transfer(id, &miner, alice.address, 800_000_000, 20_000, 0);
+    let cb101 = make_coinbase(id, 101, miner.address, 20_000);
+    let b101 = make_hybrid_block(&state, ts, vec![cb101, fund_tx]);
+    state.apply_block(&b101).unwrap();
+
+    (state, miner, alice, ts)
+}
+
+#[test]
+fn test_transfer_maturity_same_block_spending_rejected() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, mut ts) = setup_funded_state();
+    let bob = TestKeypair::from_seed(3);
+    let charlie = TestKeypair::from_seed(4);
+
+    ts += 120;
+    // Alice transfers 100M atoms to Bob in block 102
+    let tx_to_bob = make_transparent_transfer(id, &alice, bob.address, 100_000_000, 20_000, 0);
+    // In the SAME block 102, Bob attempts to spend 50M to Charlie
+    let tx_bob_spend = make_transparent_transfer(id, &bob, charlie.address, 50_000_000, 20_000, 0);
+
+    let cb102 = make_coinbase(id, 102, miner.address, 40_000);
+    let bad_block = make_candidate_block(&state, ts, vec![cb102, tx_to_bob, tx_bob_spend]);
+
+    let err = state.evaluate_candidate(&bad_block).unwrap_err();
+    assert!(
+        err.to_string().contains("insufficient spendable balance"),
+        "expected insufficient spendable balance for same-block spend, got: {err}"
+    );
+    assert!(state.apply_block(&bad_block).is_err());
+}
+
+#[test]
+fn test_transfer_maturity_succeeds_at_next_height() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, mut ts) = setup_funded_state();
+    let bob = TestKeypair::from_seed(3);
+    let charlie = TestKeypair::from_seed(4);
+
+    ts += 120;
+    // Block 102: Alice transfers 100M atoms to Bob
+    let tx_to_bob = make_transparent_transfer(id, &alice, bob.address, 100_000_000, 20_000, 0);
+    let cb102 = make_coinbase(id, 102, miner.address, 20_000);
+    let b102 = make_hybrid_block(&state, ts, vec![cb102, tx_to_bob]);
+    state.apply_block(&b102).unwrap();
+
+    // At height 102, Bob has 100M balance; ordinary transfers are NOT stored in coinbase_tranches
+    let bob_acc = state.account(&bob.address).unwrap();
+    assert_eq!(bob_acc.balance, 100_000_000);
+    assert!(bob_acc.coinbase_tranches.is_empty());
+
+    // Block 103: Bob spends 50M atoms to Charlie
+    ts += 120;
+    let tx_bob_spend = make_transparent_transfer(id, &bob, charlie.address, 50_000_000, 20_000, 0);
+    let cb103 = make_coinbase(id, 103, miner.address, 20_000);
+    let b103 = make_hybrid_block(&state, ts, vec![cb103, tx_bob_spend]);
+    state.apply_block(&b103).unwrap();
+
+    let bob_after = state.account(&bob.address).unwrap();
+    assert_eq!(bob_after.balance, 100_000_000 - 50_000_000 - 20_000);
+    let charlie_acc = state.account(&charlie.address).unwrap();
+    assert_eq!(charlie_acc.balance, 50_000_000);
+}
+
+#[test]
+fn test_guardian_protected_new_recipient_delay_and_confirmed_recipient() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, mut ts) = setup_funded_state();
+    let bob = TestKeypair::from_seed(3);
+    let recovery = TestKeypair::from_seed(99);
+    let g_keys: Vec<TestKeypair> = (10..17).map(TestKeypair::from_seed).collect();
+    let mut guardians = [[0u8; 32]; 7];
+    for (i, k) in g_keys.iter().enumerate() {
+        guardians[i] = k.pubkey;
+    }
+
+    ts += 120;
+    // Block 102: Alice configures guardians with new_recipient_delay = 10
+    let config = make_configure_guardians(
+        id,
+        &alice,
+        0,
+        50_000,
+        &guardians,
+        10,
+        144,
+        0,
+        0,
+        &recovery.pubkey,
+        &[],
+    );
+    let cb102 = make_coinbase(id, 102, miner.address, 50_000);
+    let b102 = make_hybrid_block(&state, ts, vec![cb102, config]);
+    state.apply_block(&b102).unwrap();
+
+    assert!(!state.is_confirmed_recipient(&alice.address, &bob.address));
+
+    // Block 103: Alice transfers 100M to Bob (unconfirmed recipient)
+    ts += 120;
+    let tx1 = make_transparent_transfer(id, &alice, bob.address, 100_000_000, 20_000, 1);
+    let cb103 = make_coinbase(id, 103, miner.address, 20_000);
+    let b103 = make_hybrid_block(&state, ts, vec![cb103, tx1]);
+    state.apply_block(&b103).unwrap();
+
+    // Bob has received nothing yet
+    assert!(state.account(&bob.address).is_none());
+    let alice_acc = state.account(&alice.address).unwrap();
+    assert_eq!(alice_acc.pending_transfers.len(), 1);
+    assert_eq!(alice_acc.pending_transfers[0].recipient, bob.address);
+    assert_eq!(alice_acc.pending_transfers[0].release_height, 103 + 10);
+    assert_eq!(alice_acc.pending_transfers[0].amount, 100_000_000);
+
+    // Single-counting invariant: principal is in alice.balance, deducted from spendable
+    let alice_bal = alice_acc.balance;
+    let alice_spend = alice_acc.spendable_balance(103).unwrap();
+    assert_eq!(alice_bal - alice_spend, 100_000_000);
+
+    // Mine blocks 104..=112 (transfer is still pending)
+    for h in 104..=112 {
+        ts += 120;
+        let cb = make_coinbase(id, h, miner.address, 0);
+        let b = make_hybrid_block(&state, ts, vec![cb]);
+        state.apply_block(&b).unwrap();
+    }
+    assert_eq!(
+        state
+            .account(&alice.address)
+            .unwrap()
+            .pending_transfers
+            .len(),
+        1
+    );
+    assert!(!state.is_confirmed_recipient(&alice.address, &bob.address));
+
+    // Block 113: pending transfer releases automatically at start of block
+    ts += 120;
+    let cb113 = make_coinbase(id, 113, miner.address, 0);
+    let b113 = make_hybrid_block(&state, ts, vec![cb113]);
+    state.apply_block(&b113).unwrap();
+
+    let alice_113 = state.account(&alice.address).unwrap();
+    assert_eq!(alice_113.pending_transfers.len(), 0);
+    let bob_113 = state.account(&bob.address).unwrap();
+    assert_eq!(bob_113.balance, 100_000_000);
+
+    // Bob is now confirmed!
+    assert!(state.is_confirmed_recipient(&alice.address, &bob.address));
+
+    // Block 114: Alice transfers another 50M to Bob (already confirmed recipient)
+    ts += 120;
+    let tx2 = make_transparent_transfer(id, &alice, bob.address, 50_000_000, 20_000, 2);
+    let cb114 = make_coinbase(id, 114, miner.address, 20_000);
+    let b114 = make_hybrid_block(&state, ts, vec![cb114, tx2]);
+    state.apply_block(&b114).unwrap();
+
+    // Since Bob was confirmed, transfer executed immediately (no new pending transfer!)
+    let alice_114 = state.account(&alice.address).unwrap();
+    assert_eq!(alice_114.pending_transfers.len(), 0);
+    let bob_114 = state.account(&bob.address).unwrap();
+    assert_eq!(bob_114.balance, 150_000_000);
+    // Ordinary transfers are not stored in coinbase_tranches
+    assert!(bob_114.coinbase_tranches.is_empty());
+
+    // Block 115: Bob spends the mature 150M atoms (150M - 20k fee)
+    ts += 120;
+    let tx3 = make_transparent_transfer(id, &bob, miner.address, 150_000_000 - 20_000, 20_000, 0);
+    let b115 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 115, miner.address, 20_000), tx3],
+    );
+    state.apply_block(&b115).unwrap();
+    assert_eq!(state.account(&bob.address).unwrap().balance, 0);
+}
+
+#[test]
+fn test_cancellation_restores_pending_principal() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, mut ts) = setup_funded_state();
+    let dave = TestKeypair::from_seed(5);
+    let recovery = TestKeypair::from_seed(99);
+    let g_keys: Vec<TestKeypair> = (10..17).map(TestKeypair::from_seed).collect();
+    let mut guardians = [[0u8; 32]; 7];
+    for (i, k) in g_keys.iter().enumerate() {
+        guardians[i] = k.pubkey;
+    }
+
+    ts += 120;
+    // Block 102: Configure guardians
+    let config = make_configure_guardians(
+        id,
+        &alice,
+        0,
+        50_000,
+        &guardians,
+        10,
+        144,
+        0,
+        0,
+        &recovery.pubkey,
+        &[],
+    );
+    let b102 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 102, miner.address, 50_000), config],
+    );
+    state.apply_block(&b102).unwrap();
+
+    // Block 103: Transfer 100M to Dave (pending)
+    ts += 120;
+    let tx1 = make_transparent_transfer(id, &alice, dave.address, 100_000_000, 20_000, 1);
+    let b103 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 103, miner.address, 20_000), tx1],
+    );
+    state.apply_block(&b103).unwrap();
+
+    let alice_103 = state.account(&alice.address).unwrap();
+    assert_eq!(alice_103.pending_transfers.len(), 1);
+    let tid = alice_103.pending_transfers[0].transfer_id;
+    let spend_before_cancel = alice_103.spendable_balance(104).unwrap();
+
+    // Block 104: Cancel pending transfer with 4-of-7 guardians
+    ts += 120;
+    let signers: Vec<(u8, &TestKeypair)> = (0..4).map(|i| (i as u8, &g_keys[i])).collect();
+    let cancel_tx = make_cancel_pending(id, &alice, tid, 50_000, 2, &signers);
+    let b104 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 104, miner.address, 50_000), cancel_tx],
+    );
+    state.apply_block(&b104).unwrap();
+
+    let alice_104 = state.account(&alice.address).unwrap();
+    assert_eq!(alice_104.pending_transfers.len(), 0);
+    // Spendable balance restored by 100M principal minus 50k cancel fee
+    assert_eq!(
+        alice_104.spendable_balance(104).unwrap(),
+        spend_before_cancel + 100_000_000 - 50_000
+    );
+    assert!(state.account(&dave.address).is_none());
+}
+
+#[test]
+fn test_reorganization_restores_all_maturity_and_confirmation_state() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, mut ts) = setup_funded_state();
+    let bob = TestKeypair::from_seed(3);
+    let recovery = TestKeypair::from_seed(99);
+    let g_keys: Vec<TestKeypair> = (10..17).map(TestKeypair::from_seed).collect();
+    let mut guardians = [[0u8; 32]; 7];
+    for (i, k) in g_keys.iter().enumerate() {
+        guardians[i] = k.pubkey;
+    }
+
+    ts += 120;
+    let config = make_configure_guardians(
+        id,
+        &alice,
+        0,
+        50_000,
+        &guardians,
+        10,
+        144,
+        0,
+        0,
+        &recovery.pubkey,
+        &[],
+    );
+    let b102 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 102, miner.address, 50_000), config],
+    );
+    state.apply_block(&b102).unwrap();
+
+    ts += 120;
+    let tx1 = make_transparent_transfer(id, &alice, bob.address, 100_000_000, 20_000, 1);
+    let b103 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 103, miner.address, 20_000), tx1],
+    );
+    state.apply_block(&b103).unwrap();
+
+    for h in 104..=112 {
+        ts += 120;
+        let b = make_hybrid_block(&state, ts, vec![make_coinbase(id, h, miner.address, 0)]);
+        state.apply_block(&b).unwrap();
+    }
+
+    assert!(!state.is_confirmed_recipient(&alice.address, &bob.address));
+
+    // Block 113: release occurs, Bob confirmed
+    ts += 120;
+    let b113 = make_hybrid_block(&state, ts, vec![make_coinbase(id, 113, miner.address, 0)]);
+    state.apply_block(&b113).unwrap();
+    assert!(state.is_confirmed_recipient(&alice.address, &bob.address));
+    assert_eq!(state.account(&bob.address).unwrap().balance, 100_000_000);
+
+    // Rollback to height 112
+    state.rollback_to(112).unwrap();
+
+    // Confirmation status restored to unconfirmed!
+    assert!(!state.is_confirmed_recipient(&alice.address, &bob.address));
+    // Bob has balance 0
+    assert!(state.account(&bob.address).is_none());
+    // Alice has pending transfer restored
+    assert_eq!(
+        state
+            .account(&alice.address)
+            .unwrap()
+            .pending_transfers
+            .len(),
+        1
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 13. Allowance and Nonce Consensus Enforcement (M1-H Review 4)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_allowance_exhaustion_transparent_types_1_to_4() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, mut ts) = setup_funded_state();
+    let bob = TestKeypair::from_seed(3);
+    let recovery = TestKeypair::from_seed(99);
+    let g_keys: Vec<TestKeypair> = (10..17).map(TestKeypair::from_seed).collect();
+    let mut guardians = [[0u8; 32]; 7];
+    for (i, k) in g_keys.iter().enumerate() {
+        guardians[i] = k.pubkey;
+    }
+
+    ts += 120;
+    // Configure guardians with allowance limit = 100M atoms, window = 100 blocks
+    let config = make_configure_guardians(
+        id,
+        &alice,
+        0,
+        50_000,
+        &guardians,
+        10,
+        100,
+        100_000_000,
+        100,
+        &recovery.pubkey,
+        &[],
+    );
+    let b102 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 102, miner.address, 50_000), config],
+    );
+    state.apply_block(&b102).unwrap();
+
+    // Type 1: Spend 90M atoms + 20k fee (90_020_000 total). Allowance remaining = 9_980_000.
+    ts += 120;
+    let tx1 = make_transparent_transfer(id, &alice, bob.address, 90_000_000, 20_000, 1);
+    let b103 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 103, miner.address, 20_000), tx1],
+    );
+    state.apply_block(&b103).unwrap();
+
+    let alice_acc = state.account(&alice.address).unwrap();
+    assert_eq!(alice_acc.allowance_spent, 90_020_000);
+
+    // Type 1 rejection: Attempt to spend 15M atoms (exceeds remaining 9_980_000)
+    ts += 120;
+    let bad_tx1 = make_transparent_transfer(id, &alice, bob.address, 15_000_000, 20_000, 2);
+    let bad_block_1 = make_candidate_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 104, miner.address, 20_000), bad_tx1],
+    );
+    let err = state.evaluate_candidate(&bad_block_1).unwrap_err();
+    assert!(err.to_string().contains("allowance limit exceeded"));
+
+    // Type 2 rejection: Reconfigure guardians paying 20M fee (> remaining allowance)
+    let reconfig_signers: Vec<(u8, &TestKeypair)> = (0..4).map(|i| (i as u8, &g_keys[i])).collect();
+    let bad_type2 = make_configure_guardians(
+        id,
+        &alice,
+        2,
+        20_000_000,
+        &guardians,
+        10,
+        100,
+        100_000_000,
+        100,
+        &recovery.pubkey,
+        &reconfig_signers,
+    );
+    let bad_block_2 = make_candidate_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 104, miner.address, 20_000_000), bad_type2],
+    );
+    let err = state.evaluate_candidate(&bad_block_2).unwrap_err();
+    assert!(err.to_string().contains("allowance limit exceeded"));
+
+    // Type 3 rejection: Action fee paying 20M fee (> remaining allowance)
+    let bad_action = make_guardian_action(
+        id,
+        alice.address,
+        ownchain::auth::ACTION_FREEZE,
+        20_000_000,
+        &[],
+        &reconfig_signers,
+    );
+    let bad_block_3 = make_candidate_block(
+        &state,
+        ts,
+        vec![
+            make_coinbase(id, 104, miner.address, 20_000_000),
+            bad_action,
+        ],
+    );
+    let err = state.evaluate_candidate(&bad_block_3).unwrap_err();
+    assert!(err.to_string().contains("allowance limit exceeded"));
+
+    // Type 4 rejection: Cancel fee paying 20M fee (> remaining allowance)
+    let tid = alice_acc.pending_transfers[0].transfer_id;
+    let bad_cancel = make_cancel_pending(id, &alice, tid, 20_000_000, 2, &reconfig_signers);
+    let bad_block_4 = make_candidate_block(
+        &state,
+        ts,
+        vec![
+            make_coinbase(id, 104, miner.address, 20_000_000),
+            bad_cancel,
+        ],
+    );
+    let err = state.evaluate_candidate(&bad_block_4).unwrap_err();
+    assert!(err.to_string().contains("allowance limit exceeded"));
+}
+
+#[test]
+fn test_fee_inclusion_in_allowance_spending() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, mut ts) = setup_funded_state();
+    let bob = TestKeypair::from_seed(3);
+    let recovery = TestKeypair::from_seed(99);
+    let g_keys: Vec<TestKeypair> = (10..17).map(TestKeypair::from_seed).collect();
+    let mut guardians = [[0u8; 32]; 7];
+    for (i, k) in g_keys.iter().enumerate() {
+        guardians[i] = k.pubkey;
+    }
+
+    ts += 120;
+    // Allowance limit = 10_000_000 exactly
+    let config = make_configure_guardians(
+        id,
+        &alice,
+        0,
+        50_000,
+        &guardians,
+        10,
+        100,
+        10_000_000,
+        100,
+        &recovery.pubkey,
+        &[],
+    );
+    let b102 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 102, miner.address, 50_000), config],
+    );
+    state.apply_block(&b102).unwrap();
+
+    // Transfer amount 9_990_000 <= 10_000_000, but fee is 20_000. Total cost = 10_010_000 > 10_000_000
+    ts += 120;
+    let tx = make_transparent_transfer(id, &alice, bob.address, 9_990_000, 20_000, 1);
+    let bad_block = make_candidate_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 103, miner.address, 20_000), tx],
+    );
+    let err = state.evaluate_candidate(&bad_block).unwrap_err();
+    assert!(
+        err.to_string().contains("allowance limit exceeded"),
+        "expected allowance limit exceeded due to fee inclusion, got: {err}"
+    );
+}
+
+#[test]
+fn test_allowance_window_boundary_behavior() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, mut ts) = setup_funded_state();
+    let bob = TestKeypair::from_seed(3);
+    let recovery = TestKeypair::from_seed(99);
+    let g_keys: Vec<TestKeypair> = (10..17).map(TestKeypair::from_seed).collect();
+    let mut guardians = [[0u8; 32]; 7];
+    for (i, k) in g_keys.iter().enumerate() {
+        guardians[i] = k.pubkey;
+    }
+
+    ts += 120;
+    // Window length = 10 blocks, limit = 10_000_000
+    let config = make_configure_guardians(
+        id,
+        &alice,
+        0,
+        50_000,
+        &guardians,
+        10,
+        100,
+        10_000_000,
+        10,
+        &recovery.pubkey,
+        &[],
+    );
+    let b102 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 102, miner.address, 50_000), config],
+    );
+    state.apply_block(&b102).unwrap();
+
+    // Block 103: Exhaust full allowance (9_980_000 + 20_000 = 10_000_000)
+    ts += 120;
+    let tx1 = make_transparent_transfer(id, &alice, bob.address, 9_980_000, 20_000, 1);
+    let b103 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 103, miner.address, 20_000), tx1],
+    );
+    state.apply_block(&b103).unwrap();
+
+    let alice_acc = state.account(&alice.address).unwrap();
+    assert_eq!(alice_acc.allowance_window_start, 103);
+    assert_eq!(alice_acc.allowance_spent, 10_000_000);
+
+    // Mine blocks 104..=112 (window is [103, 113))
+    for h in 104..=112 {
+        ts += 120;
+        let b = make_hybrid_block(&state, ts, vec![make_coinbase(id, h, miner.address, 0)]);
+        state.apply_block(&b).unwrap();
+    }
+
+    // At block 112 (height 112 < 113), spend attempt fails
+    ts += 120;
+    let tx_fail = make_transparent_transfer(id, &alice, bob.address, 100_000, 20_000, 2);
+    let b_fail = make_candidate_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 112, miner.address, 20_000), tx_fail],
+    );
+    assert!(state.evaluate_candidate(&b_fail).is_err());
+
+    // At block 113 (height 113 >= 113), window resets!
+    let tx_success = make_transparent_transfer(id, &alice, bob.address, 1_000_000, 20_000, 2);
+    let b113 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 113, miner.address, 20_000), tx_success],
+    );
+    state.apply_block(&b113).unwrap();
+
+    let alice_113 = state.account(&alice.address).unwrap();
+    assert_eq!(alice_113.allowance_window_start, 113);
+    assert_eq!(alice_113.allowance_spent, 1_020_000);
+}
+
+#[test]
+fn test_maximum_nonce_rejection() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, ts) = setup_funded_state();
+    let bob = TestKeypair::from_seed(3);
+
+    // Set Alice's nonce to u64::MAX
+    state.accounts.get_mut(&alice.address).unwrap().nonce = u64::MAX;
+
+    let tx = make_transparent_transfer(id, &alice, bob.address, 100_000, 20_000, u64::MAX);
+    let block = make_candidate_block(
+        &state,
+        ts + 120,
+        vec![make_coinbase(id, 102, miner.address, 20_000), tx],
+    );
+    let err = state.evaluate_candidate(&block).unwrap_err();
+    assert!(err.to_string().contains("nonce overflow"));
+}
+
+#[test]
+fn test_allowance_arithmetic_overflow() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, ts) = setup_funded_state();
+    let bob = TestKeypair::from_seed(3);
+
+    // Configure Alice's account with allowance_spent near u128::MAX
+    let acc = state.accounts.get_mut(&alice.address).unwrap();
+    acc.allowance_limit = u128::MAX;
+    acc.allowance_window_len = 1000;
+    acc.allowance_window_start = 100;
+    acc.allowance_spent = u128::MAX - 10;
+
+    let tx = make_transparent_transfer(id, &alice, bob.address, 20_000, 20_000, 0);
+    let block = make_candidate_block(
+        &state,
+        ts + 120,
+        vec![make_coinbase(id, 102, miner.address, 20_000), tx],
+    );
+    let err = state.evaluate_candidate(&block).unwrap_err();
+    assert!(err.to_string().contains("allowance arithmetic overflow"));
+}
+
+#[test]
+fn test_no_state_mutation_after_failed_checks() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, ts) = setup_funded_state();
+    let bob = TestKeypair::from_seed(3);
+
+    let before = state.clone();
+
+    // Create a transaction that fails due to bad signature
+    let mut bad_tx = make_transparent_transfer(id, &alice, bob.address, 100_000, 20_000, 0);
+    bad_tx[131..195].copy_from_slice(&[0xee; 64]);
+
+    let block = make_candidate_block(
+        &state,
+        ts + 120,
+        vec![make_coinbase(id, 102, miner.address, 20_000), bad_tx],
+    );
+    assert!(state.apply_block(&block).is_err());
+
+    // Verify completely unmutated
+    assert_eq!(state, before);
+}
+
+#[test]
+fn test_allowance_exhaustion_state_atomicity() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, mut ts) = setup_funded_state();
+    let bob = TestKeypair::from_seed(3);
+    let recovery = TestKeypair::from_seed(99);
+    let g_keys: Vec<TestKeypair> = (10..17).map(TestKeypair::from_seed).collect();
+    let mut guardians = [[0u8; 32]; 7];
+    for (i, k) in g_keys.iter().enumerate() {
+        guardians[i] = k.pubkey;
+    }
+
+    ts += 120;
+    // Configure guardians with allowance limit = 10_000_000 atoms
+    let config = make_configure_guardians(
+        id,
+        &alice,
+        0,
+        50_000,
+        &guardians,
+        10,
+        100,
+        10_000_000,
+        100,
+        &recovery.pubkey,
+        &[],
+    );
+    let b102 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 102, miner.address, 50_000), config],
+    );
+    state.apply_block(&b102).unwrap();
+
+    let before_bad = state.clone();
+
+    // Type 1 transfer exceeding allowance (15M > 10M limit)
+    ts += 120;
+    let bad_tx = make_transparent_transfer(id, &alice, bob.address, 15_000_000, 20_000, 1);
+    let bad_block = make_candidate_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 103, miner.address, 20_000), bad_tx],
+    );
+
+    let err = state.apply_block(&bad_block).unwrap_err();
+    assert!(err.to_string().contains("allowance limit exceeded"));
+
+    // Verify completely unmutated: accounts, tree, anchors, tx_ids, confirmed_recipients, tip
+    assert_eq!(state, before_bad);
+}
+
+// ---------------------------------------------------------------------------
+// 14. Targeted Regression: Confirmed Recipients & Same-Block Incoming Isolation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_unprotected_transfer_followed_by_guardian_config_and_confirmed_transfer() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, mut ts) = setup_funded_state();
+    let bob = TestKeypair::from_seed(3);
+    let recovery = TestKeypair::from_seed(99);
+    let g_keys: Vec<TestKeypair> = (10..17).map(TestKeypair::from_seed).collect();
+    let mut guardians = [[0u8; 32]; 7];
+    for (i, k) in g_keys.iter().enumerate() {
+        guardians[i] = k.pubkey;
+    }
+
+    ts += 120;
+    // Step 1: Alice has NO guardians. Alice sends an ordinary transfer to Bob in block 102.
+    let tx1 = make_transparent_transfer(id, &alice, bob.address, 100_000_000, 20_000, 0);
+    let b102 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 102, miner.address, 20_000), tx1],
+    );
+    state.apply_block(&b102).unwrap();
+
+    // In block 102, Bob is not confirmed yet (confirms after 1-block maturity at h+1)
+    assert!(!state.is_confirmed_recipient(&alice.address, &bob.address));
+
+    // Step 2: In block 103, Alice configures guardians with new_recipient_delay = 10
+    ts += 120;
+    let config = make_configure_guardians(
+        id,
+        &alice,
+        1,
+        50_000,
+        &guardians,
+        10,
+        144,
+        0,
+        0,
+        &recovery.pubkey,
+        &[],
+    );
+    let b103 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 103, miner.address, 50_000), config],
+    );
+    state.apply_block(&b103).unwrap();
+
+    // At height 103 (h+1 after block 102), Bob IS confirmed!
+    assert!(state.is_confirmed_recipient(&alice.address, &bob.address));
+
+    // Step 3: In block 104, Alice (now guardian-protected) sends another transfer to Bob
+    ts += 120;
+    let tx2 = make_transparent_transfer(id, &alice, bob.address, 50_000_000, 20_000, 2);
+    let b104 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 104, miner.address, 20_000), tx2],
+    );
+    state.apply_block(&b104).unwrap();
+
+    // Because Bob was previously confirmed, transfer executed immediately with no new-recipient delay!
+    let alice_acc = state.account(&alice.address).unwrap();
+    assert_eq!(alice_acc.pending_transfers.len(), 0);
+    let bob_acc = state.account(&bob.address).unwrap();
+    assert_eq!(bob_acc.balance, 150_000_000);
+}
+
+#[test]
+fn test_ordinary_transfer_confirmation_at_h_plus_1() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, mut ts) = setup_funded_state();
+    let bob = TestKeypair::from_seed(3);
+
+    ts += 120;
+    // Alice sends ordinary transfer to Bob at height 102
+    let tx = make_transparent_transfer(id, &alice, bob.address, 100_000_000, 20_000, 0);
+    let b102 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 102, miner.address, 20_000), tx],
+    );
+    state.apply_block(&b102).unwrap();
+
+    // At height 102, Bob is NOT confirmed
+    assert!(!state.is_confirmed_recipient(&alice.address, &bob.address));
+
+    // Advance to height 103 (empty block with only coinbase)
+    ts += 120;
+    let b103 = make_hybrid_block(&state, ts, vec![make_coinbase(id, 103, miner.address, 0)]);
+    state.apply_block(&b103).unwrap();
+
+    // At height 103 (h+1), Bob IS confirmed!
+    assert!(state.is_confirmed_recipient(&alice.address, &bob.address));
+}
+
+#[test]
+fn test_protected_pending_transfer_confirmation_at_release_height() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, mut ts) = setup_funded_state();
+    let carol = TestKeypair::from_seed(6);
+    let recovery = TestKeypair::from_seed(99);
+    let g_keys: Vec<TestKeypair> = (10..17).map(TestKeypair::from_seed).collect();
+    let mut guardians = [[0u8; 32]; 7];
+    for (i, k) in g_keys.iter().enumerate() {
+        guardians[i] = k.pubkey;
+    }
+
+    ts += 120;
+    // Configure guardians at height 102 with new_recipient_delay = 10
+    let config = make_configure_guardians(
+        id,
+        &alice,
+        0,
+        50_000,
+        &guardians,
+        10,
+        144,
+        0,
+        0,
+        &recovery.pubkey,
+        &[],
+    );
+    let b102 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 102, miner.address, 50_000), config],
+    );
+    state.apply_block(&b102).unwrap();
+
+    // Send transfer to unconfirmed Carol at height 103 (release_height = 113)
+    ts += 120;
+    let tx = make_transparent_transfer(id, &alice, carol.address, 100_000_000, 20_000, 1);
+    let b103 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 103, miner.address, 20_000), tx],
+    );
+    state.apply_block(&b103).unwrap();
+
+    // During heights 103..=112, Carol is NOT confirmed
+    for h in 104..=112 {
+        ts += 120;
+        let b = make_hybrid_block(&state, ts, vec![make_coinbase(id, h, miner.address, 0)]);
+        state.apply_block(&b).unwrap();
+        assert!(!state.is_confirmed_recipient(&alice.address, &carol.address));
+    }
+
+    // At height 113, pending transfer releases at start of block
+    ts += 120;
+    let b113 = make_hybrid_block(&state, ts, vec![make_coinbase(id, 113, miner.address, 0)]);
+    state.apply_block(&b113).unwrap();
+
+    // Carol is confirmed at release height 113!
+    assert!(state.is_confirmed_recipient(&alice.address, &carol.address));
+}
+
+#[test]
+fn test_cancelled_pending_transfer_remains_unconfirmed() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, mut ts) = setup_funded_state();
+    let dave = TestKeypair::from_seed(5);
+    let recovery = TestKeypair::from_seed(99);
+    let g_keys: Vec<TestKeypair> = (10..17).map(TestKeypair::from_seed).collect();
+    let mut guardians = [[0u8; 32]; 7];
+    for (i, k) in g_keys.iter().enumerate() {
+        guardians[i] = k.pubkey;
+    }
+
+    ts += 120;
+    // Configure guardians at height 102 with new_recipient_delay = 10
+    let config = make_configure_guardians(
+        id,
+        &alice,
+        0,
+        50_000,
+        &guardians,
+        10,
+        144,
+        0,
+        0,
+        &recovery.pubkey,
+        &[],
+    );
+    let b102 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 102, miner.address, 50_000), config],
+    );
+    state.apply_block(&b102).unwrap();
+
+    // Transfer to unconfirmed Dave at height 103 (release_height = 113)
+    ts += 120;
+    let tx1 = make_transparent_transfer(id, &alice, dave.address, 100_000_000, 20_000, 1);
+    let b103 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 103, miner.address, 20_000), tx1],
+    );
+    state.apply_block(&b103).unwrap();
+
+    let tid = state.account(&alice.address).unwrap().pending_transfers[0].transfer_id;
+
+    // Cancel pending transfer at height 104 with 4-of-7 guardians
+    ts += 120;
+    let signers: Vec<(u8, &TestKeypair)> = (0..4).map(|i| (i as u8, &g_keys[i])).collect();
+    let cancel_tx = make_cancel_pending(id, &alice, tid, 50_000, 2, &signers);
+    let b104 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 104, miner.address, 50_000), cancel_tx],
+    );
+    state.apply_block(&b104).unwrap();
+
+    // Advance past original release height 113
+    for h in 105..=115 {
+        ts += 120;
+        let b = make_hybrid_block(&state, ts, vec![make_coinbase(id, h, miner.address, 0)]);
+        state.apply_block(&b).unwrap();
+        // Dave remains unconfirmed forever
+        assert!(!state.is_confirmed_recipient(&alice.address, &dave.address));
+    }
+}
+
+#[test]
+fn test_reorganization_and_replay_producing_identical_confirmation_state() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, mut ts) = setup_funded_state();
+    let bob = TestKeypair::from_seed(3);
+    let recovery = TestKeypair::from_seed(99);
+    let g_keys: Vec<TestKeypair> = (10..17).map(TestKeypair::from_seed).collect();
+    let mut guardians = [[0u8; 32]; 7];
+    for (i, k) in g_keys.iter().enumerate() {
+        guardians[i] = k.pubkey;
+    }
+
+    ts += 120;
+    // Block 102: Configure guardians
+    let config = make_configure_guardians(
+        id,
+        &alice,
+        0,
+        50_000,
+        &guardians,
+        10,
+        144,
+        0,
+        0,
+        &recovery.pubkey,
+        &[],
+    );
+    let b102 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 102, miner.address, 50_000), config],
+    );
+    state.apply_block(&b102).unwrap();
+
+    // Block 103: Transfer to Bob (pending until 113)
+    ts += 120;
+    let tx1 = make_transparent_transfer(id, &alice, bob.address, 100_000_000, 20_000, 1);
+    let b103 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 103, miner.address, 20_000), tx1],
+    );
+    state.apply_block(&b103).unwrap();
+
+    // Mine blocks 104..=112
+    for h in 104..=112 {
+        ts += 120;
+        let b = make_hybrid_block(&state, ts, vec![make_coinbase(id, h, miner.address, 0)]);
+        state.apply_block(&b).unwrap();
+    }
+
+    // At height 112: Bob is unconfirmed
+    assert!(!state.is_confirmed_recipient(&alice.address, &bob.address));
+
+    // Block 113: release occurs, Bob confirmed
+    ts += 120;
+    let b113 = make_hybrid_block(&state, ts, vec![make_coinbase(id, 113, miner.address, 0)]);
+    state.apply_block(&b113).unwrap();
+    assert!(state.is_confirmed_recipient(&alice.address, &bob.address));
+
+    // Verify replay from genesis produces identical confirmation state
+    let replayed = state.reconstruct_confirmed_recipients().unwrap();
+    assert_eq!(state.confirmed_recipients, replayed);
+
+    // Rollback to height 112
+    state.rollback_to(112).unwrap();
+    assert!(!state.is_confirmed_recipient(&alice.address, &bob.address));
+
+    // Verify replay at rolled-back state matches exactly
+    let replayed_after_rollback = state.reconstruct_confirmed_recipients().unwrap();
+    assert_eq!(state.confirmed_recipients, replayed_after_rollback);
+}
+
+#[test]
+fn test_same_block_incoming_cannot_fund_types_1_to_4_fees_or_principal() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, mut ts) = setup_funded_state();
+    let bob = TestKeypair::from_seed(3);
+    let charlie = TestKeypair::from_seed(4);
+    let recovery = TestKeypair::from_seed(99);
+    let g_keys: Vec<TestKeypair> = (10..17).map(TestKeypair::from_seed).collect();
+    let mut guardians = [[0u8; 32]; 7];
+    for (i, k) in g_keys.iter().enumerate() {
+        guardians[i] = k.pubkey;
+    }
+
+    // Step 1: Fund Bob with 100k atoms at height 102
+    ts += 120;
+    let seed_bob = make_transparent_transfer(id, &alice, bob.address, 100_000, 20_000, 0);
+    let b102 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 102, miner.address, 20_000), seed_bob],
+    );
+    state.apply_block(&b102).unwrap();
+
+    // Step 2: Bob configures guardians at height 103, paying 100k fee, leaving 0 balance and nonce 1
+    ts += 120;
+    let config = make_configure_guardians(
+        id,
+        &bob,
+        0,
+        100_000,
+        &guardians,
+        10,
+        144,
+        0,
+        0,
+        &recovery.pubkey,
+        &[],
+    );
+    let b103 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 103, miner.address, 100_000), config],
+    );
+    state.apply_block(&b103).unwrap();
+    assert_eq!(state.account(&bob.address).unwrap().balance, 0);
+    assert!(state.account(&bob.address).unwrap().guardian_enabled);
+
+    // Step 3: In block 104 candidate, Alice transfers 100M atoms to Bob.
+    // In that SAME candidate block, Bob tries to spend or pay fees for Types 1 to 4 using incoming funds.
+    ts += 120;
+    let tx_to_bob = make_transparent_transfer(id, &alice, bob.address, 100_000_000, 20_000, 1);
+
+    // 1. Bob attempts Type 1 spend (principal + fee) in same block: REJECTED
+    let tx_type1 = make_transparent_transfer(id, &bob, charlie.address, 50_000_000, 20_000, 1);
+    let bad_block_1 = make_candidate_block(
+        &state,
+        ts,
+        vec![
+            make_coinbase(id, 104, miner.address, 40_000),
+            tx_to_bob.clone(),
+            tx_type1,
+        ],
+    );
+    let err1 = state.evaluate_candidate(&bad_block_1).unwrap_err();
+    assert!(err1.to_string().contains("insufficient spendable balance"));
+
+    // 2. Bob attempts Type 2 configure guardians (fee) in same block: REJECTED
+    let tx_type2 = make_configure_guardians(
+        id,
+        &bob,
+        1,
+        50_000,
+        &guardians,
+        10,
+        144,
+        0,
+        0,
+        &recovery.pubkey,
+        &[],
+    );
+    let bad_block_2 = make_candidate_block(
+        &state,
+        ts,
+        vec![
+            make_coinbase(id, 104, miner.address, 70_000),
+            tx_to_bob.clone(),
+            tx_type2,
+        ],
+    );
+    let err2 = state.evaluate_candidate(&bad_block_2).unwrap_err();
+    assert!(err2.to_string().contains("insufficient balance for fee"));
+
+    // 3. Bob attempts Type 3 guardian action (fee) in same block: REJECTED
+    let signers: Vec<(u8, &TestKeypair)> = (0..4).map(|i| (i as u8, &g_keys[i])).collect();
+    let tx_type3 = make_guardian_action(
+        id,
+        bob.address,
+        ownchain::auth::ACTION_FREEZE,
+        50_000,
+        &[],
+        &signers,
+    );
+    let bad_block_3 = make_candidate_block(
+        &state,
+        ts,
+        vec![
+            make_coinbase(id, 104, miner.address, 70_000),
+            tx_to_bob.clone(),
+            tx_type3,
+        ],
+    );
+    let err3 = state.evaluate_candidate(&bad_block_3).unwrap_err();
+    assert!(err3.to_string().contains("insufficient balance for fee"));
+
+    // 4. Bob attempts Type 4 cancel pending (fee) in same block: REJECTED
+    let tx_type4 = make_cancel_pending(id, &bob, Hash::ZERO, 50_000, 1, &signers);
+    let bad_block_4 = make_candidate_block(
+        &state,
+        ts,
+        vec![
+            make_coinbase(id, 104, miner.address, 70_000),
+            tx_to_bob,
+            tx_type4,
+        ],
+    );
+    let err4 = state.evaluate_candidate(&bad_block_4).unwrap_err();
+    assert!(err4.to_string().contains("insufficient balance for fee"));
+}
+
+#[test]
+fn test_released_pending_transfer_spendable_in_same_block() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, mut ts) = setup_funded_state();
+    let bob = TestKeypair::from_seed(3);
+    let charlie = TestKeypair::from_seed(4);
+    let recovery = TestKeypair::from_seed(99);
+    let g_keys: Vec<TestKeypair> = (10..17).map(TestKeypair::from_seed).collect();
+    let mut guardians = [[0u8; 32]; 7];
+    for (i, k) in g_keys.iter().enumerate() {
+        guardians[i] = k.pubkey;
+    }
+
+    ts += 120;
+    // Configure guardians at height 102 with new_recipient_delay = 10
+    let config = make_configure_guardians(
+        id,
+        &alice,
+        0,
+        50_000,
+        &guardians,
+        10,
+        144,
+        0,
+        0,
+        &recovery.pubkey,
+        &[],
+    );
+    let b102 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 102, miner.address, 50_000), config],
+    );
+    state.apply_block(&b102).unwrap();
+
+    // Send transfer to unconfirmed Bob at height 103 (release_height = 113)
+    ts += 120;
+    let tx1 = make_transparent_transfer(id, &alice, bob.address, 100_000_000, 20_000, 1);
+    let b103 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 103, miner.address, 20_000), tx1],
+    );
+    state.apply_block(&b103).unwrap();
+
+    // Mine blocks 104..=112
+    for h in 104..=112 {
+        ts += 120;
+        let b = make_hybrid_block(&state, ts, vec![make_coinbase(id, h, miner.address, 0)]);
+        state.apply_block(&b).unwrap();
+    }
+
+    // Block 113: Pending transfer releases at start-of-block.
+    // In that SAME block 113, Bob spends 50M to Charlie!
+    ts += 120;
+    let tx_bob_spend = make_transparent_transfer(id, &bob, charlie.address, 50_000_000, 20_000, 0);
+    let b113 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 113, miner.address, 20_000), tx_bob_spend],
+    );
+    // Must succeed because released pending transfers are already mature!
+    state.apply_block(&b113).unwrap();
+
+    assert_eq!(
+        state.account(&bob.address).unwrap().balance,
+        100_000_000 - 50_000_000 - 20_000
+    );
+    assert_eq!(state.account(&charlie.address).unwrap().balance, 50_000_000);
+}

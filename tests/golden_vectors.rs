@@ -16,7 +16,6 @@ use ownchain::error::EncodeError;
 use ownchain::hash::{self, Hash};
 use ownchain::header::{Header, HEADER_LEN};
 use ownchain::merkle;
-use ownchain::orchard_root::empty_commitment_root;
 
 mod vectors;
 use vectors::*;
@@ -188,7 +187,7 @@ fn header_devnet_genesis_matches_golden_vector() {
         height: 0,
         parent_block_id: Hash::ZERO,
         transaction_root: hash_of(EMPTY_ROOT),
-        orchard_commitment_root: empty_commitment_root(),
+        orchard_commitment_root: ownchain::merkle::genesis_state_root(),
         timestamp: 1_792_454_400,
         difficulty: 1,
         nonce: 0,
@@ -301,7 +300,7 @@ fn block_no_transactions_matches_golden_vector() {
         height: 0,
         parent_block_id: Hash::ZERO,
         transaction_root: hash_of(EMPTY_ROOT),
-        orchard_commitment_root: empty_commitment_root(),
+        orchard_commitment_root: ownchain::merkle::genesis_state_root(),
         timestamp: 1_792_454_400,
         difficulty: 1,
         nonce: 0,

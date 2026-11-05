@@ -83,6 +83,8 @@ pub struct ChainStateSnapshot {
     pub historical_anchors: BTreeMap<u64, Hash>,
     /// Accepted transaction IDs on the chain.
     pub accepted_transaction_ids: Vec<Hash>,
+    pub confirmed_recipients: BTreeSet<(Hash, Hash)>,
+    pub pending_confirmations: BTreeMap<u64, Vec<(Hash, Hash)>>,
 }
 
 /// The accepted-chain state.
@@ -101,6 +103,8 @@ pub struct ChainState {
     pub cumulative_issuance: u128,
     pub orchard_tree: OrchardTree,
     pub historical_anchors: BTreeMap<u64, Hash>,
+    pub confirmed_recipients: BTreeSet<(Hash, Hash)>,
+    pub pending_confirmations: BTreeMap<u64, Vec<(Hash, Hash)>>,
     history: BTreeMap<u64, ChainStateSnapshot>,
 }
 
@@ -114,8 +118,37 @@ pub struct CandidateStateTransition {
     pub orchard_tree: OrchardTree,
     pub historical_anchors: BTreeMap<u64, Hash>,
     pub accepted_transaction_ids: Vec<Hash>,
+    pub confirmed_recipients: BTreeSet<(Hash, Hash)>,
+    pub pending_confirmations: BTreeMap<u64, Vec<(Hash, Hash)>>,
     pub computed_state_root: Hash,
     pub next_cumulative_work: crate::difficulty::U256,
+}
+
+/// Checks and advances spend allowance accounting for transparent transactions.
+fn check_and_apply_allowance(
+    account: &mut AccountState,
+    height: u64,
+    cost: u128,
+) -> Result<(), ChainError> {
+    if account.allowance_limit > 0 && account.allowance_window_len > 0 {
+        let window_end = account
+            .allowance_window_start
+            .checked_add(account.allowance_window_len)
+            .ok_or_else(|| ChainError::State("allowance window overflow".into()))?;
+        if height >= window_end {
+            account.allowance_window_start = height;
+            account.allowance_spent = 0;
+        }
+        let new_spent = account
+            .allowance_spent
+            .checked_add(cost)
+            .ok_or_else(|| ChainError::State("allowance arithmetic overflow".into()))?;
+        if new_spent > account.allowance_limit {
+            return Err(ChainError::State("allowance limit exceeded".into()));
+        }
+        account.allowance_spent = new_spent;
+    }
+    Ok(())
 }
 
 impl ChainState {
@@ -135,6 +168,8 @@ impl ChainState {
             cumulative_issuance: 0,
             orchard_tree: OrchardTree::new(),
             historical_anchors,
+            confirmed_recipients: BTreeSet::new(),
+            pending_confirmations: BTreeMap::new(),
             history: BTreeMap::new(),
         }
     }
@@ -265,6 +300,23 @@ impl ChainState {
         )
     }
 
+    /// Returns whether `recipient` has previously received a confirmed transfer from `sender`.
+    pub fn is_confirmed_recipient(&self, sender: &Hash, recipient: &Hash) -> bool {
+        self.confirmed_recipients.contains(&(*sender, *recipient))
+    }
+
+    /// Reconstructs the confirmed recipients set by replaying all accepted blocks from genesis.
+    pub fn reconstruct_confirmed_recipients(&self) -> Result<BTreeSet<(Hash, Hash)>, ChainError> {
+        if self.blocks.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let mut replay = ChainState::from_genesis(&self.blocks[0])?;
+        for block in &self.blocks[1..] {
+            replay.apply_block(block)?;
+        }
+        Ok(replay.confirmed_recipients)
+    }
+
     /// Creates a snapshot of the current state.
     pub fn snapshot(&self) -> ChainStateSnapshot {
         ChainStateSnapshot {
@@ -275,6 +327,8 @@ impl ChainState {
             orchard_tree: self.orchard_tree.clone(),
             historical_anchors: self.historical_anchors.clone(),
             accepted_transaction_ids: self.accepted_transaction_ids.clone(),
+            confirmed_recipients: self.confirmed_recipients.clone(),
+            pending_confirmations: self.pending_confirmations.clone(),
         }
     }
 
@@ -300,6 +354,8 @@ impl ChainState {
         self.orchard_tree = snap.orchard_tree.clone();
         self.historical_anchors = snap.historical_anchors.clone();
         self.accepted_transaction_ids = snap.accepted_transaction_ids.clone();
+        self.confirmed_recipients = snap.confirmed_recipients.clone();
+        self.pending_confirmations = snap.pending_confirmations.clone();
 
         self.blocks.truncate(target + 1);
         self.cumulative_work.truncate(target + 1);
@@ -393,6 +449,8 @@ impl ChainState {
         let mut candidate_tree = self.orchard_tree.clone();
         let mut candidate_anchors = self.historical_anchors.clone();
         let mut candidate_tx_ids = self.accepted_transaction_ids.clone();
+        let mut candidate_confirmed = self.confirmed_recipients.clone();
+        let mut candidate_pending_confirmations = self.pending_confirmations.clone();
 
         let h = block.header.height;
         let mut block_fees: u128 = 0;
@@ -435,6 +493,22 @@ impl ChainState {
                     .balance
                     .checked_add(amount)
                     .ok_or_else(|| ChainError::State("overflow during pending release".into()))?;
+                candidate_confirmed.insert((sender_addr, recipient));
+            }
+
+            // 3. Mature ordinary direct transfer confirmations where unlock_height <= H
+            let mut matured_keys = Vec::new();
+            for &unlock_h in candidate_pending_confirmations.keys() {
+                if unlock_h <= h {
+                    matured_keys.push(unlock_h);
+                }
+            }
+            for k in matured_keys {
+                if let Some(pairs) = candidate_pending_confirmations.remove(&k) {
+                    for pair in pairs {
+                        candidate_confirmed.insert(pair);
+                    }
+                }
             }
 
             // B. Build valid 10-block ancestor-anchor window [max(0, H-10), H-1]
@@ -455,6 +529,8 @@ impl ChainState {
             }
 
             // C. Execute block transactions in order
+            let mut same_block_incoming: BTreeMap<Hash, u128> = BTreeMap::new();
+
             for (index, raw_tx) in block.transactions.iter().enumerate() {
                 let tx_id = hash::transaction_id(raw_tx);
                 if candidate_tx_ids.binary_search(&tx_id).is_ok() {
@@ -569,33 +645,39 @@ impl ChainState {
                         let spendable = sender.spendable_balance(h).map_err(|_| {
                             ChainError::State("negative spendable balance calculation".into())
                         })?;
-                        if spendable < total_cost {
+                        let incoming = same_block_incoming.get(&sender_addr).copied().unwrap_or(0);
+                        let effective_spendable =
+                            spendable.checked_sub(incoming).ok_or_else(|| {
+                                ChainError::State(
+                                    "insufficient spendable balance (same-block incoming locked)"
+                                        .into(),
+                                )
+                            })?;
+                        if effective_spendable < total_cost {
                             return Err(ChainError::State(format!(
-                                "insufficient spendable balance: {spendable} < {total_cost}"
+                                "insufficient spendable balance: {effective_spendable} < {total_cost}"
                             )));
                         }
 
                         // Allowance window check
-                        if sender.allowance_limit > 0 && sender.allowance_window_len > 0 {
-                            if h >= sender.allowance_window_start + sender.allowance_window_len {
-                                sender.allowance_window_start = h;
-                                sender.allowance_spent = 0;
-                            }
-                            if sender.allowance_spent + total_cost > sender.allowance_limit {
-                                return Err(ChainError::State("allowance limit exceeded".into()));
-                            }
-                            sender.allowance_spent += total_cost; // allowance_spent + total_cost <= allowance_limit checked above
-                        }
+                        check_and_apply_allowance(sender, h, total_cost)?;
 
-                        sender.nonce += 1; // nonce increments once per tx; bounded by block tx count
-                                           // Bounds guaranteed: spendable >= total_cost >= fee_atoms (checked above), so balance >= fee_atoms.
+                        sender.nonce = sender
+                            .nonce
+                            .checked_add(1)
+                            .ok_or_else(|| ChainError::State("nonce overflow".into()))?;
+                        // Bounds guaranteed: spendable >= total_cost >= fee_atoms (checked above), so balance >= fee_atoms.
                         sender.balance -= fee_atoms;
                         block_fees = block_fees.checked_add(fee_atoms).ok_or_else(|| {
                             ChainError::State("block fee accumulation overflow".into())
                         })?;
 
-                        if sender.guardian_enabled {
-                            // Locked in pending transfer
+                        let is_confirmed = candidate_confirmed.contains(&(sender_addr, recipient));
+                        if sender.guardian_enabled
+                            && !is_confirmed
+                            && sender.new_recipient_delay > 0
+                        {
+                            // First-time recipient under guardian protection: locked in pending transfer
                             let mut inp = [0u8; 40];
                             inp[..32].copy_from_slice(tx_id.as_bytes());
                             inp[32..].copy_from_slice(b"/pending");
@@ -614,6 +696,7 @@ impl ChainState {
                                 release_height,
                             });
                         } else {
+                            // Immediate transfer (unprotected or previously confirmed recipient)
                             sender.balance =
                                 sender.balance.checked_sub(amount).ok_or_else(|| {
                                     ChainError::State("sender balance underflow".into())
@@ -622,6 +705,21 @@ impl ChainState {
                             rec.balance = rec.balance.checked_add(amount).ok_or_else(|| {
                                 ChainError::State("recipient balance overflow".into())
                             })?;
+
+                            // Track direct Type 1 credit in same_block_incoming
+                            let inc = same_block_incoming.entry(recipient).or_default();
+                            *inc = inc.checked_add(amount).ok_or_else(|| {
+                                ChainError::State("same-block incoming overflow".into())
+                            })?;
+
+                            // Schedule recipient confirmation for height h + 1 (after 1-block maturity)
+                            let unlock_h = h.checked_add(1).ok_or_else(|| {
+                                ChainError::State("transfer maturity height overflow".into())
+                            })?;
+                            candidate_pending_confirmations
+                                .entry(unlock_h)
+                                .or_default()
+                                .push((sender_addr, recipient));
                         }
                     }
 
@@ -700,9 +798,20 @@ impl ChainState {
                         let spendable = account
                             .spendable_balance(h)
                             .map_err(|_| ChainError::State("spendable balance error".into()))?;
-                        if spendable < fee_atoms {
+                        let incoming = same_block_incoming.get(&account_addr).copied().unwrap_or(0);
+                        let effective_spendable =
+                            spendable.checked_sub(incoming).ok_or_else(|| {
+                                ChainError::State(
+                                    "insufficient spendable balance (same-block incoming locked)"
+                                        .into(),
+                                )
+                            })?;
+                        if effective_spendable < fee_atoms {
                             return Err(ChainError::State("insufficient balance for fee".into()));
                         }
+
+                        // Allowance check for configuring account
+                        check_and_apply_allowance(account, h, fee_atoms)?;
 
                         if account.guardian_enabled {
                             // Reconfiguration requires at least 4 distinct signatures from OLD guardians
@@ -724,8 +833,11 @@ impl ChainState {
                             ));
                         }
 
-                        account.nonce += 1; // nonce increments once per tx; bounded by block tx count
-                                            // Bounds guaranteed: spendable >= fee_atoms (checked above), so balance >= fee_atoms.
+                        account.nonce = account
+                            .nonce
+                            .checked_add(1)
+                            .ok_or_else(|| ChainError::State("nonce overflow".into()))?;
+                        // Bounds guaranteed: spendable >= fee_atoms (checked above), so balance >= fee_atoms.
                         account.balance -= fee_atoms;
                         block_fees = block_fees.checked_add(fee_atoms).ok_or_else(|| {
                             ChainError::State("block fee accumulation overflow".into())
@@ -820,9 +932,20 @@ impl ChainState {
                         let spendable = target
                             .spendable_balance(h)
                             .map_err(|_| ChainError::State("spendable balance error".into()))?;
-                        if spendable < fee_atoms {
+                        let incoming = same_block_incoming.get(&target_addr).copied().unwrap_or(0);
+                        let effective_spendable =
+                            spendable.checked_sub(incoming).ok_or_else(|| {
+                                ChainError::State(
+                                    "insufficient spendable balance (same-block incoming locked)"
+                                        .into(),
+                                )
+                            })?;
+                        if effective_spendable < fee_atoms {
                             return Err(ChainError::State("insufficient balance for fee".into()));
                         }
+
+                        // Allowance check for target account paying the action fee
+                        check_and_apply_allowance(target, h, fee_atoms)?;
 
                         // Bounds guaranteed: spendable >= fee_atoms (checked above), so balance >= fee_atoms.
                         target.balance -= fee_atoms;
@@ -878,8 +1001,13 @@ impl ChainState {
                             crate::auth::ACTION_EMERGENCY_RECOVERY => {
                                 // Emergency recovery: transfer spendable balance to recovery key
                                 let rec_addr = derive_address(&target.recovery_key);
-                                let recoverable = target.spendable_balance(h).map_err(|_| {
+                                let spendable = target.spendable_balance(h).map_err(|_| {
                                     ChainError::State("spendable balance error".into())
+                                })?;
+                                let incoming =
+                                    same_block_incoming.get(&target_addr).copied().unwrap_or(0);
+                                let recoverable = spendable.checked_sub(incoming).ok_or_else(|| {
+                                    ChainError::State("insufficient spendable balance (same-block incoming locked)".into())
                                 })?;
                                 // Bounds guaranteed: recoverable = spendable_balance <= balance.
                                 target.balance -= recoverable;
@@ -995,7 +1123,15 @@ impl ChainState {
                         let spendable = sender
                             .spendable_balance(h)
                             .map_err(|_| ChainError::State("spendable balance error".into()))?;
-                        if spendable < fee_atoms {
+                        let incoming = same_block_incoming.get(&sender_addr).copied().unwrap_or(0);
+                        let effective_spendable =
+                            spendable.checked_sub(incoming).ok_or_else(|| {
+                                ChainError::State(
+                                    "insufficient spendable balance (same-block incoming locked)"
+                                        .into(),
+                                )
+                            })?;
+                        if effective_spendable < fee_atoms {
                             return Err(ChainError::State("insufficient balance for fee".into()));
                         }
 
@@ -1007,9 +1143,15 @@ impl ChainState {
                                 ChainError::State("pending transfer not found".into())
                             })?;
 
+                        // Allowance check for sender paying cancellation fee
+                        check_and_apply_allowance(sender, h, fee_atoms)?;
+
                         sender.pending_transfers.remove(found_idx);
-                        sender.nonce += 1; // nonce increments once per tx; bounded by block tx count
-                                           // Bounds guaranteed: spendable >= fee_atoms (checked above), so balance >= fee_atoms.
+                        sender.nonce = sender
+                            .nonce
+                            .checked_add(1)
+                            .ok_or_else(|| ChainError::State("nonce overflow".into()))?;
+                        // Bounds guaranteed: spendable >= fee_atoms (checked above), so balance >= fee_atoms.
                         sender.balance -= fee_atoms;
                         block_fees = block_fees.checked_add(fee_atoms).ok_or_else(|| {
                             ChainError::State("block fee accumulation overflow".into())
@@ -1175,6 +1317,8 @@ impl ChainState {
             orchard_tree: candidate_tree,
             historical_anchors: candidate_anchors,
             accepted_transaction_ids: candidate_tx_ids,
+            confirmed_recipients: candidate_confirmed,
+            pending_confirmations: candidate_pending_confirmations,
             computed_state_root,
             next_cumulative_work,
         })
@@ -1192,18 +1336,9 @@ impl ChainState {
         let cand = self.evaluate_candidate(block)?;
 
         // Header slot 6 holds composite state root.
-        // For genesis (h=0), empty_commitment_root() or genesis_state_root() is accepted.
-        // For H >= 1, the declared orchard_commitment_root must strictly match computed_state_root.
-        if block.header.height == 0 {
-            if block.header.orchard_commitment_root != cand.computed_state_root
-                && block.header.orchard_commitment_root != empty_commitment_root()
-            {
-                return Err(ChainError::Invalid(ValidationError::OrchardRootMismatch {
-                    computed: cand.computed_state_root,
-                    declared: block.header.orchard_commitment_root,
-                }));
-            }
-        } else if block.header.orchard_commitment_root != cand.computed_state_root {
+        // Both genesis (h=0) and subsequent blocks (H >= 1) strictly require
+        // exact equality with computed_state_root.
+        if block.header.orchard_commitment_root != cand.computed_state_root {
             return Err(ChainError::Invalid(ValidationError::OrchardRootMismatch {
                 computed: cand.computed_state_root,
                 declared: block.header.orchard_commitment_root,
@@ -1218,6 +1353,8 @@ impl ChainState {
         self.orchard_tree = cand.orchard_tree;
         self.historical_anchors = cand.historical_anchors;
         self.accepted_transaction_ids = cand.accepted_transaction_ids;
+        self.confirmed_recipients = cand.confirmed_recipients;
+        self.pending_confirmations = cand.pending_confirmations;
 
         self.cumulative_work.push(cand.next_cumulative_work);
         self.difficulty_samples

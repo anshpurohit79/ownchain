@@ -585,15 +585,26 @@ fn genesis_must_have_no_transactions() {
 }
 
 #[test]
-fn genesis_must_have_the_canonical_empty_orchard_root() {
+fn genesis_must_have_the_canonical_composite_state_root() {
     let id = chain_id();
     let mut block = genesis::genesis_block(id);
-    block.header.orchard_commitment_root = Hash::new([0x02; 32]);
     let context = ValidationContext::genesis(id);
+
+    // 1. Genesis with empty Orchard commitment root in the state_root slot is rejected
+    block.header.orchard_commitment_root = ownchain::orchard_root::empty_commitment_root();
     assert!(matches!(
         validate_block(&block, &context),
         Err(ValidationError::InvalidGenesis { .. })
     ));
+    assert!(ChainState::from_genesis(&block).is_err());
+
+    // 2. Genesis with any alternative incorrect composite root is rejected
+    block.header.orchard_commitment_root = Hash::new([0x02; 32]);
+    assert!(matches!(
+        validate_block(&block, &context),
+        Err(ValidationError::InvalidGenesis { .. })
+    ));
+    assert!(ChainState::from_genesis(&block).is_err());
 }
 
 #[test]

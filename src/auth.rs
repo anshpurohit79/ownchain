@@ -209,6 +209,25 @@ pub fn canonical_unsigned_with_guardians(prefix: &[u8], entries: &[GuardianSigEn
     out
 }
 
+/// Strictly parses and validates a 32-byte Ed25519 public key.
+///
+/// Enforces:
+/// 1. Valid point decompression via [`VerifyingKey::from_bytes`].
+/// 2. Rejection of weak/low-order keys via [`VerifyingKey::is_weak`].
+/// 3. Rejection of non-canonical encodings (`vk.to_bytes() == *bytes`).
+///
+/// Returns [`AuthError::InvalidPublicKey`] on any parsing, weak-key, or non-canonical failure.
+pub fn parse_strict_pubkey(bytes: &[u8; 32]) -> Result<VerifyingKey, AuthError> {
+    let vk = VerifyingKey::from_bytes(bytes).map_err(|_| AuthError::InvalidPublicKey)?;
+    if vk.is_weak() {
+        return Err(AuthError::InvalidPublicKey);
+    }
+    if vk.to_bytes() != *bytes {
+        return Err(AuthError::InvalidPublicKey);
+    }
+    Ok(vk)
+}
+
 /// Strict Ed25519 signature verification using `verify_strict`.
 ///
 /// Rejects non-canonical points, small-order points, and non-canonical signatures.
@@ -219,8 +238,7 @@ pub fn verify_signature(
     sig_bytes: &[u8; 64],
 ) -> Result<(), AuthError> {
     // 1. Strict public key parsing
-    let verifying_key =
-        VerifyingKey::from_bytes(pubkey_bytes).map_err(|_| AuthError::InvalidPublicKey)?;
+    let verifying_key = parse_strict_pubkey(pubkey_bytes)?;
 
     // 2. Strict signature parsing
     let signature = Signature::from_bytes(sig_bytes);
@@ -241,7 +259,7 @@ pub fn verify_address_derivation(
     pubkey_bytes: &[u8; 32],
     expected_address: Hash,
 ) -> Result<VerifyingKey, AuthError> {
-    let vk = VerifyingKey::from_bytes(pubkey_bytes).map_err(|_| AuthError::InvalidPublicKey)?;
+    let vk = parse_strict_pubkey(pubkey_bytes)?;
     let derived = derive_address(pubkey_bytes);
     if derived != expected_address {
         return Err(AuthError::AddressMismatch {
@@ -337,7 +355,7 @@ pub fn verify_guardian_quorum(
 /// and are pairwise distinct.
 pub fn validate_guardian_keys_set(guardians: &[[u8; 32]; 7]) -> Result<(), AuthError> {
     for (i, g1) in guardians.iter().enumerate() {
-        VerifyingKey::from_bytes(g1).map_err(|_| AuthError::InvalidPublicKey)?;
+        parse_strict_pubkey(g1)?;
         for g2 in &guardians[i + 1..] {
             if g1 == g2 {
                 return Err(AuthError::DuplicateGuardianKey);
@@ -349,7 +367,7 @@ pub fn validate_guardian_keys_set(guardians: &[[u8; 32]; 7]) -> Result<(), AuthE
 
 /// Validates that a 32-byte key is a strictly valid Ed25519 public key.
 pub fn validate_pubkey(key: &[u8; 32]) -> Result<VerifyingKey, AuthError> {
-    VerifyingKey::from_bytes(key).map_err(|_| AuthError::InvalidPublicKey)
+    parse_strict_pubkey(key)
 }
 
 /// Parsed header fields and authorization of a Type 6 (TransparentToShielded) transaction.

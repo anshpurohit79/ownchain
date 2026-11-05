@@ -58,6 +58,12 @@ ORCHARD_EMPTY_ROOT_HEX = (
 )
 ORCHARD_EMPTY_ROOT = bytes.fromhex(ORCHARD_EMPTY_ROOT_HEX)
 
+# The canonical composite state root at genesis height 0 (§6.3, §6.4, ADR-001).
+GENESIS_STATE_ROOT_HEX = (
+    "a6a88639bbf0a133b9398c6e4ac1a16bb490afeedb338d1cedbbcf427e68277d"
+)
+GENESIS_STATE_ROOT = bytes.fromhex(GENESIS_STATE_ROOT_HEX)
+
 
 def tx_root(tids):
     if not tids:
@@ -221,7 +227,7 @@ def main():
         height=0,
         parent=b"\x00" * 32,
         tx_root_bytes=empty_root(),
-        orchard_root=ORCHARD_EMPTY_ROOT,
+        orchard_root=GENESIS_STATE_ROOT,
         timestamp=1792454400,
         difficulty=1,
         nonce=0,
@@ -236,7 +242,7 @@ def main():
             "height": 0,
             "parent_block_id": "0" * 64,
             "transaction_root": hexs(empty_root()),
-            "orchard_commitment_root": ORCHARD_EMPTY_ROOT_HEX,
+            "orchard_commitment_root": GENESIS_STATE_ROOT_HEX,
             "timestamp": 1792454400,
             "difficulty": 1,
             "nonce": 0,
