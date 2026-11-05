@@ -391,11 +391,13 @@ impl ChainState {
         Ok(())
     }
 
-    /// Validates a candidate block against the current state **without** mutating it.
-    pub fn validate(&self, block: &Block) -> Result<(), ValidationError> {
-        let timestamps = self.ancestor_timestamps();
+    fn validation_context<'a>(
+        &'a self,
+        block: &Block,
+        timestamps: &'a [u64],
+    ) -> Result<ValidationContext<'a>, ValidationError> {
         let mut context = match self.tip() {
-            Some(parent) => ValidationContext::new(self.chain_id, parent, &timestamps),
+            Some(parent) => ValidationContext::new(self.chain_id, parent, timestamps),
             None => ValidationContext::genesis(self.chain_id),
         }
         .with_accepted_transaction_ids(&self.accepted_transaction_ids);
@@ -415,11 +417,27 @@ impl ChainState {
             context = context.with_expected_difficulty(expected_difficulty);
         }
 
+        Ok(context)
+    }
+
+    /// Validates a candidate block against the current state **without** mutating it.
+    pub fn validate(&self, block: &Block) -> Result<(), ValidationError> {
+        let timestamps = self.ancestor_timestamps();
+        let context = self.validation_context(block, &timestamps)?;
         validate_block(block, &context)
     }
 
-    /// Evaluates a candidate block and computes the candidate post-state transition without mutating the chain.
-    pub fn evaluate_candidate(
+    /// Validates candidate block consensus and cryptographic validity against current state without requiring solved proof-of-work.
+    pub fn validate_candidate(&self, block: &Block) -> Result<(), ValidationError> {
+        let timestamps = self.ancestor_timestamps();
+        let context = self.validation_context(block, &timestamps)?;
+        crate::validation::validate_candidate_block(block, &context)
+    }
+
+    /// Evaluates a candidate block that has already passed stateless block validation ([`Self::validate`]).
+    ///
+    /// Computes the candidate post-state transition without mutating the chain.
+    fn evaluate_candidate_validated(
         &self,
         block: &Block,
     ) -> Result<CandidateStateTransition, ChainError> {
@@ -1530,7 +1548,20 @@ impl ChainState {
         })
     }
 
+    /// Evaluates a candidate block and computes the candidate post-state transition without mutating the chain.
+    ///
+    /// Performs full candidate block validation before state evaluation.
+    pub fn evaluate_candidate(
+        &self,
+        block: &Block,
+    ) -> Result<CandidateStateTransition, ChainError> {
+        self.validate_candidate(block)?;
+        self.evaluate_candidate_validated(block)
+    }
+
     /// Simulates block application and returns the expected post-state composite state root.
+    ///
+    /// Performs full candidate block validation before computing and returning the candidate state root.
     pub fn simulate_candidate_state_root(&self, block: &Block) -> Result<Hash, ChainError> {
         let cand = self.evaluate_candidate(block)?;
         Ok(cand.computed_state_root)
@@ -1539,7 +1570,7 @@ impl ChainState {
     /// Validates and atomically accepts a candidate block.
     pub fn apply_block(&mut self, block: &Block) -> Result<(), ChainError> {
         self.validate(block)?;
-        let cand = self.evaluate_candidate(block)?;
+        let cand = self.evaluate_candidate_validated(block)?;
 
         // Header slot 6 holds composite state root.
         // Both genesis (h=0) and subsequent blocks (H >= 1) strictly require

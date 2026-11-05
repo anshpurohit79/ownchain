@@ -1003,3 +1003,210 @@ fn test_type6_state_atomicity_and_reorg_rollback() {
     assert_eq!(state.orchard_tree().root(), pre_rollback_tree_root);
     assert_eq!(state.composite_state_root(), pre_rollback_root);
 }
+
+// ===========================================================================
+// Test 15: Simulation Produces Expected State Root for Valid Type 6 Candidate
+// ===========================================================================
+#[test]
+fn test_simulation_produces_expected_state_root_for_valid_type6() {
+    let (mut state, miner, alice, mut ts) = setup_funded_chain();
+    let id = devnet_chain_id();
+
+    ts += 120;
+    let amount = 50_000_000u64;
+    let fee = 1_000_000u64;
+    let t2s = build_valid_type6_tx(id, &alice, 0, amount, fee, 0x5a, &[]);
+    let cb = make_coinbase(id, 102, miner.address, fee);
+
+    let mut cand_block = make_candidate_block(&state, ts, vec![cb, t2s]);
+
+    // Candidate simulation succeeds and produces expected root
+    let simulated_root = state
+        .simulate_candidate_state_root(&cand_block)
+        .expect("simulation must succeed for valid candidate block");
+
+    // Pre-state remains unmutated
+    assert_eq!(state.tip_height(), Some(101));
+    assert_eq!(state.shielded_pool_balance(), 0);
+
+    // Block with simulated root applies cleanly
+    cand_block.header.orchard_commitment_root = simulated_root;
+    state
+        .apply_block(&cand_block)
+        .expect("block committing to simulated root must apply");
+
+    assert_eq!(state.tip_height(), Some(102));
+    assert_eq!(state.composite_state_root(), simulated_root);
+    assert_eq!(state.shielded_pool_balance(), amount as u128);
+}
+
+// ===========================================================================
+// Test 16: Simulation Rejects Candidate with Corrupted Halo2 Proof
+// ===========================================================================
+#[test]
+fn test_simulation_rejects_corrupted_halo2_proof() {
+    let (state, miner, alice, mut ts) = setup_funded_chain();
+    let id = devnet_chain_id();
+
+    ts += 120;
+    let amount = 50_000_000u64;
+    let fee = 1_000_000u64;
+    let t2s = build_valid_type6_tx(id, &alice, 0, amount, fee, 0x5b, &[]);
+    let cb = make_coinbase(id, 102, miner.address, fee);
+
+    // Corrupt Halo2 proof bytes inside bundle
+    let mut bad_t2s = t2s;
+    let bundle_len = u32::from_le_bytes(
+        bad_t2s[ownchain::tx::TX_ENVELOPE_LEN + 64..ownchain::tx::TX_ENVELOPE_LEN + 68]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    // Mutate byte in Halo2 proof section (proof ends at bundle_len - 128; mutate at -500)
+    let proof_idx = ownchain::tx::TX_ENVELOPE_LEN + 68 + bundle_len - 500;
+    bad_t2s[proof_idx] ^= 0xff;
+
+    // Recalculate transaction root for candidate block
+    let cand_block = make_candidate_block(&state, ts, vec![cb, bad_t2s]);
+
+    let err = state
+        .simulate_candidate_state_root(&cand_block)
+        .unwrap_err();
+
+    assert!(
+        err.to_string().contains("ProofVerificationFailed")
+            || err.to_string().to_lowercase().contains("proof")
+            || err.to_string().contains("Orchard")
+    );
+    // Chain state untouched
+    assert_eq!(state.tip_height(), Some(101));
+    assert_eq!(state.shielded_pool_balance(), 0);
+}
+
+// ===========================================================================
+// Test 17: Simulation Rejects Invalid Chain IDs and Invalid Sender Auth
+// ===========================================================================
+#[test]
+fn test_simulation_rejects_invalid_chain_id_and_sender_authorization() {
+    let (state, miner, alice, mut ts) = setup_funded_chain();
+    let id = devnet_chain_id();
+
+    ts += 120;
+    let amount = 50_000_000u64;
+    let fee = 1_000_000u64;
+    let t2s = build_valid_type6_tx(id, &alice, 0, amount, fee, 0x5c, &[]);
+    let cb = make_coinbase(id, 102, miner.address, fee);
+
+    // 1. Invalid chain ID in header rejected by simulation
+    let mut cand_bad_chain = make_candidate_block(&state, ts, vec![cb.clone(), t2s.clone()]);
+    cand_bad_chain.header.chain_id = Hash::new([0x99; 32]);
+    let err_chain = state
+        .simulate_candidate_state_root(&cand_bad_chain)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err_chain,
+            ownchain::chain::ChainError::Invalid(
+                ownchain::validation::ValidationError::WrongChainId { .. }
+            )
+        ) || err_chain
+            .to_string()
+            .to_lowercase()
+            .contains("wrong chain id")
+    );
+
+    // 2. Corrupted sender authorization in Type 6 rejected by simulation
+    let mut bad_sig_t2s = t2s;
+    let bundle_len = u32::from_le_bytes(
+        bad_sig_t2s[ownchain::tx::TX_ENVELOPE_LEN + 64..ownchain::tx::TX_ENVELOPE_LEN + 68]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let sig_idx = ownchain::tx::TX_ENVELOPE_LEN + 68 + bundle_len;
+    bad_sig_t2s[sig_idx] ^= 0xaa;
+
+    let cand_bad_sig = make_candidate_block(&state, ts, vec![cb, bad_sig_t2s]);
+    let err_sig = state
+        .simulate_candidate_state_root(&cand_bad_sig)
+        .unwrap_err();
+    assert!(
+        err_sig.to_string().contains("SenderSignatureInvalid")
+            || err_sig.to_string().contains("Signature")
+            || err_sig.to_string().contains("Orchard")
+    );
+
+    // Chain state untouched
+    assert_eq!(state.tip_height(), Some(101));
+    assert_eq!(state.shielded_pool_balance(), 0);
+}
+
+// ===========================================================================
+// Test 18: apply_block Rejects Invalid Candidates Without Mutating Chain State
+// ===========================================================================
+#[test]
+fn test_apply_block_rejects_invalid_candidates_without_mutating_state() {
+    let (mut state, miner, alice, mut ts) = setup_funded_chain();
+    let id = devnet_chain_id();
+
+    let snap_height = state.tip_height();
+    let snap_root = state.composite_state_root();
+    let snap_accounts = state.accounts().clone();
+    let snap_pool = state.shielded_pool_balance();
+    let snap_tree_root = state.orchard_tree().root();
+    let snap_issuance = state.cumulative_issuance();
+    let snap_tx_ids = state.accepted_transaction_ids().to_vec();
+
+    ts += 120;
+    let amount = 50_000_000u64;
+    let fee = 1_000_000u64;
+    let t2s = build_valid_type6_tx(id, &alice, 0, amount, fee, 0x5d, &[]);
+    let cb = make_coinbase(id, 102, miner.address, fee);
+
+    // Case 1: Corrupted Halo2 proof rejected by apply_block
+    let mut bad_proof_t2s = t2s.clone();
+    let bundle_len = u32::from_le_bytes(
+        bad_proof_t2s[ownchain::tx::TX_ENVELOPE_LEN + 64..ownchain::tx::TX_ENVELOPE_LEN + 68]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let proof_idx = ownchain::tx::TX_ENVELOPE_LEN + 68 + bundle_len - 80;
+    bad_proof_t2s[proof_idx] ^= 0xff;
+    let bad_proof_block = make_candidate_block(&state, ts, vec![cb.clone(), bad_proof_t2s]);
+    assert!(state.apply_block(&bad_proof_block).is_err());
+
+    assert_eq!(state.tip_height(), snap_height);
+    assert_eq!(state.composite_state_root(), snap_root);
+    assert_eq!(*state.accounts(), snap_accounts);
+    assert_eq!(state.shielded_pool_balance(), snap_pool);
+
+    // Case 2: Wrong chain ID rejected by apply_block
+    let mut bad_chain_block = make_candidate_block(&state, ts, vec![cb.clone(), t2s.clone()]);
+    bad_chain_block.header.chain_id = Hash::new([0x33; 32]);
+    assert!(state.apply_block(&bad_chain_block).is_err());
+
+    assert_eq!(state.tip_height(), snap_height);
+    assert_eq!(state.composite_state_root(), snap_root);
+
+    // Case 3: Wrong declared orchard commitment root rejected by apply_block
+    let mut bad_root_block = make_candidate_block(&state, ts, vec![cb.clone(), t2s.clone()]);
+    bad_root_block.header.orchard_commitment_root = Hash::new([0x77; 32]);
+    assert!(state.apply_block(&bad_root_block).is_err());
+
+    assert_eq!(state.tip_height(), snap_height);
+    assert_eq!(state.composite_state_root(), snap_root);
+
+    // Case 4: Corrupted sender signature rejected by apply_block
+    let mut bad_sig_t2s = t2s.clone();
+    let sig_idx = ownchain::tx::TX_ENVELOPE_LEN + 68 + bundle_len;
+    bad_sig_t2s[sig_idx] ^= 0xff;
+    let bad_sig_block = make_candidate_block(&state, ts, vec![cb, bad_sig_t2s]);
+    assert!(state.apply_block(&bad_sig_block).is_err());
+
+    // Absolute state preservation
+    assert_eq!(state.tip_height(), snap_height);
+    assert_eq!(state.composite_state_root(), snap_root);
+    assert_eq!(*state.accounts(), snap_accounts);
+    assert_eq!(state.shielded_pool_balance(), snap_pool);
+    assert_eq!(state.orchard_tree().root(), snap_tree_root);
+    assert_eq!(state.cumulative_issuance(), snap_issuance);
+    assert_eq!(state.accepted_transaction_ids(), snap_tx_ids.as_slice());
+}

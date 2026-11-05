@@ -499,6 +499,7 @@ fn make_valid_child_block(
     transactions: Vec<Vec<u8>>,
 ) -> Block {
     let mut blk = make_block(state.chain_id(), parent, timestamp, transactions);
+    blk.header.difficulty = state.expected_difficulty_for_next_block().unwrap_or(1);
     let root = state
         .simulate_candidate_state_root(&blk)
         .expect("simulate candidate state root");

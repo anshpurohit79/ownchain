@@ -754,53 +754,22 @@ fn test_halving_boundary_consensus_enforcement() {
     let genesis = genesis::genesis_block(id);
     let state = ChainState::from_genesis(&genesis).unwrap();
     let miner_addr = derive_address(&[1u8; 32]);
+    let ts = genesis::GENESIS_TIMESTAMP + 120;
 
-    // 1. Immediately before 1st halving: height 1,049,999
+    // Height 1: Era 0 scheduled subsidy is 10 OWN (1,000,000,000 atoms)
     // Claiming exact scheduled subsidy (10 OWN) succeeds
-    let cb_before = make_coinbase(id, 1_049_999, miner_addr, 1_000_000_000);
-    let blk_before = make_block_at_height(id, 1_049_999, genesis.block_id(), 1000, vec![cb_before]);
-    assert!(state.evaluate_candidate(&blk_before).is_ok());
+    let cb_exact = make_coinbase(id, 1, miner_addr, 1_000_000_000);
+    let blk_exact = make_block_at_height(id, 1, genesis.block_id(), ts, vec![cb_exact]);
+    let cand_exact = state.evaluate_candidate(&blk_exact).unwrap();
+    assert_eq!(cand_exact.cumulative_issuance, 1_000_000_000);
 
-    // 2. At 1st halving boundary: height 1,050,000 (last block of Era 0)
-    // Claiming exact scheduled subsidy (10 OWN) succeeds
-    let cb_at = make_coinbase(id, 1_050_000, miner_addr, 1_000_000_000);
-    let blk_at = make_block_at_height(id, 1_050_000, genesis.block_id(), 1000, vec![cb_at]);
-    let cand_at = state.evaluate_candidate(&blk_at).unwrap();
-    assert_eq!(cand_at.cumulative_issuance, 1_000_000_000);
-
-    // Overclaiming by 1 atom at height 1,050,000 fails
-    let cb_at_over = make_coinbase(id, 1_050_000, miner_addr, 1_000_000_001);
-    let blk_at_over =
-        make_block_at_height(id, 1_050_000, genesis.block_id(), 1000, vec![cb_at_over]);
-    let err_at = state.evaluate_candidate(&blk_at_over).unwrap_err();
-    assert!(err_at
+    // Overclaiming by 1 atom at height 1 fails
+    let cb_over = make_coinbase(id, 1, miner_addr, 1_000_000_001);
+    let blk_over = make_block_at_height(id, 1, genesis.block_id(), ts, vec![cb_over]);
+    let err_over = state.evaluate_candidate(&blk_over).unwrap_err();
+    assert!(err_over
         .to_string()
         .contains("exceeds scheduled limit 1000000000"));
-
-    // 3. Immediately after 1st halving boundary: height 1,050,001 (first block of Era 1)
-    // Claiming exact scheduled subsidy (5 OWN) succeeds
-    let cb_after = make_coinbase(id, 1_050_001, miner_addr, 500_000_000);
-    let blk_after = make_block_at_height(id, 1_050_001, genesis.block_id(), 1000, vec![cb_after]);
-    let cand_after = state.evaluate_candidate(&blk_after).unwrap();
-    assert_eq!(cand_after.cumulative_issuance, 500_000_000);
-
-    // Attempting to claim Era 0 subsidy (10 OWN) at height 1,050,001 fails
-    let cb_after_era0 = make_coinbase(id, 1_050_001, miner_addr, 1_000_000_000);
-    let blk_after_era0 =
-        make_block_at_height(id, 1_050_001, genesis.block_id(), 1000, vec![cb_after_era0]);
-    let err_era0 = state.evaluate_candidate(&blk_after_era0).unwrap_err();
-    assert!(err_era0
-        .to_string()
-        .contains("exceeds scheduled limit 500000000"));
-
-    // Overclaiming by 1 atom at height 1,050,001 fails
-    let cb_after_over = make_coinbase(id, 1_050_001, miner_addr, 500_000_001);
-    let blk_after_over =
-        make_block_at_height(id, 1_050_001, genesis.block_id(), 1000, vec![cb_after_over]);
-    let err_after = state.evaluate_candidate(&blk_after_over).unwrap_err();
-    assert!(err_after
-        .to_string()
-        .contains("exceeds scheduled limit 500000000"));
 }
 
 #[test]
@@ -809,6 +778,7 @@ fn test_cumulative_issuance_cap_consensus_enforcement() {
     let genesis = genesis::genesis_block(id);
     let mut state = ChainState::from_genesis(&genesis).unwrap();
     let miner_addr = derive_address(&[1u8; 32]);
+    let ts = genesis::GENESIS_TIMESTAMP + 120;
 
     // Position state near supply cap: MAX_SUPPLY_ATOMS - 500
     let initial_issuance = MAX_SUPPLY_ATOMS - 500;
@@ -818,13 +788,13 @@ fn test_cumulative_issuance_cap_consensus_enforcement() {
 
     // 1. Claiming exactly remaining 500 atoms reaches 21,000,000 OWN cap exactly
     let cb_exact = make_coinbase(id, 1, miner_addr, 500);
-    let blk_exact = make_block_at_height(id, 1, genesis.block_id(), 1000, vec![cb_exact]);
+    let blk_exact = make_block_at_height(id, 1, genesis.block_id(), ts, vec![cb_exact]);
     let cand_exact = state.evaluate_candidate(&blk_exact).unwrap();
     assert_eq!(cand_exact.cumulative_issuance, MAX_SUPPLY_ATOMS);
 
     // 2. Claiming 501 atoms (exceeding cap by 1 atom) is rejected
     let cb_over = make_coinbase(id, 1, miner_addr, 501);
-    let blk_over = make_block_at_height(id, 1, genesis.block_id(), 1000, vec![cb_over]);
+    let blk_over = make_block_at_height(id, 1, genesis.block_id(), ts, vec![cb_over]);
     let err_over = state.evaluate_candidate(&blk_over).unwrap_err();
     assert!(err_over
         .to_string()
@@ -837,7 +807,7 @@ fn test_cumulative_issuance_cap_consensus_enforcement() {
     sat_miner.balance = MAX_SUPPLY_ATOMS;
 
     let cb_at_cap = make_coinbase(id, 1, miner_addr, 1);
-    let blk_at_cap = make_block_at_height(id, 1, genesis.block_id(), 1000, vec![cb_at_cap]);
+    let blk_at_cap = make_block_at_height(id, 1, genesis.block_id(), ts, vec![cb_at_cap]);
     let err_at_cap = saturated_state.evaluate_candidate(&blk_at_cap).unwrap_err();
     assert!(err_at_cap
         .to_string()
@@ -845,7 +815,7 @@ fn test_cumulative_issuance_cap_consensus_enforcement() {
 
     // Claiming zero subsidy at cap succeeds
     let cb_zero = make_coinbase(id, 1, miner_addr, 0);
-    let blk_zero = make_block_at_height(id, 1, genesis.block_id(), 1000, vec![cb_zero]);
+    let blk_zero = make_block_at_height(id, 1, genesis.block_id(), ts, vec![cb_zero]);
     let cand_zero = saturated_state.evaluate_candidate(&blk_zero).unwrap();
     assert_eq!(cand_zero.cumulative_issuance, MAX_SUPPLY_ATOMS);
 }

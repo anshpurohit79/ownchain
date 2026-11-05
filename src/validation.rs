@@ -483,7 +483,11 @@ impl<'a> ValidationContext<'a> {
 /// The function is pure: it never mutates any state. A caller may therefore
 /// validate first and only then commit the block, which is what
 /// [`crate::chain::ChainState::apply_block`] does.
-pub fn validate_block(
+/// Validates all candidate block rules without requiring solved proof-of-work.
+///
+/// This performs structural, cryptographic (Halo2 proofs, transaction signatures),
+/// envelope, difficulty declaration, timestamp, and transaction root validation.
+pub fn validate_candidate_block(
     block: &Block,
     context: &ValidationContext<'_>,
 ) -> Result<(), ValidationError> {
@@ -492,6 +496,15 @@ pub fn validate_block(
     validate_transactions(block, context)?;
     validate_orchard_root(block)?;
     validate_timestamp(block, context)?;
+    Ok(())
+}
+
+/// Fully validates a completed block, including candidate rules and RandomX proof-of-work.
+pub fn validate_block(
+    block: &Block,
+    context: &ValidationContext<'_>,
+) -> Result<(), ValidationError> {
+    validate_candidate_block(block, context)?;
     validate_pow(block, context)?;
     Ok(())
 }
