@@ -666,20 +666,25 @@ fn validate_transactions(
         let mut total_actions = 0usize;
         for raw in &block.transactions {
             let tag = *raw.first().unwrap_or(&0xff);
-            let has_direct_bundle = match tag {
-                tx::TX_TYPE_COINBASE => false,
-                tx::TX_TYPE_SHIELDED_TRANSFER => true,
-                _ => false,
+            let bundle_offset = match tag {
+                tx::TX_TYPE_COINBASE => None,
+                tx::TX_TYPE_SHIELDED_TRANSFER => Some(tx::TX_ENVELOPE_LEN + 8),
+                tx::TX_TYPE_TRANSPARENT_TO_SHIELDED => Some(tx::TX_ENVELOPE_LEN + 68),
+                tx::TX_TYPE_SHIELDED_TO_TRANSPARENT => Some(tx::TX_ENVELOPE_LEN + 60),
+                _ => None,
             };
-            if has_direct_bundle && raw.len() > tx::TX_ENVELOPE_LEN + 8 {
-                let mut bundle_slice = &raw[tx::TX_ENVELOPE_LEN + 8..];
-                if let Ok(n_actions) = crate::orchard_tx::decode_compact_size(&mut bundle_slice) {
-                    total_actions = total_actions.checked_add(n_actions).ok_or(
-                        ValidationError::TooManyBlockActions {
-                            actual: usize::MAX,
-                            limit: crate::orchard_tx::MAX_ACTIONS_PER_BLOCK,
-                        },
-                    )?;
+            if let Some(offset) = bundle_offset {
+                if raw.len() > offset {
+                    let mut bundle_slice = &raw[offset..];
+                    if let Ok(n_actions) = crate::orchard_tx::decode_compact_size(&mut bundle_slice)
+                    {
+                        total_actions = total_actions.checked_add(n_actions).ok_or(
+                            ValidationError::TooManyBlockActions {
+                                actual: usize::MAX,
+                                limit: crate::orchard_tx::MAX_ACTIONS_PER_BLOCK,
+                            },
+                        )?;
+                    }
                 }
             }
         }

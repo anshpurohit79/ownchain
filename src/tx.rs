@@ -144,6 +144,8 @@ pub enum EnvelopeError {
     },
     /// The transaction carries no payload after its envelope.
     MissingPayload,
+    /// A transaction payload is shorter than required for its transaction type.
+    TruncatedPayload,
     /// A coinbase's height payload is truncated.
     TruncatedCoinbaseHeight,
     /// A transfer's fee payload is truncated.
@@ -186,6 +188,7 @@ impl core::fmt::Display for EnvelopeError {
                 write!(f, "wrong transaction chain ID {found}, expected {expected}")
             }
             EnvelopeError::MissingPayload => write!(f, "transaction carries no payload"),
+            EnvelopeError::TruncatedPayload => write!(f, "transaction payload is truncated"),
             EnvelopeError::TruncatedCoinbaseHeight => {
                 write!(f, "coinbase height field is truncated")
             }
@@ -267,6 +270,14 @@ pub fn parse_envelope(tx: &[u8], expected_chain_id: Hash) -> Result<TxEnvelope, 
             if payload.len() == 8 {
                 return Err(EnvelopeError::MissingPayload);
             }
+        }
+        TxType::TransparentToShielded if payload.len() < 133 => {
+            // sender (32) + nonce (8) + amount (16) + fee (8) + bundle_len (4) + sender_sig (64) + quorum_count (1) = 133 min
+            return Err(EnvelopeError::TruncatedPayload);
+        }
+        TxType::ShieldedToTransparent if payload.len() < 60 => {
+            // recipient (32) + amount (16) + fee (8) + bundle_len (4) = 60 min
+            return Err(EnvelopeError::TruncatedPayload);
         }
         _ => {}
     }
