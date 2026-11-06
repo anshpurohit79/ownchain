@@ -33,4 +33,5 @@ cmake = "0.1"
 # Test-only dependency used to express golden vectors as hex text.
 [dev-dependencies]
 hex = "0.4.3"
+incrementalmerkletree = "0.9.0"
 rand = "0.10.3"

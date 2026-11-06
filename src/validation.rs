@@ -19,8 +19,9 @@
 //! Stateful checks that require historical anchor validation against active chain
 //! commitment-tree roots, nullifier double-spend tracking against the chain,
 //! commitment tree updates and header `orchard_commitment_root` calculation for
-//! transaction-bearing blocks, subsidy limits, and pool balance accounting remain
-//! deferred to the subsequent stateful consensus integration stage.
+//! transaction-bearing blocks, subsidy limits, and pool balance accounting are
+//! enforced in stateful consensus by `ChainState::evaluate_candidate` and
+//! `ChainState::apply_block`.
 //! This module never invents a rule the specification does not state; in
 //! particular it does not implement the "two hours ahead of local time"
 //! deferral rule, because §4 explicitly classifies that as a local-clock
@@ -478,7 +479,8 @@ impl<'a> ValidationContext<'a> {
 /// Stateful checks (historical anchors against active chain commitment-tree roots,
 /// nullifier double-spend tracking against the chain, commitment tree updates,
 /// header `orchard_commitment_root` calculation for transaction-bearing blocks, subsidy limits,
-/// and pool-balance accounting) remain deferred.
+/// and pool-balance accounting) are enforced during candidate evaluation and block application
+/// in [`crate::chain::ChainState`].
 ///
 /// The function is pure: it never mutates any state. A caller may therefore
 /// validate first and only then commit the block, which is what
@@ -831,7 +833,8 @@ fn validate_transactions(
     // Stateful checks (historical anchors against active chain commitment-tree
     // roots, nullifier double-spend tracking against the chain, commitment tree
     // updates, header orchard_commitment_root for tx-bearing blocks, subsidy limits,
-    // and pool balance accounting) remain deferred.
+    // and pool balance accounting) are enforced at the stateful consensus boundary
+    // in `ChainState::evaluate_candidate` and `ChainState::apply_block`.
     if context.parent.is_some() {
         let vk = crate::orchard_tx::verifying_key();
         let mut total_actions = 0usize;
@@ -989,14 +992,15 @@ fn parse_envelope_at(
 ///
 /// While stateless Orchard bundle verification is now active, incremental
 /// commitment-tree state updates and root calculation for transaction-bearing
-/// blocks remain deferred to the subsequent stateful consensus integration stage.
-/// The check is therefore applied exactly where it is currently decidable without
-/// stateful tree tracking — a block that carries no transactions commits to no Orchard
+/// blocks require stateful chain context and are enforced in stateful consensus
+/// by `ChainState::evaluate_candidate` and `ChainState::apply_block`.
+/// In this stateless validator, the check is applied where it is decidable without
+/// stateful tree tracking — an empty block carries no transactions and commits to no Orchard
 /// commitment, so its header must carry the canonical empty Orchard root.
 fn validate_orchard_root(block: &Block) -> Result<(), ValidationError> {
     if !block.transactions.is_empty() {
-        // Deferred to stateful consensus integration: commitment tree state updates
-        // and header orchard_commitment_root verification for transaction-bearing blocks.
+        // Enforced in stateful consensus (ChainState::evaluate_candidate and ChainState::apply_block):
+        // incremental tree updates and header orchard_commitment_root verification.
         return Ok(());
     }
 

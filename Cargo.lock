@@ -750,6 +750,7 @@ dependencies = [
  "cmake",
  "ed25519-dalek",
  "hex",
+ "incrementalmerkletree",
  "nonempty",
  "orchard",
  "rand",

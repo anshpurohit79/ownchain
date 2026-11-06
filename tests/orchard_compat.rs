@@ -634,8 +634,8 @@ fn test_negative_duplicate_nullifier_chain_state() {
     assert!(bundle.verify_proof(vk).is_ok());
 
     // 2. CHAIN-STATE RULE (HARNESS SIMULATION):
-    // NOTE (M1-D gate boundary): This is a harness-level policy simulation.
-    // Actual production nullifier set tracking and persistence in ChainState is deferred to M1-E.
+    // NOTE (Historical M1-D gate boundary): This was originally a harness-level policy simulation.
+    // Production nullifier set tracking and persistence in ChainState was integrated in M1-H.
     let mut simulated_seen_nullifiers: HashSet<[u8; 32]> = HashSet::new();
 
     // First block inclusion succeeds
@@ -662,8 +662,8 @@ fn test_negative_unknown_historical_anchor() {
     assert!(bundle.verify_proof(vk).is_ok());
 
     // 2. CHAIN-STATE RULE (HARNESS SIMULATION):
-    // NOTE (M1-D gate boundary): This is a harness-level policy simulation.
-    // Actual production commitment tree root tracking and ancestor anchor checks in ChainState are deferred to M1-E.
+    // NOTE (Historical M1-D gate boundary): This was originally a harness-level policy simulation.
+    // Production commitment tree root tracking and ancestor anchor checks in ChainState were integrated in M1-H.
     let mut simulated_historical_anchors: HashSet<[u8; 32]> = HashSet::new();
     simulated_historical_anchors.insert(valid_anchor_bytes);
 

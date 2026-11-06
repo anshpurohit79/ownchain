@@ -143,7 +143,7 @@ The following public APIs from `orchard = 0.16.0` were verified and integrated:
    assert_eq!(recovered_note.value().inner(), 1_000_000_000);
    ```
 6. **Stateless Verification vs Chain-State Nullifier Tracking:**
-   For output-only actions with `Flags::SPENDS_DISABLED`, the action nullifier is derived by the circuit over a dummy note commitment. The isolated proof verifier validates the circuit proof. Tracking and duplicate rejection across blocks is the responsibility of the node's `ChainState` (deferred to M1-E).
+   For output-only actions with `Flags::SPENDS_DISABLED`, the action nullifier is derived by the circuit over a dummy note commitment. The isolated proof verifier validates the circuit proof. Tracking and duplicate rejection across blocks was identified as the responsibility of the node's `ChainState` (historical baseline note; integrated into consensus in Milestone M1-H).
 
 ---
 
@@ -278,8 +278,8 @@ The test suite rigorously classifies checks into their appropriate enforcement l
 | **Ciphertext Tampering with Original Proof** | `verify_proof` passes, but signature and BVK reject mutated sighash | **OwnChain ActionEffect / Digest** | Proves proof verification alone does not protect ciphertexts. |
 | **Mutated Effects / Ciphertext Fields** | Signatures and binding verification fail on altered digest | **Orchard Crate / OwnChain Digest** | Any field change invalidates authorizations. |
 | **Incorrect Fee / Value Balance Sign** | Mutated `value_balance` alters expected BVK; `bvk.verify()` fails | **Orchard Crate (Value Commitment)** | BVK derivation commits to value balance. |
-| **Duplicate Nullifier** | Isolated crate verifier succeeds; harness simulation rejects | **Harness Simulation (Future `ChainState`)** | **CRATE DOES NOT ENFORCE.** The stateless crate verifier accepts duplicate nullifiers. Production tracking belongs to M1-E. |
-| **Stale / Unknown Historical Anchor** | Isolated crate verifier succeeds; harness simulation rejects | **Harness Simulation (Future `ChainState`)** | **CRATE DOES NOT ENFORCE.** The crate only validates internal anchor consistency. Production ancestor-root validation belongs to M1-E. |
+| **Duplicate Nullifier** | Isolated crate verifier succeeds; harness simulation rejects | **ChainState Consensus (Integrated in M1-H)** | **CRATE DOES NOT ENFORCE.** The stateless crate verifier accepts duplicate nullifiers. Production tracking and duplicate rejection was integrated in Milestone M1-H. |
+| **Stale / Unknown Historical Anchor** | Isolated crate verifier succeeds; harness simulation rejects | **ChainState Consensus (Integrated in M1-H)** | **CRATE DOES NOT ENFORCE.** The crate only validates internal anchor consistency. Production ancestor-root validation was integrated in Milestone M1-H. |
 
 ---
 
@@ -314,12 +314,14 @@ All signed and verified test fixtures confirm protocol rules:
 
 ---
 
-## 9. Remaining M1-E Work (Future Consensus Integration)
+## 9. Historical Baseline Note & Subsequent Consensus Integration
 
-Passing the M1-D/M1-D.1/M1-D.2 compatibility gate proves that the pinned Orchard API can implement OwnChain's shielded rules. It does **not** integrate shielded transactions into production consensus. The following work remains for Milestone M1-E:
+Passing the M1-D/M1-D.1/M1-D.2 compatibility gate proved that the pinned Orchard API can implement OwnChain's shielded rules. At the time of this report, shielded transactions were not yet integrated into production consensus.
 
-1. **Commitment Tree State Tracking in `ChainState`:** Implement an incremental depth-32 Sinsemilla/Orchard commitment tree that appends `action.cmx()` in block order and produces the canonical header `orchard_root`.
-2. **Historical Anchor Ring Buffer:** Maintain historical tree roots across ancestor blocks to validate transaction anchors during block validation and fork reorgs.
-3. **Nullifier Persistence in `ChainState`:** Implement permanent nullifier tracking to detect and reject duplicate nullifiers within a block and against the active chain.
-4. **Transaction Envelope Parser in Block Validation:** Wire `tx_type`, `tx_version`, `chain_id`, `fee_atoms`, and `height` parsing into `src/validation.rs` for block bodies.
-5. **Subsidy & Fee Accounting in Consensus:** Verify that block coinbase payouts do not exceed `scheduled_subsidy(h) + sum(tx.fee_atoms)` and that atomic rollback occurs upon any validation failure.
+The items listed below as future work have since been completed during Milestone M1-H:
+
+1. **Commitment Tree State Tracking in `ChainState`:** Implemented an incremental depth-32 Sinsemilla/Orchard commitment tree in `src/orchard_tree.rs` that appends `action.cmx()` in block order and produces the canonical header `orchard_commitment_root`.
+2. **Historical Anchor Ring Buffer:** Maintained historical tree roots across ancestor blocks [H-10, H-1] to validate transaction anchors during block validation and fork reorgs in `ChainState`.
+3. **Nullifier Persistence in `ChainState`:** Implemented permanent nullifier tracking to detect and reject duplicate nullifiers within transactions, candidate blocks, and against the active chain.
+4. **Transaction Envelope Parser in Block Validation:** Fully integrated envelope and payload validation in `src/validation.rs` and `src/orchard_tx.rs`.
+5. **Cross-Pool & Pool Accounting in Consensus:** Implemented stateful consensus execution for Type 6 (TransparentToShielded) and Type 7 (ShieldedToTransparent) with exact value conservation ($T + S = I$) and atomic reorganization rollback.

@@ -309,8 +309,8 @@ Moves value from a transparent account into the Orchard shielded pool.
   $$valueBalanceOrchard = -shielded\_amount < 0$$
 - Pool delta:
   $$\text{shielded\_pool\_delta} = -valueBalanceOrchard = +shielded\_amount$$
-- Authorization: Sender Ed25519 signature. If the sender account is guardian-protected, a **4-of-7 guardian quorum** is strictly required. Output bundle verified via Orchard verifier.
-- State transition: Sender balance debited by $shielded\_amount + fee\_atoms$. Nonce incremented. $\text{shielded\_pool\_balance} \mathrel{+}= shielded\_amount$. Fee is paid to the block producer. New note commitments added to tree. Conservation $\Delta(T + S) = 0$ holds.
+- Authorization: Sender Ed25519 signature and Orchard binding signature over `OwnChain/TxAuth/v1`. If the sender account is guardian-protected, a **4-of-7 guardian quorum** is strictly required. Output bundle verified via Orchard verifier (`FixedPostNu6_2`). Each action's SpendAuth signature is verified against the canonical authorization digest.
+- State transition: Sender balance debited by $shielded\_amount + fee\_atoms$. Nonce incremented. $\text{shielded\_pool\_balance} \mathrel{+}= shielded\_amount$. Fee is paid to the block producer. All Orchard action nullifiers (including dummy-spend nullifiers derived under `Flags::SPENDS_DISABLED`) are checked for uniqueness within the transaction, rejected if already spent in candidate or chain state, and inserted into the active nullifier set. All Orchard action output commitments (including dummy outputs) are unconditionally appended to the incremental Orchard note commitment tree. Conservation $\Delta(T + S) = 0$ holds.
 
 #### Type 7: ShieldedToTransparent
 Moves value out of the Orchard shielded pool into a transparent recipient account.
@@ -320,8 +320,8 @@ Moves value out of the Orchard shielded pool into a transparent recipient accoun
   $$valueBalanceOrchard = +(release\_amount + fee\_atoms) > 0$$
 - Pool delta:
   $$\text{shielded\_pool\_delta} = -valueBalanceOrchard = -(release\_amount + fee\_atoms)$$
-- Authorization: Orchard spend authorization and binding signature. Anchor must fall within the 10-block ancestor window $[h-10, h-1]$.
-- State transition: Disclosed nullifiers added to nullifier set. $\text{shielded\_pool\_balance} \mathrel{-}= (release\_amount + fee\_atoms)$. Recipient transparent balance credited by $release\_amount$. Fee is paid to the block producer. Guardian protections on the recipient do not restrict inbound transfers. Conservation $\Delta(T + S) = 0$ holds.
+- Authorization: Orchard spend authorization signatures for all actions and binding signature over `OwnChain/TxAuth/v1`. Anchor must fall within the 10-block ancestor window $[h-10, h-1]$.
+- State transition: Disclosed nullifiers (both real spends and dummy spends) are checked for uniqueness within the transaction and candidate block, rejected if already spent, and added to the cumulative nullifier set. All Orchard action output commitments (including dummy outputs under `Flags::OUTPUTS_DISABLED` and change note commitments) are unconditionally appended to the incremental Orchard note commitment tree. $\text{shielded\_pool\_balance} \mathrel{-}= (release\_amount + fee\_atoms)$. Recipient transparent balance credited by $release\_amount$. Fee is paid to the block producer. Guardian protections on the recipient do not restrict inbound transfers. Conservation $\Delta(T + S) = 0$ holds.
 
 ### 7.2 Address derivation and signing preimage
 

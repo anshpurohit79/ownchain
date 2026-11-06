@@ -54,6 +54,7 @@ ORCHARD_EMPTY_ROOT_BYTES: bytes = bytes.fromhex(
 )
 DOM_ADDRESS: bytes = b"OwnChain/Address/v1"
 DOM_ACTION_EFFECT: bytes = b"OwnChain/ActionEffect/v1"
+DOM_CROSS_POOL_AUTH: bytes = b"OwnChain/CrossPoolAuth/v1"
 
 # Guardian Action Types
 ACTION_STRENGTHEN_DELAYS: int = 1
@@ -82,6 +83,91 @@ def compute_tx_id(canonical_signed_tx_bytes: bytes) -> bytes:
 def minimum_fee(canonical_signed_size: int) -> int:
     """min_fee = max(1, 100 * canonical_signed_tx_size_bytes) atoms."""
     return max(1, 100 * canonical_signed_size)
+
+
+def compute_action_effect(
+    cv_net: bytes,
+    nullifier: bytes,
+    rk: bytes,
+    cmx: bytes,
+    epk: bytes,
+    enc_ciphertext: bytes,
+    out_ciphertext: bytes,
+) -> bytes:
+    """Computes the 32-byte action effect digest for an Orchard action (§7.3)."""
+    assert len(cv_net) == 32
+    assert len(nullifier) == 32
+    assert len(rk) == 32
+    assert len(cmx) == 32
+    assert len(epk) == 32
+    assert len(enc_ciphertext) == 580
+    assert len(out_ciphertext) == 80
+    payload = cv_net + nullifier + rk + cmx + epk + enc_ciphertext + out_ciphertext
+    return hash_domained(DOM_ACTION_EFFECT, payload)
+
+
+def compute_type6_cross_pool_auth_digest(
+    chain_id: bytes,
+    tx_version: int,
+    sender_pubkey: bytes,
+    nonce: int,
+    shielded_amount: int,
+    fee_atoms: int,
+    bundle_flag_byte: int,
+    bundle_value_balance: int,
+    bundle_anchor: bytes,
+    action_effects: Sequence[bytes],
+) -> bytes:
+    """Computes the domain-separated authorization digest for a Type 6 transaction (§7.3)."""
+    assert len(chain_id) == 32
+    assert len(sender_pubkey) == 32
+    assert len(bundle_anchor) == 32
+    payload = (
+        chain_id
+        + struct.pack("<B", TX_TYPE_TRANSPARENT_TO_SHIELDED)
+        + struct.pack("<H", tx_version)
+        + sender_pubkey
+        + struct.pack("<Q", nonce)
+        + shielded_amount.to_bytes(16, "little")
+        + struct.pack("<Q", fee_atoms)
+        + struct.pack("<B", bundle_flag_byte)
+        + struct.pack("<q", bundle_value_balance)
+        + bundle_anchor
+        + struct.pack("<I", len(action_effects))
+        + b"".join(action_effects)
+    )
+    return hash_domained(DOM_CROSS_POOL_AUTH, payload)
+
+
+def compute_type7_cross_pool_auth_digest(
+    chain_id: bytes,
+    tx_version: int,
+    recipient: bytes,
+    release_amount: int,
+    fee_atoms: int,
+    bundle_flag_byte: int,
+    bundle_value_balance: int,
+    bundle_anchor: bytes,
+    action_effects: Sequence[bytes],
+) -> bytes:
+    """Computes the domain-separated authorization digest for a Type 7 transaction (§7.3)."""
+    assert len(chain_id) == 32
+    assert len(recipient) == 32
+    assert len(bundle_anchor) == 32
+    payload = (
+        chain_id
+        + struct.pack("<B", TX_TYPE_SHIELDED_TO_TRANSPARENT)
+        + struct.pack("<H", tx_version)
+        + recipient
+        + release_amount.to_bytes(16, "little")
+        + struct.pack("<Q", fee_atoms)
+        + struct.pack("<B", bundle_flag_byte)
+        + struct.pack("<q", bundle_value_balance)
+        + bundle_anchor
+        + struct.pack("<I", len(action_effects))
+        + b"".join(action_effects)
+    )
+    return hash_domained(DOM_CROSS_POOL_AUTH, payload)
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +552,7 @@ class TransparentToShieldedTx:
     orchard_bundle_bytes: bytes  # Output bundle creating shielded notes
     sender_sig: bytes = b"\x00" * 64
     guardian_sigs: list[tuple[int, bytes]] = field(default_factory=list)  # If guardian-protected
+    nullifiers: list[bytes] = field(default_factory=list)
     version: int = TX_VERSION_1
 
     @property

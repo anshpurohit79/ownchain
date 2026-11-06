@@ -712,6 +712,15 @@ class HybridChainState:
                     "Shielding funds from protected account requires 4-of-7 guardian quorum"
                 )
 
+        # Intra-transaction duplicate nullifier check
+        if len(tx.nullifiers) != len(set(tx.nullifiers)):
+            raise HybridStateError("Duplicate nullifiers within transaction")
+
+        # Nullifier double-spend check
+        for nf in tx.nullifiers:
+            if nf in self.nullifier_set:
+                raise HybridStateError(f"Duplicate nullifier: {nf.hex()}")
+
         total_cost = tx.shielded_amount + tx.fee_atoms
         if sender.spendable_balance(self.height) < total_cost:
             raise HybridStateError("Insufficient spendable balance to shield")
@@ -719,6 +728,8 @@ class HybridChainState:
         sender.nonce += 1
         sender.balance -= total_cost
         self.shielded_pool_balance += tx.shielded_amount
+        for nf in tx.nullifiers:
+            self.nullifier_set.add(nf)
 
         self.accepted_tx_ids.add(tx.tx_id)
         return tx.fee_atoms
