@@ -1443,11 +1443,180 @@ impl ChainState {
                     }
 
                     tx::TX_TYPE_SHIELDED_TO_TRANSPARENT => {
-                        // Fail-closed consensus safety gate: Type 7 is rejected before altering any consensus state
-                        // pending full Orchard cryptographic proof verification (FixedPostNu6_2 Halo2 proof, spend auth, binding signature, value balance, output tree).
-                        return Err(ChainError::State(
-                            "consensus safety gate: Type 7 (ShieldedToTransparent) rejected pending full Orchard cryptographic proof verification".into(),
-                        ));
+                        let payload = &raw_tx[tx::TX_ENVELOPE_LEN..];
+                        if payload.len() < 60 {
+                            return Err(ChainError::State(
+                                "truncated shielded-to-transparent payload".into(),
+                            ));
+                        }
+
+                        let tx_version = u16::from_le_bytes(raw_tx[1..3].try_into().unwrap());
+
+                        let mut recipient_bytes = [0u8; 32];
+                        recipient_bytes.copy_from_slice(&payload[..32]);
+                        let recipient = Hash::new(recipient_bytes);
+
+                        let release_amount =
+                            u128::from_le_bytes(payload[32..48].try_into().unwrap());
+                        if release_amount == 0 {
+                            return Err(ChainError::State(
+                                "release amount must be greater than zero".into(),
+                            ));
+                        }
+
+                        let fee_atoms =
+                            u64::from_le_bytes(payload[48..56].try_into().unwrap()) as u128;
+                        let min_fee = crate::tx::min_fee(raw_tx.len()).ok_or_else(|| {
+                            ChainError::State("transaction too large for fee calculation".into())
+                        })? as u128;
+                        if fee_atoms < min_fee {
+                            return Err(ChainError::State("fee below minimum".into()));
+                        }
+
+                        let bundle_len =
+                            u32::from_le_bytes(payload[56..60].try_into().unwrap()) as usize;
+                        let expected_payload_len = 60usize
+                            .checked_add(bundle_len)
+                            .ok_or_else(|| ChainError::State("bundle length overflow".into()))?;
+                        if payload.len() != expected_payload_len {
+                            return Err(ChainError::State(
+                                "invalid shielded-to-transparent bundle length or trailing bytes"
+                                    .into(),
+                            ));
+                        }
+
+                        let bundle_bytes = &payload[60..expected_payload_len];
+                        let bundle = deserialize_bundle(bundle_bytes)
+                            .map_err(|e| ChainError::State(format!("bundle error: {e:?}")))?;
+
+                        // Bundle structural consensus invariants
+                        let n_actions = bundle.actions().len();
+                        if n_actions == 0 || n_actions > crate::orchard_tx::MAX_ACTIONS_PER_TX {
+                            return Err(ChainError::State(format!(
+                                "invalid action count {n_actions}"
+                            )));
+                        }
+
+                        if !bundle.flags().spends_enabled() {
+                            return Err(ChainError::State(
+                                "Type 7 bundle must have spends enabled".into(),
+                            ));
+                        }
+
+                        let vb = *bundle.value_balance();
+                        if vb <= 0 {
+                            return Err(ChainError::State(
+                                "Type 7 value balance must be positive".into(),
+                            ));
+                        }
+
+                        let total_deshield = release_amount
+                            .checked_add(fee_atoms)
+                            .ok_or_else(|| ChainError::State("total deshield overflow".into()))?;
+                        let expected_vb = i64::try_from(total_deshield).map_err(|_| {
+                            ChainError::State("total deshield exceeds i64 bounds".into())
+                        })?;
+                        if vb != expected_vb {
+                            return Err(ChainError::State(format!(
+                                "value balance mismatch: got {vb}, expected {expected_vb}"
+                            )));
+                        }
+
+                        // Compute cross-pool authorization digest
+                        let auth_digest = crate::orchard_tx::compute_type7_bundle_auth_digest(
+                            *self.chain_id.as_bytes(),
+                            tx_version,
+                            recipient_bytes,
+                            release_amount,
+                            fee_atoms as u64,
+                            &bundle,
+                        );
+
+                        // Verify SpendAuth signatures on each action over auth_digest
+                        for (idx, action) in bundle.actions().iter().enumerate() {
+                            action
+                                .rk()
+                                .verify(&auth_digest, action.authorization())
+                                .map_err(|_| {
+                                    ChainError::State(format!(
+                                        "spend auth signature verification failed for action {idx}"
+                                    ))
+                                })?;
+                        }
+
+                        // Verify binding signature over auth_digest
+                        bundle
+                            .binding_validating_key()
+                            .verify(&auth_digest, bundle.authorization().binding_signature())
+                            .map_err(|_| {
+                                ChainError::State("binding signature verification failed".into())
+                            })?;
+
+                        // Anchor verification against active 10-block ancestor window
+                        let anchor = Hash::new(bundle.anchor().to_bytes());
+                        if !valid_anchors.contains(&anchor) {
+                            return Err(ChainError::State(format!(
+                                "anchor {} not in 10-block ancestor window",
+                                anchor.to_hex()
+                            )));
+                        }
+
+                        // Nullifiers check (real and dummy)
+                        let mut tx_nfs = Vec::new();
+                        for act in bundle.actions() {
+                            let nf = Hash::new(act.nullifier().to_bytes());
+                            if tx_nfs.contains(&nf) {
+                                return Err(ChainError::State(
+                                    "duplicate nullifier within transaction".into(),
+                                ));
+                            }
+                            if candidate_nullifiers.contains(&nf) {
+                                return Err(ChainError::State("nullifier double-spend".into()));
+                            }
+                            tx_nfs.push(nf);
+                        }
+
+                        // Shielded pool balance check
+                        if candidate_pool_balance < total_deshield {
+                            return Err(ChainError::State(format!(
+                                "insufficient shielded pool balance: {candidate_pool_balance} < {total_deshield}"
+                            )));
+                        }
+
+                        // State transitions
+                        // 1. Debit shielded pool balance
+                        candidate_pool_balance = candidate_pool_balance
+                            .checked_sub(total_deshield)
+                            .ok_or_else(|| {
+                                ChainError::State("shielded pool balance underflow".into())
+                            })?;
+
+                        // 2. Credit transparent recipient
+                        let rec = candidate_accounts.entry(recipient).or_default();
+                        rec.balance = rec.balance.checked_add(release_amount).ok_or_else(|| {
+                            ChainError::State("recipient balance overflow".into())
+                        })?;
+
+                        // 3. Record same-block incoming credit (locks funds from being spent in the same block)
+                        let inc = same_block_incoming.entry(recipient).or_default();
+                        *inc = inc.checked_add(release_amount).ok_or_else(|| {
+                            ChainError::State("same-block incoming overflow".into())
+                        })?;
+
+                        // 4. Accumulate block fees
+                        block_fees = block_fees.checked_add(fee_atoms).ok_or_else(|| {
+                            ChainError::State("block fee accumulation overflow".into())
+                        })?;
+
+                        // 5. Extend candidate nullifiers
+                        candidate_nullifiers.extend(tx_nfs);
+
+                        // 6. Append output commitments to Orchard tree if outputs are enabled
+                        if bundle.flags().outputs_enabled() {
+                            for act in bundle.actions() {
+                                candidate_tree.append(act.cmx());
+                            }
+                        }
                     }
 
                     _ => {

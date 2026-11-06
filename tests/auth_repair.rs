@@ -1684,7 +1684,12 @@ fn test_type7_shielded_to_transparent_consensus_gate() {
     let cb102 = make_coinbase(id, 102, miner.address, 20_000);
     let b102 = make_candidate_block(&state, ts, vec![cb102, raw_tx7]);
     let err = state.apply_block(&b102).unwrap_err();
-    assert!(err.to_string().contains("consensus safety gate: Type 7"));
+    assert!(matches!(
+        err,
+        ownchain::chain::ChainError::Invalid(
+            ownchain::validation::ValidationError::InvalidOrchardTransaction { .. }
+        )
+    ));
 
     // Verify State Atomicity: Alice's balance, pool balance, height unchanged
     let alice_acc = state.account(&alice.address).unwrap();
