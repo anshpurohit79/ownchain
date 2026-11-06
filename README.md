@@ -1,9 +1,9 @@
 # OwnChain (v1 Baseline)
 
-Experimental Rust implementation of the OwnChain v1 consensus and proof-of-work protocol baseline specified in [`docs/protocol-v1.md`](docs/protocol-v1.md).
+Experimental Rust implementation of the OwnChain v1 consensus, node runtime, and proof-of-work protocol baseline specified in [`docs/protocol-v1.md`](docs/protocol-v1.md).
 
 > [!NOTE]
-> **Experimental status:** This repository contains consensus primitives, chain-state verification, difficulty retargeting arithmetic, RandomX proof-of-work integration, and consensus-integrated stateless Orchard shielded transaction verification. It is **not** a functioning peer-to-peer network, has no wallet or persistent database, does not enforce stateful Orchard anchor/nullifier checks, and is **not** a production-ready cryptocurrency.
+> **Experimental status:** This repository implements the complete OwnChain M1-H hybrid consensus engine (shielded Orchard V2 and transparent account ledger, stateful anchors and nullifiers, cross-pool value conservation, composite state root) and the M1-I node runtime (embedded persistent storage, libp2p P2P networking, block synchronization, and mempool). It does **not** include wallet key management, note scanning, or a standalone mining daemon, and is **not** a production-ready cryptocurrency.
 
 ---
 
@@ -40,9 +40,23 @@ Experimental Rust implementation of the OwnChain v1 consensus and proof-of-work 
 
 6. **Consensus-Integrated Stateless Orchard Verification (M1-E Stage 2):**
    - **Block Validation Integration:** All candidate block transactions are validated through `validate_transaction_stateless` using the block's chain ID and pinned verifying key, returning structured `ValidationError::InvalidOrchardTransaction { index, error }`.
-   - **Per-Transaction Fee Enforcement (§4):** Checked arithmetic verification that declared fee equals $\max(1\,000,\, 1\,000 \times \text{action\_count} + \text{canonical\_tx\_size})$.
+   - **Per-Transaction Fee Enforcement (§5, §7.6):** Checked arithmetic verification that declared fee satisfies the protocol minimum fee rule: $\text{fee} \ge \max(1\text{ atom},\, 100 \times \text{canonical\_signed\_tx\_size})$.
    - **Aggregate Block Action Limit:** Early aggregate action counting against `MAX_ACTIONS_PER_BLOCK` (2,000 actions per block) to prevent proof verification resource exhaustion.
    - **Atomic State Preservation:** `ChainState::apply_block` guarantees failure of any transaction rejects the candidate block without mutating accepted state.
+
+7. **Cross-Pool Consensus Integration & Hybrid Ledger (M1-H):**
+   - **Composite State Root Verification:** 32-byte header commitment uniting RFC 6962-style transparent account tree, depth-32 incremental Orchard commitment tree, recursive-split nullifier tree, and pool balance commitment.
+   - **Stateful Shielded Accounting:** Cumulative nullifier set for double-spend prevention, 10-block ancestor anchor window $[h-10, h-1]$, and cumulative shielded pool balance tracking.
+   - **Transparent Account Ledger:** Ed25519 addresses, sequential nonces, spend allowances, delayed withdrawals, per-transfer pending locks, opt-in 7-guardian governance (3-of-7 and 4-of-7 quorums), and 100-block coinbase maturity tranches.
+   - **Atomic Cross-Pool Transfers:** Type 6 (Transparent-to-Shielded) and Type 7 (Shielded-to-Transparent) transfers with strict value conservation ($T + S = I$) and cross-pool authorization digests.
+   - **Reorganization Rollback:** Exact historical state snapshots enabling atomic reorganization rollback.
+
+8. **Node Runtime, Persistence and P2P Networking (M1-I):**
+   - Modular node runtime architecture (`node`, `storage`, `p2p`, `mempool`).
+   - Persistent embedded block and branch storage with atomic crash-safe commits and deterministic startup state reconstruction.
+   - Rust libp2p networking with TCP transport, Noise security, Yamux multiplexing, Gossipsub message propagation, and Kademlia DHT discovery.
+   - Chain synchronization protocol with cumulative proof-of-work chain selection and atomic branch reorganization.
+   - Bounded mempool with stateful admission, double-spend/conflict detection, and reorganization revalidation.
 
 ---
 
@@ -50,14 +64,9 @@ Experimental Rust implementation of the OwnChain v1 consensus and proof-of-work 
 
 The following components belong to later milestones and are explicitly **out of scope / incomplete**:
 
-- **Stateful Orchard Consensus Protections:**
-  - *Historical Anchor Validation:* Transaction anchors are checked for canonical field encoding, but are not yet validated against historical Orchard commitment tree roots.
-  - *Nullifier Set & Double-Spend Prevention:* Nullifiers are not yet tracked in `ChainState` or checked against historical nullifiers on the active chain.
-  - *Incremental Commitment Tree & Header Root Enforcement:* Block headers currently require `EMPTY_ORCHARD_ROOT` pending implementation of the incremental Orchard commitment tree.
-  - *Pool Balance & Subsidy Accounting:* `ChainState` does not yet account for shielded pool value balances or block subsidy limits.
-- **P2P Networking:** No libp2p transport, gossipsub, bootstrap discovery, or synchronization protocols are active yet.
-- **Mempool & Storage:** Transactions and blocks are validated against in-memory `ChainState`; there is no transaction pool or on-disk database engine.
-- **Wallet & Mining Client:** No key management, note scanning, or standalone mining client exists.
+- **Wallet Software:** Key management, BIP-39 seed generation, Orchard note scanning, and user-facing shielded transaction creation belong to a dedicated wallet milestone.
+- **Mining Daemon:** RandomX mining daemon, miner thread orchestration, and stratum/pool RPCs belong to a dedicated mining milestone. The node runtime validates proof of work on received blocks but does not mine.
+- **Production Network Launch:** Devnet proof-of-work uses the development salt `OwnChain-PoW-v1`. Production PoW configuration review, public testnet, and mainnet launch are future release gates. No claim of production readiness is made.
 
 ---
 

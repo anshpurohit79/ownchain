@@ -1,0 +1,1239 @@
+//! Mempool: bounded pending transaction management and admission.
+//!
+//! Enforces canonical decoding, network chain ID validation, exact minimum fees,
+//! stateless cryptographic verification, stateful nonce and spendable-balance checks,
+//! 10-block Orchard anchor window policy, nullifier conflict detection, and
+//! automatic revalidation after block inclusion or reorganization.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::account::{derive_address, AccountState};
+use crate::chain::ChainState;
+use crate::hash::{self, Hash};
+use crate::orchard_root::empty_commitment_root;
+use crate::orchard_tx::{
+    compute_type6_bundle_auth_digest, compute_type7_bundle_auth_digest, deserialize_bundle,
+    validate_bundle_stateless, verifying_key, BundleCodecError, OrchardValidationError,
+};
+use crate::tx::{self, min_fee, parse_envelope, transaction_fee, EnvelopeError, TxType};
+
+/// Default maximum number of transactions allowed in the mempool.
+pub const DEFAULT_MAX_MEMPOOL_TRANSACTIONS: usize = 5_000;
+
+/// Default maximum cumulative memory usage (in bytes) allowed for the mempool.
+pub const DEFAULT_MAX_MEMPOOL_BYTES: usize = 10_000_000;
+
+/// Configuration parameters for the mempool.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MempoolConfig {
+    /// Maximum count of admitted transactions.
+    pub max_transactions: usize,
+    /// Maximum total serialized byte size of admitted transactions.
+    pub max_bytes: usize,
+}
+
+impl Default for MempoolConfig {
+    fn default() -> Self {
+        Self {
+            max_transactions: DEFAULT_MAX_MEMPOOL_TRANSACTIONS,
+            max_bytes: DEFAULT_MAX_MEMPOOL_BYTES,
+        }
+    }
+}
+
+/// Errors that prevent transaction admission into the mempool.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum MempoolError {
+    /// Invalid transaction envelope.
+    Envelope(EnvelopeError),
+    /// Coinbase transactions cannot be admitted to the mempool.
+    CoinbaseForbidden,
+    /// Transaction fee is below protocol minimum fee.
+    FeeBelowMinimum { fee: u64, min: u64 },
+    /// Transaction already exists in the mempool.
+    AlreadyInMempool(Hash),
+    /// Transaction has already been included on the active chain.
+    AlreadyOnChain(Hash),
+    /// Mempool transaction count or byte capacity exceeded.
+    MempoolFull,
+    /// Sender transparent account does not exist or has zero balance.
+    AccountNotFound(Hash),
+    /// Sender transparent account is frozen by guardians.
+    AccountFrozen(Hash),
+    /// Nonce mismatch or conflicting pending nonce.
+    ConflictingNonce {
+        account: Hash,
+        expected: u64,
+        found: u64,
+    },
+    /// Insufficient spendable balance to cover amount and fees.
+    InsufficientSpendableBalance {
+        account: Hash,
+        spendable: u128,
+        required: u128,
+    },
+    /// Spend allowance exceeded for active window.
+    AllowanceExceeded(String),
+    /// Cryptographic signature verification failed.
+    InvalidSignature(String),
+    /// Orchard bundle decoding error.
+    BundleCodec(BundleCodecError),
+    /// Orchard stateless validation error (proof or signature).
+    OrchardValidation(OrchardValidationError),
+    /// Orchard anchor is outside the active 10-block ancestor window.
+    StaleAnchor(Hash),
+    /// Nullifier has already been spent on-chain.
+    NullifierAlreadySpent(Hash),
+    /// Nullifier conflicts with another pending transaction in the mempool.
+    ConflictingNullifier { nullifier: Hash, existing_tx: Hash },
+    /// Total deshield amount exceeds shielded pool balance.
+    InsufficientShieldedPoolBalance { available: u128, required: u128 },
+    /// Malformed transaction payload or guardian signatures.
+    Malformed(String),
+}
+
+impl core::fmt::Display for MempoolError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            MempoolError::Envelope(e) => write!(f, "invalid envelope: {e}"),
+            MempoolError::CoinbaseForbidden => write!(f, "coinbase transactions cannot enter mempool"),
+            MempoolError::FeeBelowMinimum { fee, min } => {
+                write!(f, "fee {fee} below minimum required {min}")
+            }
+            MempoolError::AlreadyInMempool(h) => write!(f, "transaction {h} already in mempool"),
+            MempoolError::AlreadyOnChain(h) => write!(f, "transaction {h} already on chain"),
+            MempoolError::MempoolFull => write!(f, "mempool capacity exceeded"),
+            MempoolError::AccountNotFound(a) => write!(f, "account {a} not found"),
+            MempoolError::AccountFrozen(a) => write!(f, "account {a} is frozen"),
+            MempoolError::ConflictingNonce {
+                account,
+                expected,
+                found,
+            } => write!(
+                f,
+                "nonce conflict for account {account}: expected {expected}, found {found}"
+            ),
+            MempoolError::InsufficientSpendableBalance {
+                account,
+                spendable,
+                required,
+            } => write!(
+                f,
+                "insufficient spendable balance for {account}: spendable {spendable}, required {required}"
+            ),
+            MempoolError::AllowanceExceeded(s) => write!(f, "allowance exceeded: {s}"),
+            MempoolError::InvalidSignature(s) => write!(f, "invalid signature: {s}"),
+            MempoolError::BundleCodec(e) => write!(f, "bundle codec error: {e:?}"),
+            MempoolError::OrchardValidation(e) => write!(f, "orchard validation error: {e:?}"),
+            MempoolError::StaleAnchor(a) => write!(f, "stale anchor {a} outside 10-block window"),
+            MempoolError::NullifierAlreadySpent(n) => write!(f, "nullifier {n} already spent on chain"),
+            MempoolError::ConflictingNullifier {
+                nullifier,
+                existing_tx,
+            } => write!(
+                f,
+                "nullifier {nullifier} conflicts with pending tx {existing_tx}"
+            ),
+            MempoolError::InsufficientShieldedPoolBalance {
+                available,
+                required,
+            } => write!(
+                f,
+                "insufficient shielded pool balance: available {available}, required {required}"
+            ),
+            MempoolError::Malformed(s) => write!(f, "malformed transaction: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for MempoolError {}
+
+impl From<EnvelopeError> for MempoolError {
+    fn from(e: EnvelopeError) -> Self {
+        MempoolError::Envelope(e)
+    }
+}
+
+impl From<BundleCodecError> for MempoolError {
+    fn from(e: BundleCodecError) -> Self {
+        MempoolError::BundleCodec(e)
+    }
+}
+
+impl From<OrchardValidationError> for MempoolError {
+    fn from(e: OrchardValidationError) -> Self {
+        MempoolError::OrchardValidation(e)
+    }
+}
+
+/// Metadata recorded for an admitted transaction.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct AdmittedTxMeta {
+    tx_type: TxType,
+    size: usize,
+    fee: u64,
+    sender_account: Option<Hash>,
+    account_nonce: Option<u64>,
+    account_spend: u128,
+    nullifiers: Vec<Hash>,
+    deshield_amount: u128,
+}
+
+/// A transaction memory pool for valid unconfirmed transactions.
+pub struct Mempool {
+    config: MempoolConfig,
+    /// Admitted transactions indexed by transaction ID.
+    transactions: BTreeMap<Hash, Vec<u8>>,
+    /// Metadata for admitted transactions.
+    tx_meta: BTreeMap<Hash, AdmittedTxMeta>,
+    /// Insertion order for FIFO / tie-break tracking.
+    insertion_order: Vec<Hash>,
+    /// Total bytes of raw transactions currently stored.
+    total_bytes: usize,
+    /// Pending nonces tracked per account: `account -> set of nonces`.
+    account_nonces: BTreeMap<Hash, BTreeSet<u64>>,
+    /// Pending transparent spend (amount + fee) tracked per account.
+    account_spends: BTreeMap<Hash, u128>,
+    /// Pending nullifiers mapped to the transaction ID that spends them.
+    mempool_nullifiers: BTreeMap<Hash, Hash>,
+    /// Total deshield amount currently pending across Type 7 transactions.
+    total_pending_deshield: u128,
+}
+
+impl Mempool {
+    /// Creates a new mempool with default configuration.
+    pub fn new() -> Self {
+        Self::with_config(MempoolConfig::default())
+    }
+
+    /// Creates a new mempool with custom configuration.
+    pub fn with_config(config: MempoolConfig) -> Self {
+        Self {
+            config,
+            transactions: BTreeMap::new(),
+            tx_meta: BTreeMap::new(),
+            insertion_order: Vec::new(),
+            total_bytes: 0,
+            account_nonces: BTreeMap::new(),
+            account_spends: BTreeMap::new(),
+            mempool_nullifiers: BTreeMap::new(),
+            total_pending_deshield: 0,
+        }
+    }
+
+    /// Returns the number of transactions currently in the mempool.
+    pub fn len(&self) -> usize {
+        self.transactions.len()
+    }
+
+    /// Returns `true` if the mempool contains no transactions.
+    pub fn is_empty(&self) -> bool {
+        self.transactions.is_empty()
+    }
+
+    /// Returns the total serialized byte size of transactions in the mempool.
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    /// Checks if a transaction ID is present in the mempool.
+    pub fn contains(&self, tx_id: &Hash) -> bool {
+        self.transactions.contains_key(tx_id)
+    }
+
+    /// Retrieves canonical bytes for a pending transaction by its ID.
+    pub fn get(&self, tx_id: &Hash) -> Option<&[u8]> {
+        self.transactions.get(tx_id).map(|v| v.as_slice())
+    }
+
+    /// Returns all transaction IDs currently in the mempool.
+    pub fn transaction_ids(&self) -> Vec<Hash> {
+        self.transactions.keys().copied().collect()
+    }
+
+    /// Returns all raw transactions currently in the mempool, in insertion order.
+    pub fn all_transactions(&self) -> Vec<Vec<u8>> {
+        self.insertion_order
+            .iter()
+            .filter_map(|id| self.transactions.get(id).cloned())
+            .collect()
+    }
+
+    /// Validates and admits a transaction into the mempool.
+    ///
+    /// The transaction is validated against the active consensus state and checked
+    /// for conflicts against other pending transactions. Admitting a transaction does
+    /// not mutate the chain state.
+    pub fn admit(&mut self, raw_tx: &[u8], chain_state: &ChainState) -> Result<Hash, MempoolError> {
+        let tx_id = hash::transaction_id(raw_tx);
+
+        if self.transactions.contains_key(&tx_id) {
+            return Err(MempoolError::AlreadyInMempool(tx_id));
+        }
+
+        if chain_state
+            .accepted_transaction_ids()
+            .binary_search(&tx_id)
+            .is_ok()
+        {
+            return Err(MempoolError::AlreadyOnChain(tx_id));
+        }
+
+        // Bounded capacity checks
+        if self.transactions.len() >= self.config.max_transactions {
+            return Err(MempoolError::MempoolFull);
+        }
+        let new_total_bytes = self
+            .total_bytes
+            .checked_add(raw_tx.len())
+            .ok_or(MempoolError::MempoolFull)?;
+        if new_total_bytes > self.config.max_bytes {
+            return Err(MempoolError::MempoolFull);
+        }
+
+        // Envelope validation
+        let env = parse_envelope(raw_tx, chain_state.chain_id())?;
+
+        if env.tx_type == TxType::Coinbase {
+            return Err(MempoolError::CoinbaseForbidden);
+        }
+
+        // Minimum fee validation
+        let fee = transaction_fee(raw_tx)
+            .ok_or_else(|| MempoolError::Malformed("unable to read transaction fee".into()))?;
+        let min = min_fee(raw_tx.len())
+            .ok_or_else(|| MempoolError::Malformed("transaction too large for fee rules".into()))?;
+        if fee < min {
+            return Err(MempoolError::FeeBelowMinimum { fee, min });
+        }
+
+        // Type-specific stateful and conflict validation
+        let meta = self.validate_and_build_meta(raw_tx, &env, fee, chain_state)?;
+
+        // Register in mempool state
+        if let Some(acct) = meta.sender_account {
+            if let Some(n) = meta.account_nonce {
+                self.account_nonces.entry(acct).or_default().insert(n);
+            }
+            if meta.account_spend > 0 {
+                let current = self.account_spends.entry(acct).or_default();
+                *current = current.saturating_add(meta.account_spend);
+            }
+        }
+
+        for nf in &meta.nullifiers {
+            self.mempool_nullifiers.insert(*nf, tx_id);
+        }
+
+        if meta.deshield_amount > 0 {
+            self.total_pending_deshield = self
+                .total_pending_deshield
+                .saturating_add(meta.deshield_amount);
+        }
+
+        self.total_bytes = new_total_bytes;
+        self.transactions.insert(tx_id, raw_tx.to_vec());
+        self.tx_meta.insert(tx_id, meta);
+        self.insertion_order.push(tx_id);
+
+        Ok(tx_id)
+    }
+
+    /// Internal validation and metadata construction for candidate transaction.
+    fn validate_and_build_meta(
+        &self,
+        raw_tx: &[u8],
+        env: &crate::tx::TxEnvelope,
+        fee: u64,
+        chain_state: &ChainState,
+    ) -> Result<AdmittedTxMeta, MempoolError> {
+        let tip_h = chain_state.tip_height().unwrap_or(0);
+        let active_anchors = self.active_anchor_set(chain_state);
+
+        match env.tx_type {
+            TxType::Coinbase => Err(MempoolError::CoinbaseForbidden),
+
+            TxType::TransparentTransfer => {
+                if raw_tx.len() != 195 {
+                    return Err(MempoolError::Malformed("invalid Type 1 length".into()));
+                }
+                let payload = &raw_tx[tx::TX_ENVELOPE_LEN..];
+                let mut sender_key = [0u8; 32];
+                sender_key.copy_from_slice(&payload[0..32]);
+                let sender_addr = derive_address(&sender_key);
+
+                let amount = u128::from_le_bytes(payload[64..80].try_into().unwrap());
+                let nonce = u64::from_le_bytes(payload[88..96].try_into().unwrap());
+
+                // Signature check
+                let unsigned_preimage =
+                    crate::auth::compute_signing_preimage(chain_state.chain_id(), &raw_tx[..131]);
+                let sig: [u8; 64] = raw_tx[131..195].try_into().unwrap();
+                crate::auth::verify_signature(&sender_key, &unsigned_preimage, &sig)
+                    .map_err(|e| MempoolError::InvalidSignature(e.to_string()))?;
+
+                // Account state checks
+                let acct = chain_state
+                    .account(&sender_addr)
+                    .ok_or(MempoolError::AccountNotFound(sender_addr))?;
+                if acct.is_frozen {
+                    return Err(MempoolError::AccountFrozen(sender_addr));
+                }
+
+                // Sequential nonce validation
+                let expected_nonce = self.expected_next_nonce(&sender_addr, acct.nonce);
+                if nonce != expected_nonce {
+                    return Err(MempoolError::ConflictingNonce {
+                        account: sender_addr,
+                        expected: expected_nonce,
+                        found: nonce,
+                    });
+                }
+
+                // Spendable balance validation
+                let total_spend = amount
+                    .checked_add(fee as u128)
+                    .ok_or_else(|| MempoolError::Malformed("spend overflow".into()))?;
+                let current_pending = self.account_spends.get(&sender_addr).copied().unwrap_or(0);
+                let needed = current_pending
+                    .checked_add(total_spend)
+                    .ok_or_else(|| MempoolError::Malformed("spend overflow".into()))?;
+                let spendable = acct
+                    .spendable_balance(tip_h)
+                    .map_err(|_| MempoolError::Malformed("spendable balance calculation".into()))?;
+                if needed > spendable {
+                    return Err(MempoolError::InsufficientSpendableBalance {
+                        account: sender_addr,
+                        spendable,
+                        required: needed,
+                    });
+                }
+
+                // Check spend allowance
+                check_mempool_allowance(acct, tip_h, total_spend)?;
+
+                Ok(AdmittedTxMeta {
+                    tx_type: env.tx_type,
+                    size: raw_tx.len(),
+                    fee,
+                    sender_account: Some(sender_addr),
+                    account_nonce: Some(nonce),
+                    account_spend: total_spend,
+                    nullifiers: Vec::new(),
+                    deshield_amount: 0,
+                })
+            }
+
+            TxType::ConfigureGuardians => {
+                if raw_tx.len() < 436 {
+                    return Err(MempoolError::Malformed("invalid Type 2 length".into()));
+                }
+                let payload = &raw_tx[tx::TX_ENVELOPE_LEN..];
+                let mut account_key = [0u8; 32];
+                account_key.copy_from_slice(&payload[..32]);
+                let account_addr = derive_address(&account_key);
+                let nonce = u64::from_le_bytes(payload[32..40].try_into().unwrap());
+
+                let mut new_guardians = [[0u8; 32]; 7];
+                for i in 0..7 {
+                    new_guardians[i].copy_from_slice(&payload[48 + i * 32..48 + (i + 1) * 32]);
+                }
+                crate::auth::validate_guardian_keys_set(&new_guardians)
+                    .map_err(|e| MempoolError::Malformed(format!("invalid guardian keys: {e}")))?;
+
+                let acct = chain_state
+                    .account(&account_addr)
+                    .ok_or(MempoolError::AccountNotFound(account_addr))?;
+                if acct.is_frozen {
+                    return Err(MempoolError::AccountFrozen(account_addr));
+                }
+
+                let expected_nonce = self.expected_next_nonce(&account_addr, acct.nonce);
+                if nonce != expected_nonce {
+                    return Err(MempoolError::ConflictingNonce {
+                        account: account_addr,
+                        expected: expected_nonce,
+                        found: nonce,
+                    });
+                }
+
+                let current_pending = self.account_spends.get(&account_addr).copied().unwrap_or(0);
+                let needed = current_pending
+                    .checked_add(fee as u128)
+                    .ok_or_else(|| MempoolError::Malformed("fee overflow".into()))?;
+                let spendable = acct
+                    .spendable_balance(tip_h)
+                    .map_err(|_| MempoolError::Malformed("spendable balance".into()))?;
+                if needed > spendable {
+                    return Err(MempoolError::InsufficientSpendableBalance {
+                        account: account_addr,
+                        spendable,
+                        required: needed,
+                    });
+                }
+
+                Ok(AdmittedTxMeta {
+                    tx_type: env.tx_type,
+                    size: raw_tx.len(),
+                    fee,
+                    sender_account: Some(account_addr),
+                    account_nonce: Some(nonce),
+                    account_spend: fee as u128,
+                    nullifiers: Vec::new(),
+                    deshield_amount: 0,
+                })
+            }
+
+            TxType::GuardianAction => {
+                let payload = &raw_tx[tx::TX_ENVELOPE_LEN..];
+                if payload.len() < 42 {
+                    return Err(MempoolError::Malformed("invalid Type 3 length".into()));
+                }
+                let mut target_key = [0u8; 32];
+                target_key.copy_from_slice(&payload[..32]);
+                let target_addr = derive_address(&target_key);
+
+                let acct = chain_state
+                    .account(&target_addr)
+                    .ok_or(MempoolError::AccountNotFound(target_addr))?;
+                if !acct.guardian_enabled {
+                    return Err(MempoolError::Malformed("guardians not enabled".into()));
+                }
+
+                Ok(AdmittedTxMeta {
+                    tx_type: env.tx_type,
+                    size: raw_tx.len(),
+                    fee,
+                    sender_account: Some(target_addr),
+                    account_nonce: None,
+                    account_spend: fee as u128,
+                    nullifiers: Vec::new(),
+                    deshield_amount: 0,
+                })
+            }
+
+            TxType::CancelPendingTransfer => {
+                if raw_tx.len() < 180 {
+                    return Err(MempoolError::Malformed("invalid Type 4 length".into()));
+                }
+                let payload = &raw_tx[tx::TX_ENVELOPE_LEN..];
+                let mut sender_key = [0u8; 32];
+                sender_key.copy_from_slice(&payload[..32]);
+                let sender_addr = derive_address(&sender_key);
+                let transfer_id = Hash::new(payload[32..64].try_into().unwrap());
+                let nonce = u64::from_le_bytes(payload[72..80].try_into().unwrap());
+
+                let acct = chain_state
+                    .account(&sender_addr)
+                    .ok_or(MempoolError::AccountNotFound(sender_addr))?;
+                if acct.is_frozen {
+                    return Err(MempoolError::AccountFrozen(sender_addr));
+                }
+
+                // Verify pending transfer exists
+                if !acct
+                    .pending_transfers
+                    .iter()
+                    .any(|p| p.transfer_id == transfer_id)
+                {
+                    return Err(MempoolError::Malformed(
+                        "pending transfer not found on account".into(),
+                    ));
+                }
+
+                let expected_nonce = self.expected_next_nonce(&sender_addr, acct.nonce);
+                if nonce != expected_nonce {
+                    return Err(MempoolError::ConflictingNonce {
+                        account: sender_addr,
+                        expected: expected_nonce,
+                        found: nonce,
+                    });
+                }
+
+                Ok(AdmittedTxMeta {
+                    tx_type: env.tx_type,
+                    size: raw_tx.len(),
+                    fee,
+                    sender_account: Some(sender_addr),
+                    account_nonce: Some(nonce),
+                    account_spend: fee as u128,
+                    nullifiers: Vec::new(),
+                    deshield_amount: 0,
+                })
+            }
+
+            TxType::ShieldedTransfer => {
+                let payload = &raw_tx[tx::TX_ENVELOPE_LEN..];
+                if payload.len() < 8 {
+                    return Err(MempoolError::Malformed("truncated Type 5".into()));
+                }
+                let bundle_bytes = &payload[8..];
+                let bundle = deserialize_bundle(bundle_bytes)?;
+
+                let vk = verifying_key();
+                validate_bundle_stateless(env, fee, &bundle, vk)?;
+
+                // Anchor verification
+                let anchor = Hash::new(bundle.anchor().to_bytes());
+                if !active_anchors.contains(&anchor) {
+                    return Err(MempoolError::StaleAnchor(anchor));
+                }
+
+                // Nullifier extraction and conflict check
+                let mut nfs = Vec::with_capacity(bundle.actions().len());
+                for action in bundle.actions() {
+                    let nf = Hash::new(action.nullifier().to_bytes());
+                    if chain_state.nullifier_set().contains(&nf) {
+                        return Err(MempoolError::NullifierAlreadySpent(nf));
+                    }
+                    if let Some(existing_tx) = self.mempool_nullifiers.get(&nf) {
+                        return Err(MempoolError::ConflictingNullifier {
+                            nullifier: nf,
+                            existing_tx: *existing_tx,
+                        });
+                    }
+                    nfs.push(nf);
+                }
+
+                Ok(AdmittedTxMeta {
+                    tx_type: env.tx_type,
+                    size: raw_tx.len(),
+                    fee,
+                    sender_account: None,
+                    account_nonce: None,
+                    account_spend: 0,
+                    nullifiers: nfs,
+                    deshield_amount: 0,
+                })
+            }
+
+            TxType::TransparentToShielded => {
+                let payload = &raw_tx[tx::TX_ENVELOPE_LEN..];
+                if payload.len() < 133 {
+                    return Err(MempoolError::Malformed("truncated Type 6".into()));
+                }
+                let mut sender_key = [0u8; 32];
+                sender_key.copy_from_slice(&payload[..32]);
+                let sender_addr = derive_address(&sender_key);
+                let nonce = u64::from_le_bytes(payload[32..40].try_into().unwrap());
+                let shielded_amount = u128::from_le_bytes(payload[40..56].try_into().unwrap());
+                if shielded_amount == 0 {
+                    return Err(MempoolError::Malformed(
+                        "shielded amount must be > 0".into(),
+                    ));
+                }
+
+                let bundle_len = u32::from_le_bytes(payload[64..68].try_into().unwrap()) as usize;
+                let bundle_end = 68 + bundle_len;
+                let sig_end = bundle_end + 64;
+                if payload.len() < sig_end + 1 {
+                    return Err(MempoolError::Malformed(
+                        "truncated Type 6 bundle/sig".into(),
+                    ));
+                }
+
+                let bundle_bytes = &payload[68..bundle_end];
+                let bundle = deserialize_bundle(bundle_bytes)?;
+
+                if *bundle.flags() != orchard::bundle::Flags::SPENDS_DISABLED {
+                    return Err(MempoolError::Malformed(
+                        "Type 6 requires SPENDS_DISABLED".into(),
+                    ));
+                }
+                if *bundle.anchor() != orchard::tree::Anchor::empty_tree() {
+                    return Err(MempoolError::Malformed(
+                        "Type 6 anchor must be empty tree".into(),
+                    ));
+                }
+
+                // Stateless bundle proof check
+                let vk = verifying_key();
+                bundle.verify_proof(vk).map_err(|e| {
+                    OrchardValidationError::ProofVerificationFailed(format!("{e:?}"))
+                })?;
+
+                // Sender signature check over cross-pool auth digest
+                let auth_digest = compute_type6_bundle_auth_digest(
+                    *chain_state.chain_id().as_bytes(),
+                    1,
+                    sender_key,
+                    nonce,
+                    shielded_amount,
+                    fee,
+                    &bundle,
+                );
+                let mut sender_sig = [0u8; 64];
+                sender_sig.copy_from_slice(&payload[bundle_end..sig_end]);
+                crate::auth::verify_signature(&sender_key, &auth_digest, &sender_sig)
+                    .map_err(|e| MempoolError::InvalidSignature(e.to_string()))?;
+
+                // Binding signature verification over auth_digest
+                bundle
+                    .binding_validating_key()
+                    .verify(&auth_digest, bundle.authorization().binding_signature())
+                    .map_err(|_| MempoolError::InvalidSignature("binding signature".into()))?;
+
+                let acct = chain_state
+                    .account(&sender_addr)
+                    .ok_or(MempoolError::AccountNotFound(sender_addr))?;
+                if acct.is_frozen {
+                    return Err(MempoolError::AccountFrozen(sender_addr));
+                }
+
+                // If guardians enabled, verify 4-of-7 quorum
+                if acct.guardian_enabled {
+                    let guardian_section = &payload[sig_end..];
+                    let entries = crate::auth::parse_guardian_sigs(guardian_section)
+                        .map_err(|e| MempoolError::Malformed(format!("guardian sigs: {e}")))?;
+                    crate::auth::verify_guardian_quorum(&acct.guardians, &auth_digest, &entries, 4)
+                        .map_err(|e| MempoolError::InvalidSignature(format!("quorum: {e}")))?;
+                }
+
+                // Nonce and spendable balance check
+                let expected_nonce = self.expected_next_nonce(&sender_addr, acct.nonce);
+                if nonce != expected_nonce {
+                    return Err(MempoolError::ConflictingNonce {
+                        account: sender_addr,
+                        expected: expected_nonce,
+                        found: nonce,
+                    });
+                }
+
+                let total_spend = shielded_amount
+                    .checked_add(fee as u128)
+                    .ok_or_else(|| MempoolError::Malformed("spend overflow".into()))?;
+                let current_pending = self.account_spends.get(&sender_addr).copied().unwrap_or(0);
+                let needed = current_pending
+                    .checked_add(total_spend)
+                    .ok_or_else(|| MempoolError::Malformed("spend overflow".into()))?;
+                let spendable = acct
+                    .spendable_balance(tip_h)
+                    .map_err(|_| MempoolError::Malformed("spendable balance".into()))?;
+                if needed > spendable {
+                    return Err(MempoolError::InsufficientSpendableBalance {
+                        account: sender_addr,
+                        spendable,
+                        required: needed,
+                    });
+                }
+
+                check_mempool_allowance(acct, tip_h, total_spend)?;
+
+                // Nullifier extraction
+                let mut nfs = Vec::with_capacity(bundle.actions().len());
+                for action in bundle.actions() {
+                    let nf = Hash::new(action.nullifier().to_bytes());
+                    if chain_state.nullifier_set().contains(&nf) {
+                        return Err(MempoolError::NullifierAlreadySpent(nf));
+                    }
+                    if let Some(existing_tx) = self.mempool_nullifiers.get(&nf) {
+                        return Err(MempoolError::ConflictingNullifier {
+                            nullifier: nf,
+                            existing_tx: *existing_tx,
+                        });
+                    }
+                    nfs.push(nf);
+                }
+
+                Ok(AdmittedTxMeta {
+                    tx_type: env.tx_type,
+                    size: raw_tx.len(),
+                    fee,
+                    sender_account: Some(sender_addr),
+                    account_nonce: Some(nonce),
+                    account_spend: total_spend,
+                    nullifiers: nfs,
+                    deshield_amount: 0,
+                })
+            }
+
+            TxType::ShieldedToTransparent => {
+                let payload = &raw_tx[tx::TX_ENVELOPE_LEN..];
+                if payload.len() < 60 {
+                    return Err(MempoolError::Malformed("truncated Type 7".into()));
+                }
+                let mut recipient_bytes = [0u8; 32];
+                recipient_bytes.copy_from_slice(&payload[..32]);
+
+                let release_amount = u128::from_le_bytes(payload[32..48].try_into().unwrap());
+                if release_amount == 0 {
+                    return Err(MempoolError::Malformed("release amount must be > 0".into()));
+                }
+
+                let bundle_len = u32::from_le_bytes(payload[56..60].try_into().unwrap()) as usize;
+                let expected_len = 60 + bundle_len;
+                if payload.len() != expected_len {
+                    return Err(MempoolError::Malformed(
+                        "invalid Type 7 bundle length".into(),
+                    ));
+                }
+
+                let bundle_bytes = &payload[60..expected_len];
+                let bundle = deserialize_bundle(bundle_bytes)?;
+
+                if !bundle.flags().spends_enabled() {
+                    return Err(MempoolError::Malformed(
+                        "Type 7 requires spends enabled".into(),
+                    ));
+                }
+
+                let vk = verifying_key();
+                bundle.verify_proof(vk).map_err(|e| {
+                    OrchardValidationError::ProofVerificationFailed(format!("{e:?}"))
+                })?;
+
+                // Anchor verification
+                let anchor = Hash::new(bundle.anchor().to_bytes());
+                if !active_anchors.contains(&anchor) {
+                    return Err(MempoolError::StaleAnchor(anchor));
+                }
+
+                // Cross-pool auth digest and signatures
+                let auth_digest = compute_type7_bundle_auth_digest(
+                    *chain_state.chain_id().as_bytes(),
+                    1,
+                    recipient_bytes,
+                    release_amount,
+                    fee,
+                    &bundle,
+                );
+                for (idx, action) in bundle.actions().iter().enumerate() {
+                    action
+                        .rk()
+                        .verify(&auth_digest, action.authorization())
+                        .map_err(|_| {
+                            MempoolError::InvalidSignature(format!("spend auth action {idx}"))
+                        })?;
+                }
+                bundle
+                    .binding_validating_key()
+                    .verify(&auth_digest, bundle.authorization().binding_signature())
+                    .map_err(|_| MempoolError::InvalidSignature("binding signature".into()))?;
+
+                // Shielded pool balance check
+                let total_deshield = release_amount
+                    .checked_add(fee as u128)
+                    .ok_or_else(|| MempoolError::Malformed("deshield overflow".into()))?;
+                let current_deshield = self
+                    .total_pending_deshield
+                    .checked_add(total_deshield)
+                    .ok_or_else(|| MempoolError::Malformed("deshield overflow".into()))?;
+                let pool_balance = chain_state.shielded_pool_balance();
+                if current_deshield > pool_balance {
+                    return Err(MempoolError::InsufficientShieldedPoolBalance {
+                        available: pool_balance,
+                        required: current_deshield,
+                    });
+                }
+
+                // Nullifiers
+                let mut nfs = Vec::with_capacity(bundle.actions().len());
+                for action in bundle.actions() {
+                    let nf = Hash::new(action.nullifier().to_bytes());
+                    if chain_state.nullifier_set().contains(&nf) {
+                        return Err(MempoolError::NullifierAlreadySpent(nf));
+                    }
+                    if let Some(existing_tx) = self.mempool_nullifiers.get(&nf) {
+                        return Err(MempoolError::ConflictingNullifier {
+                            nullifier: nf,
+                            existing_tx: *existing_tx,
+                        });
+                    }
+                    nfs.push(nf);
+                }
+
+                Ok(AdmittedTxMeta {
+                    tx_type: env.tx_type,
+                    size: raw_tx.len(),
+                    fee,
+                    sender_account: None,
+                    account_nonce: None,
+                    account_spend: 0,
+                    nullifiers: nfs,
+                    deshield_amount: total_deshield,
+                })
+            }
+        }
+    }
+
+    /// Computes the expected next nonce for `account`, taking pending mempool txs into account.
+    fn expected_next_nonce(&self, account: &Hash, committed_nonce: u64) -> u64 {
+        if let Some(nonces) = self.account_nonces.get(account) {
+            if let Some(&max_nonce) = nonces.iter().max() {
+                return max_nonce.saturating_add(1);
+            }
+        }
+        committed_nonce
+    }
+
+    /// Returns the set of valid anchors in the active 10-block ancestor window.
+    fn active_anchor_set(&self, chain_state: &ChainState) -> BTreeSet<Hash> {
+        let tip_h = chain_state.tip_height().unwrap_or(0);
+        let min_h = tip_h.saturating_sub(10);
+        let mut anchors = BTreeSet::new();
+        for h in min_h..=tip_h {
+            if let Some(anc) = chain_state.historical_anchors().get(&h) {
+                anchors.insert(*anc);
+            }
+        }
+        if tip_h <= 10 {
+            anchors.insert(empty_commitment_root());
+        }
+        anchors
+    }
+
+    /// Removes a transaction from the mempool by transaction ID.
+    pub fn remove(&mut self, tx_id: &Hash) -> Option<Vec<u8>> {
+        let raw_tx = self.transactions.remove(tx_id)?;
+        if let Some(meta) = self.tx_meta.remove(tx_id) {
+            self.total_bytes = self.total_bytes.saturating_sub(meta.size);
+            if let Some(acct) = meta.sender_account {
+                if let Some(nonce) = meta.account_nonce {
+                    if let Some(nonces) = self.account_nonces.get_mut(&acct) {
+                        nonces.remove(&nonce);
+                        if nonces.is_empty() {
+                            self.account_nonces.remove(&acct);
+                        }
+                    }
+                }
+                if let Some(spend) = self.account_spends.get_mut(&acct) {
+                    *spend = spend.saturating_sub(meta.account_spend);
+                    if *spend == 0 {
+                        self.account_spends.remove(&acct);
+                    }
+                }
+            }
+            for nf in meta.nullifiers {
+                self.mempool_nullifiers.remove(&nf);
+            }
+            if meta.deshield_amount > 0 {
+                self.total_pending_deshield = self
+                    .total_pending_deshield
+                    .saturating_sub(meta.deshield_amount);
+            }
+        }
+        self.insertion_order.retain(|id| id != tx_id);
+        Some(raw_tx)
+    }
+
+    /// Handles a new accepted block: removes confirmed transactions and revalidates remaining mempool.
+    pub fn on_block_accepted(&mut self, block: &crate::block::Block, chain_state: &ChainState) {
+        for tx in &block.transactions {
+            let tx_id = hash::transaction_id(tx);
+            self.remove(&tx_id);
+        }
+        self.revalidate(chain_state);
+    }
+
+    /// Handles a chain reorganization: revalidates all pending mempool transactions against `new_chain_state`.
+    pub fn on_reorganization(&mut self, new_chain_state: &ChainState) {
+        self.revalidate(new_chain_state);
+    }
+
+    /// Revalidates all mempool transactions against `chain_state`.
+    ///
+    /// Transactions that are no longer valid (e.g. stale nonces, spent nullifiers,
+    /// expired anchors, or depleted balances) are evicted.
+    pub fn revalidate(&mut self, chain_state: &ChainState) {
+        let current_txs: Vec<(Hash, Vec<u8>)> = self
+            .insertion_order
+            .iter()
+            .filter_map(|id| self.transactions.get(id).map(|tx| (*id, tx.clone())))
+            .collect();
+
+        // Clear tracking tables
+        self.transactions.clear();
+        self.tx_meta.clear();
+        self.insertion_order.clear();
+        self.total_bytes = 0;
+        self.account_nonces.clear();
+        self.account_spends.clear();
+        self.mempool_nullifiers.clear();
+        self.total_pending_deshield = 0;
+
+        for (_id, raw_tx) in current_txs {
+            // Attempt re-admission against new state
+            let _ = self.admit(&raw_tx, chain_state);
+        }
+    }
+}
+
+impl Default for Mempool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Validates spend allowance limits for an account.
+fn check_mempool_allowance(
+    account: &AccountState,
+    height: u64,
+    cost: u128,
+) -> Result<(), MempoolError> {
+    if account.allowance_limit > 0 && account.allowance_window_len > 0 {
+        let window_end = account
+            .allowance_window_start
+            .checked_add(account.allowance_window_len)
+            .ok_or_else(|| MempoolError::AllowanceExceeded("window overflow".into()))?;
+        let current_spent = if height >= window_end {
+            0
+        } else {
+            account.allowance_spent
+        };
+        let new_spent = current_spent
+            .checked_add(cost)
+            .ok_or_else(|| MempoolError::AllowanceExceeded("arithmetic overflow".into()))?;
+        if new_spent > account.allowance_limit {
+            return Err(MempoolError::AllowanceExceeded(
+                "spending limit would be exceeded".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::account::scheduled_subsidy;
+    use crate::block::Block;
+    use crate::genesis::DEVNET;
+    use crate::hash::{chain_id, transaction_id};
+    use crate::header::Header;
+    use crate::merkle;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn test_chain_id() -> Hash {
+        chain_id(DEVNET)
+    }
+
+    fn make_coinbase(chain_id: Hash, height: u64, miner_addr: [u8; 32]) -> Vec<u8> {
+        let mut tx = Vec::with_capacity(83);
+        tx.push(0); // Type 0: Coinbase
+        tx.extend_from_slice(&1u16.to_le_bytes());
+        tx.extend_from_slice(chain_id.as_bytes());
+        tx.extend_from_slice(&height.to_le_bytes());
+        tx.extend_from_slice(&miner_addr);
+        let payout = scheduled_subsidy(height) as u64;
+        tx.extend_from_slice(&payout.to_le_bytes());
+        tx
+    }
+
+    fn make_type1_tx(
+        chain_id: Hash,
+        sender_sk: &SigningKey,
+        recipient: Hash,
+        amount: u128,
+        fee: u64,
+        nonce: u64,
+    ) -> Vec<u8> {
+        let sender_pk = sender_sk.verifying_key().to_bytes();
+        let mut unsigned_tx = Vec::with_capacity(131);
+        unsigned_tx.push(1); // Type 1
+        unsigned_tx.extend_from_slice(&1u16.to_le_bytes());
+        unsigned_tx.extend_from_slice(chain_id.as_bytes());
+        unsigned_tx.extend_from_slice(&sender_pk);
+        unsigned_tx.extend_from_slice(recipient.as_bytes());
+        unsigned_tx.extend_from_slice(&amount.to_le_bytes());
+        unsigned_tx.extend_from_slice(&fee.to_le_bytes());
+        unsigned_tx.extend_from_slice(&nonce.to_le_bytes());
+
+        let preimage = crate::auth::compute_signing_preimage(chain_id, &unsigned_tx);
+        let sig = sender_sk.sign(&preimage);
+
+        let mut signed_tx = unsigned_tx;
+        signed_tx.extend_from_slice(&sig.to_bytes());
+        signed_tx
+    }
+
+    fn setup_chain_with_funded_account(miner_sk: &SigningKey) -> (ChainState, Block) {
+        let cid = test_chain_id();
+        let genesis = crate::genesis::genesis_block(cid);
+        let mut state = ChainState::from_genesis(&genesis).unwrap();
+
+        let miner_pk = miner_sk.verifying_key().to_bytes();
+        let miner_addr = derive_address(&miner_pk);
+
+        // Mine blocks 1 through 101 so block 1 coinbase matures (100 block maturity)
+        let mut prev_time = genesis.header.timestamp;
+        let mut last_block = genesis;
+        for h in 1..=101 {
+            prev_time += 120;
+            let cb = make_coinbase(cid, h, *miner_addr.as_bytes());
+            let cb_id = transaction_id(&cb);
+            let mut blk = Block {
+                header: Header {
+                    version: 1,
+                    chain_id: cid,
+                    height: h,
+                    parent_block_id: last_block.block_id(),
+                    transaction_root: merkle::tx_root(&[cb_id]),
+                    orchard_commitment_root: empty_commitment_root(),
+                    timestamp: prev_time,
+                    difficulty: state.expected_difficulty_for_next_block().unwrap_or(1),
+                    nonce: 0,
+                },
+                transactions: vec![cb],
+            };
+            let root = state
+                .simulate_candidate_state_root(&blk)
+                .expect("simulated state root");
+            blk.header.orchard_commitment_root = root;
+            state.apply_block(&blk).unwrap();
+            last_block = blk;
+        }
+
+        (state, last_block)
+    }
+
+    #[test]
+    fn test_reject_coinbase_in_mempool() {
+        let cid = test_chain_id();
+        let genesis = crate::genesis::genesis_block(cid);
+        let state = ChainState::from_genesis(&genesis).unwrap();
+        let cb = make_coinbase(cid, 1, [0x02; 32]);
+
+        let mut pool = Mempool::new();
+        let res = pool.admit(&cb, &state);
+        assert_eq!(res, Err(MempoolError::CoinbaseForbidden));
+    }
+
+    #[test]
+    fn test_reject_fee_below_minimum() {
+        let cid = test_chain_id();
+        let genesis = crate::genesis::genesis_block(cid);
+        let state = ChainState::from_genesis(&genesis).unwrap();
+
+        let sender_sk = SigningKey::from_bytes(&[0x11; 32]);
+        let recipient = Hash::new([0x22; 32]);
+        // Min fee for 195 bytes is 19,500 atoms. Pass 5,000.
+        let tx = make_type1_tx(cid, &sender_sk, recipient, 1_000_000, 5_000, 0);
+
+        let mut pool = Mempool::new();
+        let res = pool.admit(&tx, &state);
+        assert!(matches!(res, Err(MempoolError::FeeBelowMinimum { .. })));
+    }
+
+    #[test]
+    fn test_mempool_capacity_limits() {
+        let cid = test_chain_id();
+        let genesis = crate::genesis::genesis_block(cid);
+        let state = ChainState::from_genesis(&genesis).unwrap();
+
+        let sender_sk = SigningKey::from_bytes(&[0x11; 32]);
+        let recipient = Hash::new([0x22; 32]);
+        let tx = make_type1_tx(cid, &sender_sk, recipient, 1_000_000, 20_000, 0);
+
+        // Max 0 transactions
+        let mut pool = Mempool::with_config(MempoolConfig {
+            max_transactions: 0,
+            max_bytes: 10_000_000,
+        });
+        let res = pool.admit(&tx, &state);
+        assert_eq!(res, Err(MempoolError::MempoolFull));
+    }
+
+    #[test]
+    fn test_mempool_nonce_and_balance_conflicts() {
+        let miner_sk = SigningKey::from_bytes(&[0x07; 32]);
+        let (state, _last_block) = setup_chain_with_funded_account(&miner_sk);
+        let cid = test_chain_id();
+
+        let recipient1 = Hash::new([0x22; 32]);
+        let recipient2 = Hash::new([0x33; 32]);
+
+        let mut pool = Mempool::new();
+
+        // Transaction 1: nonce 0, amount 100_000, fee 20_000
+        let tx1 = make_type1_tx(cid, &miner_sk, recipient1, 100_000, 20_000, 0);
+        let tx1_id = pool.admit(&tx1, &state).unwrap();
+        assert_eq!(pool.len(), 1);
+        assert!(pool.contains(&tx1_id));
+
+        // Duplicate admission of tx1 -> AlreadyInMempool
+        assert_eq!(
+            pool.admit(&tx1, &state),
+            Err(MempoolError::AlreadyInMempool(tx1_id))
+        );
+
+        // Competing Transaction with SAME nonce 0 to recipient2 -> ConflictingNonce
+        let tx_competing = make_type1_tx(cid, &miner_sk, recipient2, 50_000, 20_000, 0);
+        let res = pool.admit(&tx_competing, &state);
+        assert!(matches!(res, Err(MempoolError::ConflictingNonce { .. })));
+
+        // Nonce gap: trying nonce 2 instead of 1 -> ConflictingNonce
+        let tx_gap = make_type1_tx(cid, &miner_sk, recipient2, 50_000, 20_000, 2);
+        assert!(matches!(
+            pool.admit(&tx_gap, &state),
+            Err(MempoolError::ConflictingNonce { .. })
+        ));
+
+        // Sequential Transaction with nonce 1 -> succeeds!
+        let tx2 = make_type1_tx(cid, &miner_sk, recipient2, 50_000, 20_000, 1);
+        let tx2_id = pool.admit(&tx2, &state).unwrap();
+        assert_eq!(pool.len(), 2);
+        assert!(pool.contains(&tx2_id));
+
+        // Excess balance spend: account has 10 OWN mature (1_000_000_000 atoms)
+        // Trying to spend 2_000_000_000 atoms with nonce 2 -> InsufficientSpendableBalance
+        let tx_excess = make_type1_tx(cid, &miner_sk, recipient2, 2_000_000_000, 20_000, 2);
+        assert!(matches!(
+            pool.admit(&tx_excess, &state),
+            Err(MempoolError::InsufficientSpendableBalance { .. })
+        ));
+    }
+
+    #[test]
+    fn test_mempool_block_inclusion_and_revalidation() {
+        let miner_sk = SigningKey::from_bytes(&[0x07; 32]);
+        let (mut state, last_block) = setup_chain_with_funded_account(&miner_sk);
+        let cid = test_chain_id();
+
+        let recipient1 = Hash::new([0x22; 32]);
+        let recipient2 = Hash::new([0x33; 32]);
+
+        let mut pool = Mempool::new();
+
+        let tx1 = make_type1_tx(cid, &miner_sk, recipient1, 100_000, 20_000, 0);
+        let tx2 = make_type1_tx(cid, &miner_sk, recipient2, 50_000, 20_000, 1);
+
+        let tx1_id = pool.admit(&tx1, &state).unwrap();
+        let tx2_id = pool.admit(&tx2, &state).unwrap();
+        assert_eq!(pool.len(), 2);
+
+        // Include tx1 in a new block at height 102
+        let h = 102;
+        let cb = make_coinbase(cid, h, [0x05; 32]);
+        let tx_ids = vec![transaction_id(&cb), tx1_id];
+        let mut blk = Block {
+            header: Header {
+                version: 1,
+                chain_id: cid,
+                height: h,
+                parent_block_id: last_block.block_id(),
+                transaction_root: merkle::tx_root(&tx_ids),
+                orchard_commitment_root: empty_commitment_root(),
+                timestamp: last_block.header.timestamp + 120,
+                difficulty: state.expected_difficulty_for_next_block().unwrap_or(1),
+                nonce: 0,
+            },
+            transactions: vec![cb, tx1.clone()],
+        };
+        let root = state
+            .simulate_candidate_state_root(&blk)
+            .expect("simulated state root");
+        blk.header.orchard_commitment_root = root;
+
+        state.apply_block(&blk).unwrap();
+
+        // Notify mempool of block acceptance
+        pool.on_block_accepted(&blk, &state);
+
+        // tx1 should be removed
+        assert!(!pool.contains(&tx1_id));
+        // tx2 should still be in mempool, revalidated against state where miner nonce is now 1
+        assert!(pool.contains(&tx2_id));
+        assert_eq!(pool.len(), 1);
+    }
+}
