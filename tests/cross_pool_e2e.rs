@@ -259,6 +259,10 @@ struct E2EFixtures {
 
     // 2-action bundle spending 100M note twice (duplicate nullifiers)
     type7_proven_dup_spends: Bundle<InProgress<Proof, Unauthorized>, i64>,
+
+    // Actual 2-leaf post-Type-6 anchor [seed_cmx_100m, seed_cmx_50m]
+    anchor_two_leaf_post_type6: Anchor,
+    type7_proven_intra_block_spend: Bundle<InProgress<Proof, Unauthorized>, i64>,
 }
 
 static FIXTURES: OnceLock<E2EFixtures> = OnceLock::new();
@@ -463,6 +467,28 @@ fn get_fixtures() -> &'static E2EFixtures {
         let (unauth7_dup, _) = b7_dup.build::<i64>(&mut rng).unwrap().unwrap();
         let type7_proven_dup_spends = unauth7_dup.create_proof(&pk, &mut rng).unwrap();
 
+        // 6. Build genuine intra-block spend against the actual 2-leaf post-Type-6 root:
+        // Existing active leaf at index 0: seed_cmx_100m.
+        // Candidate-block leaf at index 1: seed_cmx_50m.
+        let mut auth_path_50m_in_two_leaf =
+            EMPTY_ROOTS.map(|bytes| MerkleHashOrchard::from_bytes(&bytes).unwrap());
+        auth_path_50m_in_two_leaf[0] = MerkleHashOrchard::from_cmx(&seed_cmx_100m);
+        let path_50m_in_two_leaf = MerklePath::from_parts(1, auth_path_50m_in_two_leaf);
+        let anchor_two_leaf_post_type6 = path_50m_in_two_leaf.root(seed_cmx_50m);
+
+        let mut b7_intra = Builder::new(
+            BundleType::UNPADDED,
+            BundleVersion::orchard_v2(),
+            Flags::OUTPUTS_DISABLED,
+            anchor_two_leaf_post_type6,
+        )
+        .unwrap();
+        b7_intra
+            .add_spend(user_fvk.clone(), seed_note_50m, path_50m_in_two_leaf)
+            .unwrap();
+        let (unauth7_intra, _) = b7_intra.build::<i64>(&mut rng).unwrap().unwrap();
+        let type7_proven_intra_block_spend = unauth7_intra.create_proof(&pk, &mut rng).unwrap();
+
         E2EFixtures {
             pk,
             vk,
@@ -488,6 +514,8 @@ fn get_fixtures() -> &'static E2EFixtures {
             type7_proven_outputs_disabled,
             type7_real_nf_outputs_disabled,
             type7_proven_dup_spends,
+            anchor_two_leaf_post_type6,
+            type7_proven_intra_block_spend,
         }
     })
 }
@@ -783,10 +811,10 @@ fn test_02_mixed_block_intra_block_anchor_rejected() {
     state.apply_block(&b102).unwrap();
 
     // 2. Attempt intra-block spend at height 103:
-    // Block 103 contains Type 6 (creating 50M note) AND Type 7 (spending 50M note)
-    // where Type 7 uses the anchor created by 50M note!
-    // Since 50M note was only added in Block 103, its anchor does NOT exist in the
-    // historical ancestor window [H-10, H-1] for Block 103!
+    // Block 103 contains Type 6 (creating 50M note at index 1) AND Type 7 (spending that 50M note)
+    // where Type 7 uses the actual 2-leaf post-Type-6 tree root (anchor_two_leaf_post_type6)!
+    // Even though Type 7 proof is mathematically valid against the post-Type-6 root, that root
+    // does NOT exist in the historical ancestor window [H-10, H-1] for Block 103!
     ts += 120;
     let t6_same_block = build_type6_tx(
         id,
@@ -803,7 +831,7 @@ fn test_02_mixed_block_intra_block_anchor_rejected() {
         bob.address,
         49_000_000,
         1_000_000,
-        &fix.type7_proven_outputs_disabled,
+        &fix.type7_proven_intra_block_spend,
     );
     let cb103 = make_coinbase(id, 103, miner.address, 2_000_000);
 
@@ -846,6 +874,8 @@ fn test_02_mixed_block_intra_block_anchor_rejected() {
 #[test]
 fn test_03_strict_anchor_window_boundaries() {
     let (mut state, miner, alice, mut ts) = setup_funded_chain();
+    let side_state_base = state.clone();
+    let ts_side = ts;
     let fix = get_fixtures();
     let id = devnet_chain_id();
     let bob = TestKeypair::from_seed(3);
@@ -952,6 +982,44 @@ fn test_03_strict_anchor_window_boundaries() {
         format!("{err_unk:?}").contains("not in 10-block ancestor window"),
         "Unknown anchor must be rejected: {err_unk:?}"
     );
+
+    // Test genuine side-branch anchor rejection:
+    // Construct a competing branch that branches from height 101 and creates a 50M note (anchor is seed_anchor_50m)
+    let mut side_state = side_state_base;
+    let cb102_side = make_coinbase(id, 102, miner.address, 1_000_000);
+    let t6_side = build_type6_tx(
+        id,
+        &alice,
+        0,
+        50_000_000,
+        1_000_000,
+        &fix.type6_proven_50m,
+        &[],
+    );
+    let b102_side = make_hybrid_block(&side_state, ts_side + 120, vec![cb102_side, t6_side]);
+    side_state.apply_block(&b102_side).unwrap();
+    assert_eq!(
+        side_state.orchard_tree().root().as_bytes(),
+        &fix.seed_anchor_50m.to_bytes()
+    );
+
+    // Build valid Type 7 spend against the side-branch anchor (seed_anchor_50m)
+    let t7_side_spend = build_type7_tx(
+        id,
+        &fix.user_sk,
+        bob.address,
+        49_000_000,
+        1_000_000,
+        &fix.type7_proven_outputs_disabled,
+    );
+    // Submit candidate block with this Type 7 spend to the active main chain
+    let cb113_side = make_coinbase(id, 113, miner.address, 1_000_000);
+    let b113_side = make_candidate_block(&state, ts + 120, vec![cb113_side, t7_side_spend]);
+    let err_side = state.evaluate_candidate(&b113_side).unwrap_err();
+    assert!(
+        format!("{err_side:?}").contains("not in 10-block ancestor window"),
+        "Side-branch anchor must be rejected on active main chain: {err_side:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,7 +1069,10 @@ fn test_04_comprehensive_nullifier_matrix() {
     );
 
     // 3. Reject duplicate nullifiers ACROSS transactions in the same block
-    let t7_dummy = build_type7_tx(
+    // Create two distinct transactions: different recipients so transaction IDs differ,
+    // but both consume the exact same underlying nullifiers.
+    let carol = TestKeypair::from_seed(4);
+    let t7_dummy_a = build_type7_tx(
         id,
         &fix.user_sk,
         bob.address,
@@ -1009,15 +1080,28 @@ fn test_04_comprehensive_nullifier_matrix() {
         1_000_000,
         &fix.type7_proven_dummy_spend,
     );
+    let t7_dummy_b = build_type7_tx(
+        id,
+        &fix.user_sk,
+        carol.address,
+        60_000_000,
+        1_000_000,
+        &fix.type7_proven_dummy_spend,
+    );
+    let cb103_cross = make_coinbase(id, 103, miner.address, 2_000_000);
     let b103_cross_tx = make_candidate_block(
         &state,
         ts,
-        vec![cb103.clone(), t7_dummy.clone(), t7_dummy.clone()],
+        vec![cb103_cross, t7_dummy_a.clone(), t7_dummy_b],
     );
-    assert!(state.evaluate_candidate(&b103_cross_tx).is_err());
+    let err_cross = state.evaluate_candidate(&b103_cross_tx).unwrap_err();
+    assert!(
+        format!("{err_cross:?}").contains("duplicate nullifier across transactions"),
+        "Duplicate nullifier across transactions must be rejected: {err_cross:?}"
+    );
 
     // 4. Commit valid Type 7 withdrawal with genuine dummy spend at Height 103
-    let b103 = make_hybrid_block(&state, ts, vec![cb103, t7_dummy]);
+    let b103 = make_hybrid_block(&state, ts, vec![cb103, t7_dummy_a]);
     state.apply_block(&b103).unwrap();
 
     // Verify both real and dummy nullifiers from Type 7 are committed in nullifier set
@@ -1124,10 +1208,37 @@ fn test_05_reorganization_and_rollback_permutations() {
 
     // Verify state after reorg unwinding Type 7:
     assert_eq!(state.tip().unwrap().header.height, 104);
+    assert_eq!(state.accounts(), branch_b.accounts());
     // Bob was never credited on Branch B:
     assert_eq!(state.accounts().get(&bob.address).map(|a| a.balance), None);
     // Shielded pool restored to 100M:
     assert_eq!(state.shielded_pool_balance(), 100_000_000);
+    assert_eq!(
+        state.shielded_pool_balance(),
+        branch_b.shielded_pool_balance()
+    );
+    assert_eq!(state.orchard_tree().count(), 1);
+    assert_eq!(
+        state.orchard_tree().count(),
+        branch_b.orchard_tree().count()
+    );
+    assert_eq!(state.orchard_tree().root(), branch_b.orchard_tree().root());
+    assert_eq!(state.historical_anchors(), branch_b.historical_anchors());
+    assert_eq!(state.nullifier_set(), branch_b.nullifier_set());
+    assert_eq!(
+        state.nullifier_state_root(),
+        branch_b.nullifier_state_root()
+    );
+    assert_eq!(
+        state.accepted_transaction_ids(),
+        branch_b.accepted_transaction_ids()
+    );
+    assert_eq!(
+        state.composite_state_root(),
+        branch_b.composite_state_root()
+    );
+    assert_eq!(state.cumulative_issuance(), branch_b.cumulative_issuance());
+    assert_eq!(state.cumulative_work(), branch_b.cumulative_work());
     // Type 7 nullifiers are gone:
     assert!(!state
         .nullifier_set()
@@ -1166,6 +1277,7 @@ fn test_05_reorganization_and_rollback_permutations() {
     state_c.reorganize(&branch_d_blocks).unwrap();
 
     assert_eq!(state_c.tip().unwrap().header.height, 106);
+    assert_eq!(state_c.accounts(), branch_d.accounts());
     // Both Alice and Bob balances restored to pre-shielding state:
     assert_eq!(
         state_c.accounts().get(&alice.address).unwrap().balance,
@@ -1178,9 +1290,45 @@ fn test_05_reorganization_and_rollback_permutations() {
     );
     // Shielded pool restored to 0:
     assert_eq!(state_c.shielded_pool_balance(), 0);
+    assert_eq!(
+        state_c.shielded_pool_balance(),
+        branch_d.shielded_pool_balance()
+    );
     // Nullifiers completely cleared:
     assert_eq!(state_c.nullifier_set().len(), 0);
+    assert_eq!(state_c.nullifier_set(), branch_d.nullifier_set());
+    assert_eq!(
+        state_c.nullifier_state_root(),
+        ownchain::merkle::nullifier_empty_root()
+    );
+    assert_eq!(
+        state_c.nullifier_state_root(),
+        branch_d.nullifier_state_root()
+    );
     assert_eq!(state_c.orchard_tree().count(), 0);
+    assert_eq!(
+        state_c.orchard_tree().count(),
+        branch_d.orchard_tree().count()
+    );
+    assert_eq!(state_c.orchard_tree().root(), empty_commitment_root());
+    assert_eq!(
+        state_c.orchard_tree().root(),
+        branch_d.orchard_tree().root()
+    );
+    assert_eq!(state_c.historical_anchors(), branch_d.historical_anchors());
+    assert_eq!(
+        state_c.accepted_transaction_ids(),
+        branch_d.accepted_transaction_ids()
+    );
+    assert_eq!(
+        state_c.composite_state_root(),
+        branch_d.composite_state_root()
+    );
+    assert_eq!(
+        state_c.cumulative_issuance(),
+        branch_d.cumulative_issuance()
+    );
+    assert_eq!(state_c.cumulative_work(), branch_d.cumulative_work());
     assert_eq!(
         total_transparent_balance(&state_c) + state_c.shielded_pool_balance(),
         state_c.cumulative_issuance()
@@ -1383,35 +1531,93 @@ fn test_07_public_validation_api_consistency() {
     let state_snapshot = state.clone();
     let _ = state.simulate_candidate_state_root(&cand_block);
     let _ = state.evaluate_candidate(&cand_block);
-    assert_eq!(
-        total_transparent_balance(&state),
-        total_transparent_balance(&state_snapshot)
-    );
+    assert_eq!(state.accounts(), state_snapshot.accounts());
     assert_eq!(
         state.shielded_pool_balance(),
         state_snapshot.shielded_pool_balance()
     );
+    assert_eq!(
+        state.orchard_tree().count(),
+        state_snapshot.orchard_tree().count()
+    );
+    assert_eq!(
+        state.orchard_tree().root(),
+        state_snapshot.orchard_tree().root()
+    );
+    assert_eq!(state.nullifier_set(), state_snapshot.nullifier_set());
+    assert_eq!(
+        state.nullifier_state_root(),
+        state_snapshot.nullifier_state_root()
+    );
+    assert_eq!(
+        state.composite_state_root(),
+        state_snapshot.composite_state_root()
+    );
     assert_eq!(state.tip(), state_snapshot.tip());
+    assert_eq!(state.cumulative_work(), state_snapshot.cumulative_work());
+    assert_eq!(
+        state.cumulative_issuance(),
+        state_snapshot.cumulative_issuance()
+    );
+    assert_eq!(
+        state.accepted_transaction_ids(),
+        state_snapshot.accepted_transaction_ids()
+    );
+    assert_eq!(
+        state.historical_anchors(),
+        state_snapshot.historical_anchors()
+    );
 
     // 3. Cryptographic validation during candidate evaluation:
-    // Corrupt the sender signature in Type 6
+    // Corrupt the sender signature in Type 6:
+    // Offset calculation: TX_ENVELOPE_LEN (35) + 68 fixed payload prefix + bundle_len
+    let payload = &t6_valid[ownchain::tx::TX_ENVELOPE_LEN..];
+    let bundle_len = u32::from_le_bytes(payload[64..68].try_into().unwrap()) as usize;
+    let sig_offset = ownchain::tx::TX_ENVELOPE_LEN + 68 + bundle_len;
     let mut t6_corrupt_sig = t6_valid.clone();
-    let last_idx = t6_corrupt_sig.len() - 1;
-    t6_corrupt_sig[last_idx] ^= 0xff;
+    t6_corrupt_sig[sig_offset] ^= 0xff; // Flips first byte of 64-byte sender signature, leaving guardian count intact
     let b_corrupt = make_candidate_block(&state, ts + 120, vec![cb102.clone(), t6_corrupt_sig]);
 
+    let err_val = state.validate_candidate(&b_corrupt).unwrap_err();
     assert!(
-        state.validate_candidate(&b_corrupt).is_err(),
-        "validate_candidate must reject corrupted signature"
+        format!("{err_val:?}").contains("SenderSignatureInvalid"),
+        "validate_candidate must reject corrupted signature as SenderSignatureInvalid: {err_val:?}"
     );
+    let err_eval = state.evaluate_candidate(&b_corrupt).unwrap_err();
     assert!(
-        state.evaluate_candidate(&b_corrupt).is_err(),
-        "evaluate_candidate must reject corrupted signature"
+        format!("{err_eval:?}").contains("SenderSignatureInvalid"),
+        "evaluate_candidate must reject corrupted signature as SenderSignatureInvalid: {err_eval:?}"
     );
+    let err_sim = state.simulate_candidate_state_root(&b_corrupt).unwrap_err();
     assert!(
-        state.simulate_candidate_state_root(&b_corrupt).is_err(),
-        "simulate_candidate_state_root must reject corrupted signature"
+        format!("{err_sim:?}").contains("SenderSignatureInvalid"),
+        "simulate_candidate_state_root must reject corrupted signature as SenderSignatureInvalid: {err_sim:?}"
     );
+
+    // Verify state non-mutation after rejected simulation and evaluation calls
+    assert_eq!(state.accounts(), state_snapshot.accounts());
+    assert_eq!(
+        state.shielded_pool_balance(),
+        state_snapshot.shielded_pool_balance()
+    );
+    assert_eq!(
+        state.orchard_tree().count(),
+        state_snapshot.orchard_tree().count()
+    );
+    assert_eq!(
+        state.orchard_tree().root(),
+        state_snapshot.orchard_tree().root()
+    );
+    assert_eq!(state.nullifier_set(), state_snapshot.nullifier_set());
+    assert_eq!(
+        state.nullifier_state_root(),
+        state_snapshot.nullifier_state_root()
+    );
+    assert_eq!(
+        state.composite_state_root(),
+        state_snapshot.composite_state_root()
+    );
+    assert_eq!(state.tip(), state_snapshot.tip());
 
     // 4. Incorrect composite state root rejection at apply_block:
     let mut b_wrong_root = cand_block.clone();
@@ -1423,14 +1629,29 @@ fn test_07_public_validation_api_consistency() {
     );
 
     // 5. Zero state mutation after rejected block
-    assert_eq!(
-        total_transparent_balance(&state),
-        total_transparent_balance(&state_snapshot)
-    );
+    assert_eq!(state.accounts(), state_snapshot.accounts());
     assert_eq!(
         state.shielded_pool_balance(),
         state_snapshot.shielded_pool_balance()
     );
+    assert_eq!(
+        state.orchard_tree().count(),
+        state_snapshot.orchard_tree().count()
+    );
+    assert_eq!(
+        state.orchard_tree().root(),
+        state_snapshot.orchard_tree().root()
+    );
+    assert_eq!(state.nullifier_set(), state_snapshot.nullifier_set());
+    assert_eq!(
+        state.nullifier_state_root(),
+        state_snapshot.nullifier_state_root()
+    );
+    assert_eq!(
+        state.composite_state_root(),
+        state_snapshot.composite_state_root()
+    );
+    assert_eq!(state.tip(), state_snapshot.tip());
 
     // 6. Acceptance of valid block
     let mut b_valid = cand_block;

@@ -1205,7 +1205,13 @@ impl ChainState {
                                 ));
                             }
                             if candidate_nullifiers.contains(&nf) {
-                                return Err(ChainError::State("nullifier double-spend".into()));
+                                if self.nullifier_set.contains(&nf) {
+                                    return Err(ChainError::State("nullifier double-spend".into()));
+                                } else {
+                                    return Err(ChainError::State(
+                                        "nullifier double-spend: duplicate nullifier across transactions".into(),
+                                    ));
+                                }
                             }
                             tx_nfs.push(nf);
                         }
@@ -1377,7 +1383,13 @@ impl ChainState {
                                 ));
                             }
                             if candidate_nullifiers.contains(&nf) {
-                                return Err(ChainError::State("nullifier double-spend".into()));
+                                if self.nullifier_set.contains(&nf) {
+                                    return Err(ChainError::State("nullifier double-spend".into()));
+                                } else {
+                                    return Err(ChainError::State(
+                                        "nullifier double-spend: duplicate nullifier across transactions".into(),
+                                    ));
+                                }
                             }
                             tx_nfs.push(nf);
                         }
@@ -1601,7 +1613,13 @@ impl ChainState {
                                 ));
                             }
                             if candidate_nullifiers.contains(&nf) {
-                                return Err(ChainError::State("nullifier double-spend".into()));
+                                if self.nullifier_set.contains(&nf) {
+                                    return Err(ChainError::State("nullifier double-spend".into()));
+                                } else {
+                                    return Err(ChainError::State(
+                                        "nullifier double-spend: duplicate nullifier across transactions".into(),
+                                    ));
+                                }
                             }
                             tx_nfs.push(nf);
                         }

@@ -309,7 +309,11 @@ Moves value from a transparent account into the Orchard shielded pool.
   $$valueBalanceOrchard = -shielded\_amount < 0$$
 - Pool delta:
   $$\text{shielded\_pool\_delta} = -valueBalanceOrchard = +shielded\_amount$$
-- Authorization: Sender Ed25519 signature and Orchard binding signature over `OwnChain/TxAuth/v1`. If the sender account is guardian-protected, a **4-of-7 guardian quorum** is strictly required. Output bundle verified via Orchard verifier (`FixedPostNu6_2`). Each action's SpendAuth signature is verified against the canonical authorization digest.
+- Authorization: Sender Ed25519 signature, 4-of-7 guardian signatures (if guardian protection is enabled on the sender account), each action's SpendAuth signature, and Orchard RedPallas binding signature all sign and verify over the canonical Type 6 cross-pool authorization digest computed with domain `OwnChain/CrossPoolAuth/v1`:
+  $$\text{auth\_digest}_{T6} = \text{BLAKE2b-256}(\text{UTF8("OwnChain/CrossPoolAuth/v1")} \parallel chain\_id[32] \parallel 6:u8 \parallel tx\_version:u16\_le \parallel sender\_pubkey[32] \parallel nonce:u64\_le \parallel shielded\_amount:u128\_le \parallel fee\_atoms:u64\_le \parallel bundle\_flags:u8 \parallel bundle\_value\_balance:i64\_le \parallel bundle\_anchor[32] \parallel action\_count:u32\_le \parallel repeated(action\_effect\_i[32]))$$
+  where each `action_effect_i` is computed in canonical ZIP-225 Section 7 order:
+  $$\text{action\_effect} = \text{BLAKE2b-256}(\text{UTF8("OwnChain/ActionEffect/v1")} \parallel cv\_net[32] \parallel nullifier[32] \parallel rk[32] \parallel cmx[32] \parallel epk[32] \parallel enc\_ciphertext[580] \parallel out\_ciphertext[80])$$
+  Output bundle is verified via Orchard verifier (`FixedPostNu6_2`). The bundle flags must be `Flags::SPENDS_DISABLED` (`0x02`), and anchor must be the empty tree root.
 - State transition: Sender balance debited by $shielded\_amount + fee\_atoms$. Nonce incremented. $\text{shielded\_pool\_balance} \mathrel{+}= shielded\_amount$. Fee is paid to the block producer. All Orchard action nullifiers (including dummy-spend nullifiers derived under `Flags::SPENDS_DISABLED`) are checked for uniqueness within the transaction, rejected if already spent in candidate or chain state, and inserted into the active nullifier set. All Orchard action output commitments (including dummy outputs) are unconditionally appended to the incremental Orchard note commitment tree. Conservation $\Delta(T + S) = 0$ holds.
 
 #### Type 7: ShieldedToTransparent
@@ -320,7 +324,9 @@ Moves value out of the Orchard shielded pool into a transparent recipient accoun
   $$valueBalanceOrchard = +(release\_amount + fee\_atoms) > 0$$
 - Pool delta:
   $$\text{shielded\_pool\_delta} = -valueBalanceOrchard = -(release\_amount + fee\_atoms)$$
-- Authorization: Orchard spend authorization signatures for all actions and binding signature over `OwnChain/TxAuth/v1`. Anchor must fall within the 10-block ancestor window $[h-10, h-1]$.
+- Authorization: Orchard spend authorization signatures for all actions and RedPallas binding signature verify over the canonical Type 7 cross-pool authorization digest computed with domain `OwnChain/CrossPoolAuth/v1`:
+  $$\text{auth\_digest}_{T7} = \text{BLAKE2b-256}(\text{UTF8("OwnChain/CrossPoolAuth/v1")} \parallel chain\_id[32] \parallel 7:u8 \parallel tx\_version:u16\_le \parallel recipient[32] \parallel release\_amount:u128\_le \parallel fee\_atoms:u64\_le \parallel bundle\_flags:u8 \parallel bundle\_value\_balance:i64\_le \parallel bundle\_anchor[32] \parallel action\_count:u32\_le \parallel repeated(action\_effect\_i[32]))$$
+  where each `action_effect_i` is computed with `OwnChain/ActionEffect/v1` as defined above. Spend bundle is verified via Orchard verifier (`FixedPostNu6_2`). Bundle anchor must fall within the 10-block ancestor window $[h-10, h-1]$.
 - State transition: Disclosed nullifiers (both real spends and dummy spends) are checked for uniqueness within the transaction and candidate block, rejected if already spent, and added to the cumulative nullifier set. All Orchard action output commitments (including dummy outputs under `Flags::OUTPUTS_DISABLED` and change note commitments) are unconditionally appended to the incremental Orchard note commitment tree. $\text{shielded\_pool\_balance} \mathrel{-}= (release\_amount + fee\_atoms)$. Recipient transparent balance credited by $release\_amount$. Fee is paid to the block producer. Guardian protections on the recipient do not restrict inbound transfers. Conservation $\Delta(T + S) = 0$ holds.
 
 ### 7.2 Address derivation and signing preimage
@@ -328,13 +334,17 @@ Moves value out of the Orchard shielded pool into a transparent recipient accoun
 #### Address derivation
 $$\text{address} = \text{BLAKE2b-256}(\text{UTF8("OwnChain/Address/v1")} \parallel ed25519\_public\_key[32])$$
 
-#### Signing preimage
-For any transaction signed by account owner or guardians, the signing preimage is:
+#### Signing preimage for transparent transactions (Types 1–4)
+For transparent transactions signed by an account owner or guardians (Types 1, 2, 3, and 4), the signing preimage is:
 
 $$\text{preimage} = \text{UTF8("OwnChain/TxAuth/v1")} \parallel chain\_id[32] \parallel \text{canonical\_unsigned\_tx\_bytes}$$
 
 where `canonical_unsigned_tx_bytes` begins with `tx_type:u8 || tx_version:u16_le || chain_id:[u8;32]` and includes all consensus fields of the transaction except the signature(s). Signatures are verified as $\text{Ed25519Verify}(pubkey, preimage, signature)$. Binding `chain_id` into the preimage ensures cross-network replay protection.
 
+#### Signing preimage for cross-pool transactions (Types 6 and 7)
+Cross-pool transactions move value across the transparent and shielded pools and do **not** use `OwnChain/TxAuth/v1`. Instead, they bind all external transaction fields and canonical Orchard action effects into the dedicated `OwnChain/CrossPoolAuth/v1` authorization digest defined in §7.1. All signatures on a cross-pool transaction—including transparent sender Ed25519 signatures, guardian quorum signatures, RedPallas spend authorization signatures, and Orchard binding signatures—sign and verify over that single cross-pool authorization digest.
+
+#### Transaction ID
 The transaction ID is:
 
 $$\text{tx\_id} = \text{BLAKE2b-256}(\text{UTF8("OwnChain/Tx/v1")} \parallel \text{canonical\_signed\_tx\_bytes})$$
