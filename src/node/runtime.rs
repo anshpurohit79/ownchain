@@ -7,11 +7,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use libp2p::core::Multiaddr;
 use libp2p::identity::{Keypair, PeerId};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::block::Block;
 use crate::chain::ChainState;
@@ -21,12 +23,17 @@ use crate::hash::Hash;
 use crate::mempool::{Mempool, MempoolError};
 use crate::node::config::NodeConfig;
 use crate::p2p::identity::{load_or_generate_identity, peer_id_from_keypair};
-use crate::p2p::network::{NetworkEvent, NetworkHandle, NetworkService};
+use crate::p2p::network::{NetworkEvent, NetworkHandle, NetworkService, PeerInfo};
 use crate::p2p::protocol::{
     SyncRequest, SyncResponse, MAX_BLOCKS_PER_RESPONSE, MAX_HEADERS_PER_RESPONSE,
 };
 use crate::storage::{BlockStore, StorageError};
 use crate::validation::ValidationError;
+
+/// Maximum number of orphan blocks held in memory.
+pub const MAX_ORPHAN_BLOCKS: usize = 100;
+/// Maximum cumulative bytes of serialized orphan blocks held in memory (5 MB).
+pub const MAX_ORPHAN_BYTES: usize = 5 * 1024 * 1024;
 
 /// Runtime errors encountered during node lifecycle operations.
 #[derive(Debug)]
@@ -75,6 +82,211 @@ impl From<ValidationError> for RuntimeError {
     }
 }
 
+#[derive(Clone, Debug)]
+struct OrphanEntry {
+    block: Block,
+    source_peer: PeerId,
+    serialized_size: usize,
+}
+
+/// RAII guard ensuring `is_syncing` flag is reset whenever synchronization terminates.
+struct SyncGuard(Arc<AtomicBool>);
+
+impl SyncGuard {
+    fn try_acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
+        if flag
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            Some(Self(flag.clone()))
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for SyncGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Current consensus, chain, and runtime status of a running node.
+#[derive(Clone, Debug)]
+pub struct NodeStatus {
+    pub tip_height: u64,
+    pub tip_block_id: Hash,
+    pub cumulative_work: U256,
+    pub composite_state_root: Hash,
+    pub mempool_size: usize,
+    pub peer_id: PeerId,
+}
+
+/// Internal actor commands dispatched to the `NodeRuntime` event loop.
+pub enum NodeCommand {
+    SubmitBlock {
+        block: Block,
+        respond_to: oneshot::Sender<Result<(), String>>,
+    },
+    SubmitTransaction {
+        tx_bytes: Vec<u8>,
+        respond_to: oneshot::Sender<Result<Hash, MempoolError>>,
+    },
+    GetStatus {
+        respond_to: oneshot::Sender<NodeStatus>,
+    },
+    GetListenAddrs {
+        respond_to: oneshot::Sender<Vec<Multiaddr>>,
+    },
+    GetConnectedPeers {
+        respond_to: oneshot::Sender<Vec<PeerInfo>>,
+    },
+    Dial {
+        addr: Multiaddr,
+        respond_to: oneshot::Sender<Result<(), String>>,
+    },
+    Disconnect {
+        peer_id: PeerId,
+        respond_to: oneshot::Sender<Result<(), String>>,
+    },
+    SyncWithPeer {
+        peer_id: PeerId,
+        peer_tip_height: u64,
+        respond_to: oneshot::Sender<()>,
+    },
+    Stop {
+        respond_to: oneshot::Sender<()>,
+    },
+}
+
+/// Thread-safe and cloneable handle for interacting with a running `NodeRuntime` actor.
+#[derive(Clone)]
+pub struct NodeHandle {
+    peer_id: PeerId,
+    command_tx: mpsc::Sender<NodeCommand>,
+}
+
+impl NodeHandle {
+    pub fn peer_id(&self) -> PeerId {
+        self.peer_id
+    }
+
+    pub async fn submit_block(&self, block: Block) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(NodeCommand::SubmitBlock {
+                block,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|_| "Node runtime has shut down".to_string())?;
+        rx.await
+            .map_err(|_| "Node runtime dropped response".to_string())?
+    }
+
+    pub async fn submit_transaction(&self, tx_bytes: Vec<u8>) -> Result<Hash, MempoolError> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(NodeCommand::SubmitTransaction {
+                tx_bytes,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|_| {
+                MempoolError::Malformed("Node runtime command channel closed".to_string())
+            })?;
+        rx.await.map_err(|_| {
+            MempoolError::Malformed("Node runtime dropped response receiver".to_string())
+        })?
+    }
+
+    pub async fn status(&self) -> Result<NodeStatus, String> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(NodeCommand::GetStatus { respond_to: tx })
+            .await
+            .map_err(|_| "Node runtime has shut down".to_string())?;
+        rx.await
+            .map_err(|_| "Node runtime dropped response".to_string())
+    }
+
+    pub async fn get_listen_addrs(&self) -> Result<Vec<Multiaddr>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(NodeCommand::GetListenAddrs { respond_to: tx })
+            .await
+            .map_err(|_| "Node runtime has shut down".to_string())?;
+        rx.await
+            .map_err(|_| "Node runtime dropped response".to_string())
+    }
+
+    pub async fn get_connected_peers(&self) -> Result<Vec<PeerInfo>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(NodeCommand::GetConnectedPeers { respond_to: tx })
+            .await
+            .map_err(|_| "Node runtime has shut down".to_string())?;
+        rx.await
+            .map_err(|_| "Node runtime dropped response".to_string())
+    }
+
+    pub async fn dial(&self, addr: Multiaddr) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(NodeCommand::Dial {
+                addr,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|_| "Node runtime has shut down".to_string())?;
+        rx.await
+            .map_err(|_| "Node runtime dropped response".to_string())?
+    }
+
+    pub async fn disconnect(&self, peer_id: PeerId) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(NodeCommand::Disconnect {
+                peer_id,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|_| "Node runtime has shut down".to_string())?;
+        rx.await
+            .map_err(|_| "Node runtime dropped response".to_string())?
+    }
+
+    pub async fn sync_with_peer(
+        &self,
+        peer_id: PeerId,
+        peer_tip_height: u64,
+    ) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(NodeCommand::SyncWithPeer {
+                peer_id,
+                peer_tip_height,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|_| "Node runtime has shut down".to_string())?;
+        let _ = rx.await;
+        Ok(())
+    }
+
+    pub async fn stop(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .command_tx
+            .send(NodeCommand::Stop { respond_to: tx })
+            .await
+            .is_ok()
+        {
+            let _ = rx.await;
+        }
+    }
+}
+
 /// The running node instance coordinating blockchain storage, networking, and consensus.
 pub struct NodeRuntime {
     config: NodeConfig,
@@ -83,11 +295,15 @@ pub struct NodeRuntime {
     mempool: Mempool,
     network_handle: NetworkHandle,
     network_event_rx: mpsc::Receiver<NetworkEvent>,
+    command_tx: mpsc::Sender<NodeCommand>,
+    command_rx: mpsc::Receiver<NodeCommand>,
     keypair: Keypair,
     peer_id: PeerId,
-    orphan_blocks: HashMap<Hash, (Block, PeerId)>,
+    orphan_blocks: HashMap<Hash, OrphanEntry>,
     orphan_parents: HashMap<Hash, Vec<Hash>>,
-    is_syncing: bool,
+    orphan_order: VecDeque<Hash>,
+    orphan_bytes: usize,
+    is_syncing: Arc<AtomicBool>,
 }
 
 impl NodeRuntime {
@@ -142,6 +358,8 @@ impl NodeRuntime {
         // Spawn network service in background tokio task
         tokio::spawn(network_service.run());
 
+        let (command_tx, command_rx) = mpsc::channel(64);
+
         Ok(Self {
             config,
             storage,
@@ -149,12 +367,36 @@ impl NodeRuntime {
             mempool,
             network_handle,
             network_event_rx,
+            command_tx,
+            command_rx,
             keypair,
             peer_id,
             orphan_blocks: HashMap::new(),
             orphan_parents: HashMap::new(),
-            is_syncing: false,
+            orphan_order: VecDeque::new(),
+            orphan_bytes: 0,
+            is_syncing: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Obtains a cloneable `NodeHandle` actor client for this runtime.
+    pub fn handle(&self) -> NodeHandle {
+        NodeHandle {
+            peer_id: self.peer_id,
+            command_tx: self.command_tx.clone(),
+        }
+    }
+
+    /// Spawns the node runtime in a background Tokio task and returns its handle.
+    pub fn spawn(
+        config: NodeConfig,
+    ) -> Result<(NodeHandle, tokio::task::JoinHandle<()>), RuntimeError> {
+        let mut runtime = Self::init(config)?;
+        let handle = runtime.handle();
+        let join_handle = tokio::spawn(async move {
+            runtime.run(None).await;
+        });
+        Ok((handle, join_handle))
     }
 
     pub fn peer_id(&self) -> PeerId {
@@ -193,6 +435,89 @@ impl NodeRuntime {
         &self.network_handle
     }
 
+    pub fn orphan_count(&self) -> usize {
+        self.orphan_blocks.len()
+    }
+
+    pub fn orphan_bytes(&self) -> usize {
+        self.orphan_bytes
+    }
+
+    fn add_orphan(&mut self, block_id: Hash, block: Block, source_peer: PeerId) {
+        let block_bytes_len = match block.to_bytes() {
+            Ok(b) => b.len(),
+            Err(_) => return,
+        };
+
+        if block_bytes_len > MAX_ORPHAN_BYTES {
+            tracing::warn!(
+                "Orphan block {} size {} exceeds maximum orphan storage limit {}",
+                block_id,
+                block_bytes_len,
+                MAX_ORPHAN_BYTES
+            );
+            return;
+        }
+
+        if self.orphan_blocks.contains_key(&block_id) {
+            return;
+        }
+
+        // Evict oldest orphans if limit reached
+        while self.orphan_blocks.len() >= MAX_ORPHAN_BLOCKS
+            || (self.orphan_bytes + block_bytes_len > MAX_ORPHAN_BYTES
+                && !self.orphan_blocks.is_empty())
+        {
+            if let Some(oldest_id) = self.orphan_order.pop_front() {
+                if let Some(entry) = self.orphan_blocks.remove(&oldest_id) {
+                    self.orphan_bytes = self.orphan_bytes.saturating_sub(entry.serialized_size);
+                    let p_id = entry.block.header.parent_block_id;
+                    if let Some(children) = self.orphan_parents.get_mut(&p_id) {
+                        children.retain(|id| id != &oldest_id);
+                        if children.is_empty() {
+                            self.orphan_parents.remove(&p_id);
+                        }
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+
+        let parent_id = block.header.parent_block_id;
+        self.orphan_parents
+            .entry(parent_id)
+            .or_default()
+            .push(block_id);
+        self.orphan_order.push_back(block_id);
+        self.orphan_bytes += block_bytes_len;
+        self.orphan_blocks.insert(
+            block_id,
+            OrphanEntry {
+                block,
+                source_peer,
+                serialized_size: block_bytes_len,
+            },
+        );
+    }
+
+    fn remove_orphan(&mut self, block_id: &Hash) -> Option<OrphanEntry> {
+        if let Some(entry) = self.orphan_blocks.remove(block_id) {
+            self.orphan_bytes = self.orphan_bytes.saturating_sub(entry.serialized_size);
+            self.orphan_order.retain(|id| id != block_id);
+            let parent_id = entry.block.header.parent_block_id;
+            if let Some(children) = self.orphan_parents.get_mut(&parent_id) {
+                children.retain(|id| id != block_id);
+                if children.is_empty() {
+                    self.orphan_parents.remove(&parent_id);
+                }
+            }
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
     /// Submits a transaction locally (e.g. from RPC or CLI).
     ///
     /// Validates and admits the transaction to the mempool, then broadcasts it to peers.
@@ -227,7 +552,7 @@ impl NodeRuntime {
             let _ = self.network_handle.dial(addr.clone()).await;
         }
 
-        let mut sync_interval = tokio::time::interval(Duration::from_secs(5));
+        let mut sync_interval = tokio::time::interval(Duration::from_millis(500));
 
         loop {
             tokio::select! {
@@ -240,6 +565,55 @@ impl NodeRuntime {
                 } => {
                     tracing::info!("Shutdown signal received, stopping node runtime");
                     break;
+                }
+
+                cmd = self.command_rx.recv() => {
+                    match cmd {
+                        Some(NodeCommand::SubmitBlock { block, respond_to }) => {
+                            let res = self.handle_inbound_block(self.peer_id, Box::new(block)).await;
+                            let _ = respond_to.send(res);
+                        }
+                        Some(NodeCommand::SubmitTransaction { tx_bytes, respond_to }) => {
+                            let res = self.submit_transaction(tx_bytes).await;
+                            let _ = respond_to.send(res);
+                        }
+                        Some(NodeCommand::GetStatus { respond_to }) => {
+                            let status = NodeStatus {
+                                tip_height: self.tip_height(),
+                                tip_block_id: self.tip_block_id(),
+                                cumulative_work: self.cumulative_work(),
+                                composite_state_root: self.chain_state.composite_state_root(),
+                                mempool_size: self.mempool.len(),
+                                peer_id: self.peer_id,
+                            };
+                            let _ = respond_to.send(status);
+                        }
+                        Some(NodeCommand::GetListenAddrs { respond_to }) => {
+                            let addrs = self.network_handle.get_listen_addrs().await.unwrap_or_default();
+                            let _ = respond_to.send(addrs);
+                        }
+                        Some(NodeCommand::GetConnectedPeers { respond_to }) => {
+                            let peers = self.network_handle.get_connected_peers().await.unwrap_or_default();
+                            let _ = respond_to.send(peers);
+                        }
+                        Some(NodeCommand::Dial { addr, respond_to }) => {
+                            let res = self.network_handle.dial(addr).await;
+                            let _ = respond_to.send(res);
+                        }
+                        Some(NodeCommand::Disconnect { peer_id, respond_to }) => {
+                            let res = self.network_handle.disconnect(peer_id).await;
+                            let _ = respond_to.send(res);
+                        }
+                        Some(NodeCommand::SyncWithPeer { peer_id, peer_tip_height, respond_to }) => {
+                            self.sync_with_peer(peer_id, peer_tip_height).await;
+                            let _ = respond_to.send(());
+                        }
+                        Some(NodeCommand::Stop { respond_to }) => {
+                            let _ = respond_to.send(());
+                            break;
+                        }
+                        None => {}
+                    }
                 }
 
                 _ = sync_interval.tick() => {
@@ -262,7 +636,7 @@ impl NodeRuntime {
     }
 
     async fn check_sync(&mut self) {
-        if self.is_syncing {
+        if self.is_syncing.load(Ordering::SeqCst) {
             return;
         }
 
@@ -285,28 +659,95 @@ impl NodeRuntime {
         }
     }
 
-    /// Bounded chain synchronization loop with a peer.
+    /// Bounded fork-aware chain synchronization loop with a peer.
     pub async fn sync_with_peer(&mut self, peer_id: PeerId, peer_tip_height: u64) {
-        if self.is_syncing {
-            return;
-        }
-        self.is_syncing = true;
-        let start_height = self.tip_height() + 1;
-        if start_height > peer_tip_height {
-            self.is_syncing = false;
-            return;
-        }
+        let _guard = match SyncGuard::try_acquire(&self.is_syncing) {
+            Some(g) => g,
+            None => {
+                tracing::debug!("Sync already in progress; skipping duplicate sync request");
+                return;
+            }
+        };
+
+        // 1. Discover common ancestor between local chain and peer chain
+        let min_h = self.tip_height().min(peer_tip_height);
+        let common_ancestor_height = if min_h == 0 {
+            0
+        } else {
+            // Fast path: check if peer matches our local active chain at min_h
+            let fast_req = SyncRequest::GetHeaders {
+                start_height: min_h,
+                max_count: 1,
+            };
+            let is_match = match self
+                .network_handle
+                .send_sync_request(peer_id, fast_req)
+                .await
+            {
+                Ok(SyncResponse::Headers(headers)) if headers.len() == 1 => {
+                    let local_id = self
+                        .storage
+                        .get_block_by_height(min_h)
+                        .ok()
+                        .flatten()
+                        .map(|b| b.block_id());
+                    Some(headers[0].block_id()) == local_id
+                }
+                _ => false,
+            };
+
+            if is_match {
+                min_h
+            } else {
+                // Binary search for common ancestor in [0, min_h - 1]
+                let mut low = 0u64;
+                let mut high = min_h - 1;
+                while low < high {
+                    let mid = (low + high).div_ceil(2);
+                    let req = SyncRequest::GetHeaders {
+                        start_height: mid,
+                        max_count: 1,
+                    };
+                    match self.network_handle.send_sync_request(peer_id, req).await {
+                        Ok(SyncResponse::Headers(headers)) if headers.len() == 1 => {
+                            let local_id = self
+                                .storage
+                                .get_block_by_height(mid)
+                                .ok()
+                                .flatten()
+                                .map(|b| b.block_id());
+                            if Some(headers[0].block_id()) == local_id {
+                                low = mid;
+                            } else {
+                                high = mid - 1;
+                            }
+                        }
+                        _ => {
+                            tracing::warn!(
+                                "Failed to query header at height {} during ancestor discovery with {}",
+                                mid,
+                                peer_id
+                            );
+                            return;
+                        }
+                    }
+                }
+                low
+            }
+        };
 
         tracing::info!(
-            "Starting chain sync with peer {} from height #{} to #{}",
+            "Common ancestor with peer {} found at height #{}. Fetching replacement blocks #{}..#{}",
             peer_id,
-            start_height,
+            common_ancestor_height,
+            common_ancestor_height + 1,
             peer_tip_height
         );
 
-        let mut current_h = start_height;
+        let mut current_h = common_ancestor_height + 1;
         while current_h <= peer_tip_height {
-            let count = (peer_tip_height - current_h + 1).min(50) as u32;
+            let count =
+                (peer_tip_height - current_h + 1).min(MAX_HEADERS_PER_RESPONSE as u64) as u32;
             let req = SyncRequest::GetHeaders {
                 start_height: current_h,
                 max_count: count,
@@ -319,7 +760,6 @@ impl NodeRuntime {
                     }
 
                     let block_ids: Vec<Hash> = headers.iter().map(|h| h.block_id()).collect();
-                    let next_h = current_h + headers.len() as u64;
 
                     // Request blocks for these headers
                     let block_req = SyncRequest::GetBlocks {
@@ -331,32 +771,32 @@ impl NodeRuntime {
                         .await
                     {
                         Ok(SyncResponse::Blocks(blocks)) => {
+                            if blocks.is_empty() {
+                                break;
+                            }
+                            let num_blocks = blocks.len() as u64;
                             for block in blocks {
                                 if let Err(e) =
                                     self.handle_inbound_block(peer_id, Box::new(block)).await
                                 {
                                     tracing::warn!("Sync block validation failed: {}", e);
-                                    self.is_syncing = false;
                                     return;
                                 }
                             }
+                            current_h += num_blocks;
                         }
                         other => {
                             tracing::warn!("Unexpected sync blocks response: {:?}", other);
-                            break;
+                            return;
                         }
                     }
-
-                    current_h = next_h;
                 }
                 other => {
                     tracing::warn!("Unexpected sync headers response: {:?}", other);
-                    break;
+                    return;
                 }
             }
         }
-
-        self.is_syncing = false;
     }
 
     async fn handle_network_event(&mut self, event: NetworkEvent) {
@@ -434,8 +874,14 @@ impl NodeRuntime {
             SyncRequest::GetBlocks { block_ids } => {
                 let count = block_ids.len().min(MAX_BLOCKS_PER_RESPONSE);
                 let mut blocks = Vec::with_capacity(count);
+                let mut total_bytes = 0usize;
                 for id in block_ids.iter().take(count) {
                     if let Ok(Some(block)) = self.storage.get_block(id) {
+                        let block_size = block.to_bytes().map(|b| b.len()).unwrap_or(0);
+                        if !blocks.is_empty() && total_bytes + block_size > 1_800_000 {
+                            break;
+                        }
+                        total_bytes += block_size;
                         blocks.push(block);
                     }
                 }
@@ -473,12 +919,18 @@ impl NodeRuntime {
         queue.push_back((source_peer, block));
 
         while let Some((peer, curr_block)) = queue.pop_front() {
-            let accepted_id = self.process_single_block(peer, curr_block).await?;
+            let (accepted_id, missing_parents) =
+                self.process_single_block(peer, curr_block).await?;
+
+            for parent_block in missing_parents {
+                queue.push_back((peer, Box::new(parent_block)));
+            }
+
             if let Some(new_id) = accepted_id {
                 if let Some(orphan_ids) = self.orphan_parents.remove(&new_id) {
                     for child_id in orphan_ids {
-                        if let Some((child_block, p)) = self.orphan_blocks.remove(&child_id) {
-                            queue.push_back((p, Box::new(child_block)));
+                        if let Some(child_entry) = self.remove_orphan(&child_id) {
+                            queue.push_back((child_entry.source_peer, Box::new(child_entry.block)));
                         }
                     }
                 }
@@ -492,14 +944,14 @@ impl NodeRuntime {
         &mut self,
         source_peer: PeerId,
         block: Box<Block>,
-    ) -> Result<Option<Hash>, String> {
+    ) -> Result<(Option<Hash>, Vec<Block>), String> {
         let block_id = block.header.block_id();
         let height = block.header.height;
         let parent_id = block.header.parent_block_id;
 
         // 1. Ignore if block is already known in storage
         if self.storage.has_block(&block_id).unwrap_or(false) {
-            return Ok(None);
+            return Ok((None, Vec::new()));
         }
 
         // 2. Missing parent check: if parent is unknown and not genesis, treat as orphan
@@ -514,21 +966,21 @@ impl NodeRuntime {
                 source_peer
             );
 
-            self.orphan_blocks.insert(block_id, (*block, source_peer));
-            self.orphan_parents
-                .entry(parent_id)
-                .or_default()
-                .push(block_id);
+            self.add_orphan(block_id, *block, source_peer);
 
             // Request missing parent block
             let req = SyncRequest::GetBlocks {
                 block_ids: vec![parent_id],
             };
-            let _ = self
+            let mut retrieved_parents = Vec::new();
+            if let Ok(SyncResponse::Blocks(parents)) = self
                 .network_handle
                 .send_sync_request(source_peer, req)
-                .await;
-            return Ok(None);
+                .await
+            {
+                retrieved_parents = parents;
+            }
+            return Ok((None, retrieved_parents));
         }
 
         // 3. Case A: Block directly extends current active tip
@@ -567,11 +1019,12 @@ impl NodeRuntime {
                 new_work
             );
 
-            return Ok(Some(block_id));
+            return Ok((Some(block_id), Vec::new()));
         }
 
         // 4. Case B: Competing branch / reorganization evaluation
-        self.evaluate_competing_branch(source_peer, *block).await
+        let res = self.evaluate_competing_branch(source_peer, *block).await?;
+        Ok((res, Vec::new()))
     }
 
     /// Evaluates a competing branch block, checking whether it leads to a reorganization
@@ -645,8 +1098,7 @@ impl NodeRuntime {
                     branch_b.header.height,
                     e
                 );
-                // Store as unapplied branch block
-                let _ = self.storage.store_branch_block(&block, U256::zero());
+                // Do not persist invalid branch block
                 return Ok(None);
             }
             branch_works.push(branch_state.cumulative_work());

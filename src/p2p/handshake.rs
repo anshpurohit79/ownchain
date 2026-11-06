@@ -142,9 +142,9 @@ impl HandshakeMessage {
                 "software version too long".into(),
             ));
         }
-        if bytes.len() < o + v_len {
+        if bytes.len() != o + v_len {
             return Err(HandshakeError::Malformed(
-                "software version truncated".into(),
+                "trailing bytes or truncated software version in handshake".into(),
             ));
         }
 

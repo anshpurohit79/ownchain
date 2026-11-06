@@ -54,9 +54,9 @@ Experimental Rust implementation of the OwnChain v1 consensus, node runtime, and
 8. **Node Runtime, Persistence and P2P Networking (M1-I):**
    - Modular node runtime architecture (`node`, `storage`, `p2p`, `mempool`).
    - Persistent embedded block and branch storage with atomic crash-safe commits and deterministic startup state reconstruction.
-   - Rust libp2p networking with TCP transport, Noise security, Yamux multiplexing, Gossipsub message propagation, and Kademlia DHT discovery.
-   - Chain synchronization protocol with cumulative proof-of-work chain selection and atomic branch reorganization.
-   - Bounded mempool with stateful admission, double-spend/conflict detection, and reorganization revalidation.
+   - Rust libp2p networking with TCP transport, Noise security, Yamux multiplexing, Gossipsub message propagation (`blocks/v1`, `txs/v1`), application-level handshakes (`/ownchain/1`), request-response chain synchronization (`/ownchain/sync/1`), and Kademlia DHT routing table maintenance (with bootstrap-address dialing as the currently supported initial connectivity mechanism).
+   - Fork-aware chain synchronization protocol with cumulative proof-of-work chain selection, common ancestor discovery, and atomic branch reorganization.
+   - Bounded mempool with stateful admission, multi-type authorization checks, double-spend/conflict detection, and reorganization revalidation.
 
 ---
 

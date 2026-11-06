@@ -66,6 +66,10 @@ pub enum NetworkCommand {
     Disconnect(PeerId),
     /// Query list of currently connected peers.
     GetConnectedPeers(oneshot::Sender<Vec<PeerInfo>>),
+    /// Query local listening addresses.
+    GetListenAddrs(oneshot::Sender<Vec<Multiaddr>>),
+    /// Initiate Kademlia DHT bootstrap.
+    BootstrapKademlia,
     /// Update local tip status for future handshakes.
     UpdateTip {
         height: u64,
@@ -176,6 +180,22 @@ impl NetworkHandle {
         rx.await.map_err(|e| format!("query dropped: {e}"))
     }
 
+    pub async fn get_listen_addrs(&self) -> Result<Vec<Multiaddr>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(NetworkCommand::GetListenAddrs(tx))
+            .await
+            .map_err(|e| e.to_string())?;
+        rx.await.map_err(|e| format!("query dropped: {e}"))
+    }
+
+    pub async fn bootstrap_kademlia(&self) -> Result<(), String> {
+        self.command_tx
+            .send(NetworkCommand::BootstrapKademlia)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     pub async fn update_tip(
         &self,
         height: u64,
@@ -208,6 +228,7 @@ pub struct NetworkService {
     command_rx: mpsc::Receiver<NetworkCommand>,
     event_tx: mpsc::Sender<NetworkEvent>,
     peers: HashMap<PeerId, PeerInfo>,
+    listen_addrs: Vec<Multiaddr>,
     pending_sync_requests:
         HashMap<OutboundRequestId, oneshot::Sender<Result<SyncResponse, String>>>,
     seen_announcements: HashSet<Hash>,
@@ -275,6 +296,7 @@ impl NetworkService {
             command_rx,
             event_tx,
             peers: HashMap::new(),
+            listen_addrs: Vec::new(),
             pending_sync_requests: HashMap::new(),
             seen_announcements: HashSet::new(),
             announcement_fifo: VecDeque::new(),
@@ -391,6 +413,12 @@ impl NetworkService {
                 let peer_list: Vec<PeerInfo> = self.peers.values().cloned().collect();
                 let _ = sender.send(peer_list);
             }
+            NetworkCommand::GetListenAddrs(sender) => {
+                let _ = sender.send(self.listen_addrs.clone());
+            }
+            NetworkCommand::BootstrapKademlia => {
+                let _ = self.swarm.behaviour_mut().kademlia.bootstrap();
+            }
             NetworkCommand::UpdateTip {
                 height,
                 block_id,
@@ -405,9 +433,22 @@ impl NetworkService {
 
     async fn handle_swarm_event(&mut self, event: SwarmEvent<OwnChainBehaviourEvent>) {
         match event {
+            SwarmEvent::NewListenAddr { address, .. } => {
+                tracing::info!("Node listening on {}", address);
+                if !self.listen_addrs.contains(&address) {
+                    self.listen_addrs.push(address);
+                }
+            }
+
             SwarmEvent::ConnectionEstablished {
                 peer_id, endpoint, ..
             } => {
+                let remote_addr = endpoint.get_remote_address().clone();
+                self.swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&peer_id, remote_addr.clone());
+
                 if self.peers.len() >= self.max_peers {
                     tracing::warn!(
                         "Max peers limit reached ({}), rejecting {}",
@@ -418,12 +459,11 @@ impl NetworkService {
                     return;
                 }
 
-                let addr = Some(endpoint.get_remote_address().clone());
                 self.peers.insert(
                     peer_id,
                     PeerInfo {
                         peer_id,
-                        address: addr,
+                        address: Some(remote_addr),
                         handshake: None,
                         connected_at: std::time::Instant::now(),
                     },
@@ -446,6 +486,35 @@ impl NetworkService {
                     .await;
             }
 
+            SwarmEvent::Behaviour(OwnChainBehaviourEvent::Identify(
+                libp2p::identify::Event::Received { peer_id, info, .. },
+            )) => {
+                for addr in info.listen_addrs {
+                    self.swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .add_address(&peer_id, addr);
+                }
+            }
+
+            SwarmEvent::Behaviour(OwnChainBehaviourEvent::Kademlia(kad_event)) => match kad_event {
+                libp2p::kad::Event::RoutingUpdated {
+                    peer,
+                    is_new_peer,
+                    addresses,
+                    ..
+                } => {
+                    tracing::debug!(
+                        "Kademlia routing updated: peer={peer}, new={is_new_peer}, addrs={:?}",
+                        addresses
+                    );
+                }
+                libp2p::kad::Event::OutboundQueryProgressed { result, .. } => {
+                    tracing::debug!("Kademlia query progress: {:?}", result);
+                }
+                _ => {}
+            },
+
             SwarmEvent::Behaviour(OwnChainBehaviourEvent::Gossipsub(GossipsubEvent::Message {
                 message,
                 ..
@@ -455,10 +524,6 @@ impl NetworkService {
 
             SwarmEvent::Behaviour(OwnChainBehaviourEvent::RequestResponse(req_resp_event)) => {
                 self.handle_request_response_event(req_resp_event).await;
-            }
-
-            SwarmEvent::NewListenAddr { address, .. } => {
-                tracing::info!("Node listening on {}", address);
             }
 
             _ => {}
@@ -580,6 +645,27 @@ impl NetworkService {
                     .await;
             }
             other_req => {
+                let is_handshake_done = self
+                    .peers
+                    .get(&peer_id)
+                    .map(|p| p.handshake.is_some())
+                    .unwrap_or(false);
+
+                if !is_handshake_done {
+                    tracing::warn!(
+                        "Peer {} sent sync request {:?} before completing application handshake; disconnecting",
+                        peer_id,
+                        other_req
+                    );
+                    let _ = self.swarm.behaviour_mut().request_response.send_response(
+                        channel,
+                        SyncResponse::Error("handshake required before sync requests".into()),
+                    );
+                    let _ = self.swarm.disconnect_peer_id(peer_id);
+                    self.peers.remove(&peer_id);
+                    return;
+                }
+
                 // Forward GetStatus / GetHeaders / GetBlocks etc. to node runtime
                 let _ = self
                     .event_tx
@@ -712,6 +798,78 @@ mod tests {
         let p1_id = handle1.local_peer_id();
         let p2_id = handle2.local_peer_id();
         assert_ne!(p1_id, p2_id);
+
+        s1_handle.abort();
+        s2_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_handshake_exchange_and_rejection() {
+        let chain_id_dev = Hash::new([1u8; 32]);
+        let chain_id_test = Hash::new([9u8; 32]);
+        let genesis_hash = Hash::new([2u8; 32]);
+        let tip_id = Hash::new([3u8; 32]);
+
+        let kp1 = Keypair::generate_ed25519();
+        let (service1, handle1, mut rx1) = NetworkService::new(
+            kp1,
+            "devnet",
+            chain_id_dev,
+            genesis_hash,
+            0,
+            tip_id,
+            U256::zero(),
+            "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            50,
+            100,
+            100,
+        )
+        .unwrap();
+
+        let s1_handle = tokio::spawn(service1.run());
+
+        // Get listen address for service 1
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let addrs1 = handle1.get_listen_addrs().await.unwrap();
+        assert!(!addrs1.is_empty(), "Service 1 must have listening address");
+        let target_addr = addrs1[0].clone();
+
+        // Node 2 has incompatible chain ID
+        let kp2 = Keypair::generate_ed25519();
+        let (service2, handle2, _rx2) = NetworkService::new(
+            kp2,
+            "testnet",
+            chain_id_test,
+            genesis_hash,
+            0,
+            tip_id,
+            U256::zero(),
+            "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            50,
+            100,
+            100,
+        )
+        .unwrap();
+        let s2_handle = tokio::spawn(service2.run());
+
+        // Dial node 1 from node 2
+        handle2.dial(target_addr).await.unwrap();
+
+        // Node 1 should reject the handshake and disconnect Node 2
+        let timeout = tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(ev) = rx1.recv().await {
+                if let NetworkEvent::PeerDisconnected { .. } = ev {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+
+        assert!(
+            timeout.unwrap_or(false),
+            "Incompatible peer must be disconnected after handshake rejection"
+        );
 
         s1_handle.abort();
         s2_handle.abort();

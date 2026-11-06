@@ -132,12 +132,20 @@ impl SyncRequest {
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 Ok(SyncRequest::Handshake(msg))
             }
-            TAG_REQ_GET_STATUS => Ok(SyncRequest::GetStatus),
-            TAG_REQ_GET_HEADERS => {
-                if bytes.len() < 1 + 8 + 4 {
+            TAG_REQ_GET_STATUS => {
+                if bytes.len() != 1 {
                     return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "truncated GetHeaders",
+                        io::ErrorKind::InvalidData,
+                        "trailing bytes in GetStatus",
+                    ));
+                }
+                Ok(SyncRequest::GetStatus)
+            }
+            TAG_REQ_GET_HEADERS => {
+                if bytes.len() != 1 + 8 + 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid GetHeaders message length",
                     ));
                 }
                 let start_height = u64::from_le_bytes(bytes[1..9].try_into().unwrap());
@@ -157,10 +165,10 @@ impl SyncRequest {
                 let count = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
                 let count = count.min(MAX_BLOCKS_PER_RESPONSE);
                 let expected = 5 + count * 32;
-                if bytes.len() < expected {
+                if bytes.len() != expected {
                     return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "truncated GetBlocks IDs",
+                        io::ErrorKind::InvalidData,
+                        "invalid GetBlocks message length",
                     ));
                 }
                 let mut ids = Vec::with_capacity(count);
@@ -172,20 +180,20 @@ impl SyncRequest {
                 Ok(SyncRequest::GetBlocks { block_ids: ids })
             }
             TAG_REQ_GET_BLOCK_BY_HEIGHT => {
-                if bytes.len() < 9 {
+                if bytes.len() != 9 {
                     return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "truncated GetBlockByHeight",
+                        io::ErrorKind::InvalidData,
+                        "invalid GetBlockByHeight length",
                     ));
                 }
                 let height = u64::from_le_bytes(bytes[1..9].try_into().unwrap());
                 Ok(SyncRequest::GetBlockByHeight { height })
             }
             TAG_REQ_GET_MISSING_PARENT => {
-                if bytes.len() < 33 {
+                if bytes.len() != 33 {
                     return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "truncated GetMissingParent",
+                        io::ErrorKind::InvalidData,
+                        "invalid GetMissingParent length",
                     ));
                 }
                 let mut id = [0u8; 32];
@@ -230,12 +238,30 @@ impl SyncResponse {
             }
             SyncResponse::Blocks(blocks) => {
                 out.push(TAG_RESP_BLOCKS);
-                let count = blocks.len().min(MAX_BLOCKS_PER_RESPONSE) as u32;
-                out.extend_from_slice(&count.to_le_bytes());
-                for b in blocks.iter().take(count as usize) {
+                let mut serialized_blocks = Vec::new();
+                let mut total_size = 5; // 1 byte tag + 4 bytes count
+                for b in blocks.iter().take(MAX_BLOCKS_PER_RESPONSE) {
                     let b_bytes = b
                         .to_bytes()
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    let entry_len = 4 + b_bytes.len();
+                    if total_size + entry_len > MAX_FRAME_LENGTH {
+                        if serialized_blocks.is_empty() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "single block size {entry_len} exceeds max frame length {MAX_FRAME_LENGTH}"
+                                ),
+                            ));
+                        }
+                        break;
+                    }
+                    total_size += entry_len;
+                    serialized_blocks.push(b_bytes);
+                }
+                let count = serialized_blocks.len() as u32;
+                out.extend_from_slice(&count.to_le_bytes());
+                for b_bytes in serialized_blocks {
                     let b_len = b_bytes.len() as u32;
                     out.extend_from_slice(&b_len.to_le_bytes());
                     out.extend_from_slice(&b_bytes);
@@ -270,10 +296,10 @@ impl SyncResponse {
                 Ok(SyncResponse::Handshake(msg))
             }
             TAG_RESP_STATUS => {
-                if bytes.len() < 1 + 8 + 32 + 32 {
+                if bytes.len() != 1 + 8 + 32 + 32 {
                     return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "truncated status response",
+                        io::ErrorKind::InvalidData,
+                        "invalid status response length",
                     ));
                 }
                 let tip_height = u64::from_le_bytes(bytes[1..9].try_into().unwrap());
@@ -297,10 +323,10 @@ impl SyncResponse {
                 let count = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
                 let count = count.min(MAX_HEADERS_PER_RESPONSE);
                 let expected = 5 + count * HEADER_LEN;
-                if bytes.len() < expected {
+                if bytes.len() != expected {
                     return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "truncated headers payload",
+                        io::ErrorKind::InvalidData,
+                        "invalid headers response length",
                     ));
                 }
                 let mut headers = Vec::with_capacity(count);
@@ -343,9 +369,23 @@ impl SyncResponse {
                     blocks.push(block);
                     o += b_len;
                 }
+                if o != bytes.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "trailing bytes in blocks response",
+                    ));
+                }
                 Ok(SyncResponse::Blocks(blocks))
             }
-            TAG_RESP_NOT_FOUND => Ok(SyncResponse::NotFound),
+            TAG_RESP_NOT_FOUND => {
+                if bytes.len() != 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "trailing bytes in not found response",
+                    ));
+                }
+                Ok(SyncResponse::NotFound)
+            }
             TAG_RESP_ERROR => {
                 if bytes.len() < 3 {
                     return Err(io::Error::new(
@@ -354,10 +394,10 @@ impl SyncResponse {
                     ));
                 }
                 let m_len = u16::from_le_bytes(bytes[1..3].try_into().unwrap()) as usize;
-                if bytes.len() < 3 + m_len {
+                if bytes.len() != 3 + m_len {
                     return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "truncated error message",
+                        io::ErrorKind::InvalidData,
+                        "invalid error message response length",
                     ));
                 }
                 let msg = String::from_utf8_lossy(&bytes[3..3 + m_len]).to_string();
@@ -505,5 +545,61 @@ mod tests {
         let resp3 = SyncResponse::Error("test error".into());
         let bytes3 = resp3.to_bytes().unwrap();
         assert_eq!(SyncResponse::from_bytes(&bytes3).unwrap(), resp3);
+    }
+
+    #[test]
+    fn test_reject_trailing_bytes_on_requests_and_responses() {
+        // Trailing bytes on GetStatus
+        let mut bad_status_req = SyncRequest::GetStatus.to_bytes();
+        bad_status_req.push(0xff);
+        assert!(SyncRequest::from_bytes(&bad_status_req).is_err());
+
+        // Trailing bytes on GetHeaders
+        let mut bad_headers_req = SyncRequest::GetHeaders {
+            start_height: 1,
+            max_count: 10,
+        }
+        .to_bytes();
+        bad_headers_req.push(0x00);
+        assert!(SyncRequest::from_bytes(&bad_headers_req).is_err());
+
+        // Trailing bytes on NotFound
+        let mut bad_not_found = SyncResponse::NotFound.to_bytes().unwrap();
+        bad_not_found.push(0x01);
+        assert!(SyncResponse::from_bytes(&bad_not_found).is_err());
+
+        // Trailing bytes on Status response
+        let mut bad_status_resp = SyncResponse::Status {
+            tip_height: 1,
+            tip_block_id: Hash::ZERO,
+            cumulative_work: U256::zero(),
+        }
+        .to_bytes()
+        .unwrap();
+        bad_status_resp.push(0x00);
+        assert!(SyncResponse::from_bytes(&bad_status_resp).is_err());
+    }
+
+    #[test]
+    fn test_byte_aware_block_batching() {
+        use crate::genesis::genesis_block;
+        use crate::hash::chain_id;
+
+        let cid = chain_id("devnet");
+        let gen = genesis_block(cid);
+
+        // A response with many blocks must not exceed MAX_FRAME_LENGTH
+        let many_blocks = vec![gen; 100];
+        let resp = SyncResponse::Blocks(many_blocks);
+        let bytes = resp.to_bytes().unwrap();
+        assert!(bytes.len() <= MAX_FRAME_LENGTH);
+
+        let decoded = SyncResponse::from_bytes(&bytes).unwrap();
+        if let SyncResponse::Blocks(b_list) = decoded {
+            assert!(!b_list.is_empty());
+            assert!(b_list.len() <= MAX_BLOCKS_PER_RESPONSE);
+        } else {
+            panic!("expected SyncResponse::Blocks");
+        }
     }
 }

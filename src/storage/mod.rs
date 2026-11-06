@@ -479,8 +479,29 @@ impl BlockStore {
             let mut block_meta = write_tx.open_table(TABLE_BLOCK_METADATA)?;
             let mut chain_meta = write_tx.open_table(TABLE_CHAIN_METADATA)?;
 
-            // If old chain was longer, remove stale height index entries
-            let mut old_metas_to_update = Vec::new();
+            // 1. For every active height that will be replaced by the replacement branch:
+            // Read its previous block ID from the active height index and mark its metadata inactive.
+            let mut displaced_metas = Vec::new();
+            for block in new_active_blocks {
+                let h = block.header.height;
+                let b_id = block.block_id();
+                if let Some(old_id_val) = height_idx.get(h)? {
+                    let old_id = Hash::new(*old_id_val.value());
+                    if old_id != b_id {
+                        if let Some(old_meta_val) = block_meta.get(old_id.as_bytes())? {
+                            if let Some(mut m) =
+                                StoredBlockMetadata::deserialize(old_meta_val.value())
+                            {
+                                m.is_active = false;
+                                displaced_metas.push((old_id, m));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. If the previous active chain was longer than the new tip,
+            // mark displaced blocks inactive and remove the stale height index entries.
             if old_tip_height > new_tip_height {
                 for h in (new_tip_height + 1)..=old_tip_height {
                     if let Some(old_id_val) = height_idx.get(h)? {
@@ -490,7 +511,7 @@ impl BlockStore {
                                 StoredBlockMetadata::deserialize(old_meta_val.value())
                             {
                                 m.is_active = false;
-                                old_metas_to_update.push((old_id, m));
+                                displaced_metas.push((old_id, m));
                             }
                         }
                     }
@@ -498,11 +519,11 @@ impl BlockStore {
                 }
             }
 
-            for (old_id, m) in old_metas_to_update {
+            for (old_id, m) in displaced_metas {
                 block_meta.insert(old_id.as_bytes(), m.serialize().as_slice())?;
             }
 
-            // Insert new active branch blocks and update height index
+            // 3. Insert replacement branch blocks, update height index, and mark metadata active
             for (block, &work) in new_active_blocks.iter().zip(new_cumulative_work.iter()) {
                 let b_id = block.block_id();
                 let b_bytes = block
@@ -520,6 +541,7 @@ impl BlockStore {
                 block_meta.insert(b_id.as_bytes(), meta.serialize().as_slice())?;
             }
 
+            // 4. Update active tip metadata
             chain_meta.insert(KEY_TIP_BLOCK_ID, new_tip_id.as_bytes().as_slice())?;
             chain_meta.insert(KEY_TIP_HEIGHT, &new_tip_height.to_le_bytes()[..])?;
             chain_meta.insert(KEY_CUMULATIVE_WORK, new_tip_work.to_le_bytes().as_slice())?;
@@ -800,5 +822,199 @@ mod tests {
         let reconstructed = reopened.reconstruct_chain_state().unwrap();
         assert_eq!(reconstructed.tip_height(), Some(2));
         assert_eq!(reconstructed.tip_block_id(), Some(b2b.block_id()));
+    }
+
+    #[test]
+    fn test_reorganization_metadata_consistency_regression() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test_reorg_consistency.redb");
+        let cid = chain_id(DEVNET);
+
+        let store = BlockStore::open(&db_path, cid).unwrap();
+        let genesis_state = store.reconstruct_chain_state().unwrap();
+        let genesis_time = genesis_block(cid).header.timestamp;
+
+        // 1. Build active branch A (2 blocks)
+        let mut state_a = genesis_state.clone();
+        let b1a = make_valid_child_block(&state_a, genesis_time + 120);
+        state_a.apply_block(&b1a).unwrap();
+        store
+            .commit_active_block(&b1a, state_a.cumulative_work())
+            .unwrap();
+
+        let b2a = make_valid_child_block(&state_a, genesis_time + 240);
+        state_a.apply_block(&b2a).unwrap();
+        store
+            .commit_active_block(&b2a, state_a.cumulative_work())
+            .unwrap();
+
+        let b1a_id = b1a.block_id();
+        let b2a_id = b2a.block_id();
+
+        // Both b1a and b2a should be active
+        assert!(
+            store
+                .get_block_metadata(&b1a_id)
+                .unwrap()
+                .unwrap()
+                .is_active
+        );
+        assert!(
+            store
+                .get_block_metadata(&b2a_id)
+                .unwrap()
+                .unwrap()
+                .is_active
+        );
+
+        // 2. Build competing equal-height branch B (2 blocks) with greater cumulative work
+        let mut state_b = genesis_state.clone();
+        let b1b = make_valid_child_block(&state_b, genesis_time + 130);
+        state_b.apply_block(&b1b).unwrap();
+        let b2b = make_valid_child_block(&state_b, genesis_time + 260);
+        state_b.apply_block(&b2b).unwrap();
+
+        let b1b_id = b1b.block_id();
+        let b2b_id = b2b.block_id();
+
+        // Reorganize store to Branch B with higher cumulative work
+        let work_b1 = U256::from_u128(10);
+        let work_b2 = U256::from_u128(20);
+
+        store
+            .commit_reorganization(
+                &[b1b.clone(), b2b.clone()],
+                &[work_b1, work_b2],
+                state_a.tip_height().unwrap(),
+            )
+            .unwrap();
+
+        // Verify displaced Branch A blocks are now marked inactive!
+        assert!(
+            !store
+                .get_block_metadata(&b1a_id)
+                .unwrap()
+                .unwrap()
+                .is_active
+        );
+        assert!(
+            !store
+                .get_block_metadata(&b2a_id)
+                .unwrap()
+                .unwrap()
+                .is_active
+        );
+
+        // Verify replacement Branch B blocks are marked active
+        assert!(
+            store
+                .get_block_metadata(&b1b_id)
+                .unwrap()
+                .unwrap()
+                .is_active
+        );
+        assert!(
+            store
+                .get_block_metadata(&b2b_id)
+                .unwrap()
+                .unwrap()
+                .is_active
+        );
+
+        // 3. Extend displaced Branch A until it has greater cumulative work than B
+        let b3a = make_valid_child_block(&state_a, genesis_time + 360);
+        state_a.apply_block(&b3a).unwrap();
+        let b4a = make_valid_child_block(&state_a, genesis_time + 480);
+        state_a.apply_block(&b4a).unwrap();
+
+        let b3a_id = b3a.block_id();
+        let b4a_id = b4a.block_id();
+
+        let work_a1 = state_a.cumulative_work_at(1).unwrap();
+        let work_a2 = state_a.cumulative_work_at(2).unwrap();
+        let work_a3 = state_a.cumulative_work_at(3).unwrap();
+        let work_a4 = state_a.cumulative_work_at(4).unwrap();
+
+        // 4. Reorganize back to Branch A
+        store
+            .commit_reorganization(
+                &[b1a.clone(), b2a.clone(), b3a.clone(), b4a.clone()],
+                &[work_a1, work_a2, work_a3, work_a4],
+                2, // old tip height was 2 (Branch B)
+            )
+            .unwrap();
+
+        // Verify Branch B blocks are now marked inactive
+        assert!(
+            !store
+                .get_block_metadata(&b1b_id)
+                .unwrap()
+                .unwrap()
+                .is_active
+        );
+        assert!(
+            !store
+                .get_block_metadata(&b2b_id)
+                .unwrap()
+                .unwrap()
+                .is_active
+        );
+
+        // Verify Branch A blocks are all marked active
+        assert!(
+            store
+                .get_block_metadata(&b1a_id)
+                .unwrap()
+                .unwrap()
+                .is_active
+        );
+        assert!(
+            store
+                .get_block_metadata(&b2a_id)
+                .unwrap()
+                .unwrap()
+                .is_active
+        );
+        assert!(
+            store
+                .get_block_metadata(&b3a_id)
+                .unwrap()
+                .unwrap()
+                .is_active
+        );
+        assert!(
+            store
+                .get_block_metadata(&b4a_id)
+                .unwrap()
+                .unwrap()
+                .is_active
+        );
+
+        // Side-branch blocks (b1b and b2b) remain retrievable by block ID!
+        assert!(store.get_block(&b1b_id).unwrap().is_some());
+        assert!(store.get_block(&b2b_id).unwrap().is_some());
+
+        drop(store);
+
+        // 5. Restart from storage and verify exact active-chain reconstruction
+        let reopened = BlockStore::open(&db_path, cid).unwrap();
+        let (tip_h, tip_id, tip_work) = reopened.get_tip().unwrap();
+        assert_eq!(tip_h, 4);
+        assert_eq!(tip_id, b4a_id);
+        assert_eq!(tip_work, work_a4);
+
+        let h1_id = reopened.get_block_by_height(1).unwrap().unwrap().block_id();
+        let h2_id = reopened.get_block_by_height(2).unwrap().unwrap().block_id();
+        let h3_id = reopened.get_block_by_height(3).unwrap().unwrap().block_id();
+        let h4_id = reopened.get_block_by_height(4).unwrap().unwrap().block_id();
+        assert_eq!(h1_id, b1a_id);
+        assert_eq!(h2_id, b2a_id);
+        assert_eq!(h3_id, b3a_id);
+        assert_eq!(h4_id, b4a_id);
+
+        let reconstructed = reopened.reconstruct_chain_state().unwrap();
+        assert_eq!(reconstructed.tip_height(), Some(4));
+        assert_eq!(reconstructed.tip_block_id(), Some(b4a_id));
+        assert_eq!(reconstructed.cumulative_work(), state_a.cumulative_work());
     }
 }

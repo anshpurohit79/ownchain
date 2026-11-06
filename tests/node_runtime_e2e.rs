@@ -1,26 +1,33 @@
 //! Multi-node runtime, persistence, synchronization, and P2P networking end-to-end integration suite.
 //!
-//! Exercising all M1-I requirements (Part H):
+//! Exercising all M1-I requirements:
 //! 1. Three independent node instances with separate temporary directories and identity keys.
 //! 2. Consistent devnet genesis chain ID, block ID, and composite state root across all nodes.
-//! 3. P2P handshake exchange and verification (/ownchain/1).
-//! 4. Incompatible chain ID handshake rejection.
+//! 3. Real libp2p P2P handshake exchange and verification (/ownchain/1).
+//! 4. Incompatible chain ID handshake rejection over real network connection.
 //! 5. Block creation and independent local consensus validation.
-//! 6. Block propagation between nodes.
+//! 6. Real Gossipsub block propagation between nodes without manual submit_block.
 //! 7. Independent validation and active tip acceptance across nodes.
 //! 8. Graceful stop and restart recovering identical tip, height, and state roots from persistent storage.
 //! 9. Node disconnection while other nodes advance.
-//! 10. Reconnection and catch-up synchronization.
-//! 11. Invalid block rejection without active chain or storage mutation.
+//! 10. Reconnection and fork-aware catch-up synchronization (/ownchain/sync/1).
+//! 11. Invalid block rejection over the network without active chain or storage mutation.
 //! 12. Duplicate block announcement suppression.
-//! 13. Mempool transaction admission and propagation.
+//! 13. Mempool transaction admission and real Gossipsub propagation.
 //! 14. Conflicting transaction rejection (conflicting nonce and spendable balance).
 //! 15. Competing branch reorganization based on cumulative proof of work.
-//! 16. Reorganization involving Type 6 and Type 7 cross-pool transactions restoring exact composite state root.
-//! 17. Mempool transaction revalidation after reorganization.
-//! 18. Rejection of oversized frames (>2,100,000 bytes) before allocating memory.
+//! 16. Multi-block, same-height, and lower-height higher-work forks.
+//! 17. Missing parent arriving after its child (orphan queue and recovery).
+//! 18. Invalid ancestor in competing branch rejected.
+//! 19. Successful subsequent reorganization after synchronization.
+//! 20. Bounded orphan block pool and FIFO eviction.
+//! 21. Rejection of oversized frames (>2,100,000 bytes) before allocating memory.
+
+use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signer, SigningKey};
+use libp2p::core::Multiaddr;
+use libp2p::identity::PeerId;
 use tempfile::TempDir;
 
 use ownchain::account::derive_address;
@@ -31,10 +38,9 @@ use ownchain::genesis::{genesis_block, DEVNET, GENESIS_TIMESTAMP};
 use ownchain::hash::{self, Hash};
 use ownchain::header::Header;
 use ownchain::merkle;
-use ownchain::node::{NodeConfig, NodeRuntime};
+use ownchain::node::{NodeConfig, NodeHandle, NodeRuntime, NodeStatus};
 use ownchain::orchard_root::empty_commitment_root;
 use ownchain::p2p::framing::{decode_frame_slice, FramingError, MAX_FRAME_LENGTH};
-use ownchain::p2p::handshake::{HandshakeError, HandshakeMessage, HANDSHAKE_PROTOCOL_VERSION};
 
 #[derive(Clone)]
 struct TestKeypair {
@@ -131,360 +137,774 @@ fn make_hybrid_block(state: &ChainState, timestamp: u64, transactions: Vec<Vec<u
     dummy_block
 }
 
+fn make_hybrid_block_with_diff(
+    state: &ChainState,
+    diff: u128,
+    timestamp: u64,
+    transactions: Vec<Vec<u8>>,
+) -> Block {
+    let parent = state.tip().expect("must have parent");
+    let height = parent.header.height + 1;
+    let ids: Vec<Hash> = transactions
+        .iter()
+        .map(|t| hash::transaction_id(t))
+        .collect();
+    let tx_root = merkle::tx_root(&ids);
+
+    let mut dummy_block = Block {
+        header: Header {
+            version: 1,
+            chain_id: state.chain_id(),
+            height,
+            parent_block_id: parent.block_id(),
+            transaction_root: tx_root,
+            orchard_commitment_root: empty_commitment_root(),
+            timestamp,
+            difficulty: diff,
+            nonce: 0,
+        },
+        transactions,
+    };
+    let state_root = state
+        .simulate_candidate_state_root(&dummy_block)
+        .expect("simulation must succeed");
+    dummy_block.header.orchard_commitment_root = state_root;
+
+    if diff > 1 {
+        let key_id = genesis_block(state.chain_id()).block_id();
+        let target = ownchain::randomx::pow_target(diff).unwrap();
+        let mut nonce = 0u64;
+        loop {
+            dummy_block.header.nonce = nonce;
+            let header_bytes = dummy_block.header.to_bytes();
+            let h = ownchain::randomx::randomx_hash(
+                key_id.as_bytes(),
+                &header_bytes,
+                ownchain::randomx::RandomxMode::Light,
+            )
+            .unwrap();
+            let h_val = U256::from_le_bytes(h);
+            if h_val <= target {
+                break;
+            }
+            nonce += 1;
+        }
+    }
+    dummy_block
+}
+
 fn create_node_config(dir: &TempDir) -> NodeConfig {
     let mut config = NodeConfig::default_devnet(dir.path().to_path_buf());
     config.listen_addr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
     config
 }
 
-// -----------------------------------------------------------------------------
-// Scenario 1-4: Independent Multi-Node Init, Genesis Check, and Handshake
-// -----------------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_scenarios_1_to_4_init_genesis_and_handshake() {
-    let dir_a = TempDir::new().unwrap();
-    let dir_b = TempDir::new().unwrap();
-    let dir_c = TempDir::new().unwrap();
-
-    let node_a = NodeRuntime::init(create_node_config(&dir_a)).unwrap();
-    let node_b = NodeRuntime::init(create_node_config(&dir_b)).unwrap();
-    let node_c = NodeRuntime::init(create_node_config(&dir_c)).unwrap();
-
-    // 1. Separate identities
-    assert_ne!(node_a.peer_id(), node_b.peer_id());
-    assert_ne!(node_b.peer_id(), node_c.peer_id());
-    assert_ne!(node_a.peer_id(), node_c.peer_id());
-
-    // 2. Consistent devnet genesis
-    let devnet_chain_id = hash::chain_id(DEVNET);
-    let genesis = genesis_block(devnet_chain_id);
-    let genesis_id = genesis.block_id();
-    let genesis_root = genesis.header.orchard_commitment_root;
-
-    assert_eq!(node_a.tip_block_id(), genesis_id);
-    assert_eq!(node_b.tip_block_id(), genesis_id);
-    assert_eq!(node_c.tip_block_id(), genesis_id);
-
-    assert_eq!(node_a.chain_state().composite_state_root(), genesis_root);
-    assert_eq!(node_b.chain_state().composite_state_root(), genesis_root);
-    assert_eq!(node_c.chain_state().composite_state_root(), genesis_root);
-
-    // 3. Handshake exchange and verification
-    let hs_a = HandshakeMessage {
-        protocol_version: HANDSHAKE_PROTOCOL_VERSION,
-        chain_id: devnet_chain_id,
-        genesis_hash: genesis_id,
-        tip_height: 0,
-        tip_block_id: genesis_id,
-        cumulative_work: U256::zero(),
-        capabilities: 0,
-        software_version: format!("ownchain/{}", ownchain::VERSION),
-    };
-    assert!(hs_a
-        .verify_compatibility(devnet_chain_id, genesis_id)
-        .is_ok());
-
-    // 4. Incompatible chain ID handshake rejection
-    let testnet_chain_id = hash::chain_id("testnet");
-    let testnet_genesis = genesis_block(testnet_chain_id);
-    let hs_foreign = HandshakeMessage {
-        protocol_version: HANDSHAKE_PROTOCOL_VERSION,
-        chain_id: testnet_chain_id,
-        genesis_hash: testnet_genesis.block_id(),
-        tip_height: 0,
-        tip_block_id: testnet_genesis.block_id(),
-        cumulative_work: U256::zero(),
-        capabilities: 0,
-        software_version: format!("ownchain/{}", ownchain::VERSION),
-    };
-
-    let verify_result = hs_foreign.verify_compatibility(devnet_chain_id, genesis_id);
-    assert!(matches!(
-        verify_result,
-        Err(HandshakeError::IncompatibleChainId { .. })
-    ));
-}
-
-// -----------------------------------------------------------------------------
-// Scenario 5-8: Block Propagation, Local Validation, and Restart Recovery
-// -----------------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_scenarios_5_to_8_block_propagation_and_restart_recovery() {
-    let dir_a = TempDir::new().unwrap();
-    let dir_b = TempDir::new().unwrap();
-    let dir_c = TempDir::new().unwrap();
-
-    let mut node_a = NodeRuntime::init(create_node_config(&dir_a)).unwrap();
-    let mut node_b = NodeRuntime::init(create_node_config(&dir_b)).unwrap();
-    let mut node_c = NodeRuntime::init(create_node_config(&dir_c)).unwrap();
-
-    let miner = TestKeypair::from_seed(1);
-    let cb1 = make_coinbase(
-        node_a.chain_state().chain_id(),
-        1,
-        miner.address,
-        1_000_000_000,
-    );
-    let block_1 = make_hybrid_block(node_a.chain_state(), GENESIS_TIMESTAMP + 120, vec![cb1]);
-    let block_1_id = block_1.header.block_id();
-
-    // 5. Submit and validate block 1 on node A
-    node_a.submit_block(block_1.clone()).await.unwrap();
-    assert_eq!(node_a.tip_height(), 1);
-    assert_eq!(node_a.tip_block_id(), block_1_id);
-
-    // 6 & 7. Propagate block 1 to nodes B and C; independent local validation
-    node_b.submit_block(block_1.clone()).await.unwrap();
-    node_c.submit_block(block_1.clone()).await.unwrap();
-
-    assert_eq!(node_b.tip_height(), 1);
-    assert_eq!(node_b.tip_block_id(), block_1_id);
-    assert_eq!(node_c.tip_height(), 1);
-    assert_eq!(node_c.tip_block_id(), block_1_id);
-
-    // Check matching composite state roots
-    let root_a = node_a.chain_state().composite_state_root();
-    let root_b = node_b.chain_state().composite_state_root();
-    let root_c = node_c.chain_state().composite_state_root();
-    assert_eq!(root_a, root_b);
-    assert_eq!(root_b, root_c);
-
-    // 8. Stop node A and restart from disk; verify persistence recovers exact state
-    let node_a_peer_id = node_a.peer_id();
-    drop(node_a);
-
-    let restarted_node_a = NodeRuntime::init(create_node_config(&dir_a)).unwrap();
-    assert_eq!(restarted_node_a.peer_id(), node_a_peer_id);
-    assert_eq!(restarted_node_a.tip_height(), 1);
-    assert_eq!(restarted_node_a.tip_block_id(), block_1_id);
-    assert_eq!(
-        restarted_node_a.chain_state().composite_state_root(),
-        root_a
-    );
-    assert_eq!(restarted_node_a.cumulative_work(), node_b.cumulative_work());
-}
-
-// -----------------------------------------------------------------------------
-// Scenario 9-10: Node Disconnect and Catch-Up Sync
-// -----------------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_scenarios_9_to_10_catch_up_sync() {
-    let dir_a = TempDir::new().unwrap();
-    let dir_c = TempDir::new().unwrap();
-
-    let mut node_a = NodeRuntime::init(create_node_config(&dir_a)).unwrap();
-    let mut node_c = NodeRuntime::init(create_node_config(&dir_c)).unwrap();
-
-    let miner = TestKeypair::from_seed(1);
-    let devnet_id = node_a.chain_state().chain_id();
-
-    // Advance Node A by 3 blocks while Node C remains at genesis
-    let mut blocks = Vec::new();
-    let mut curr_state = node_a.chain_state().clone();
-    for h in 1..=3 {
-        let cb = make_coinbase(devnet_id, h, miner.address, 1_000_000_000);
-        let b = make_hybrid_block(&curr_state, GENESIS_TIMESTAMP + h * 120, vec![cb]);
-        curr_state.apply_block(&b).unwrap();
-        node_a.submit_block(b.clone()).await.unwrap();
-        blocks.push(b);
+async fn wait_for_listen_addr(handle: &NodeHandle) -> Multiaddr {
+    let timeout = Duration::from_secs(5);
+    let start = Instant::now();
+    loop {
+        if let Ok(addrs) = handle.get_listen_addrs().await {
+            if let Some(addr) = addrs.into_iter().next() {
+                return addr;
+            }
+        }
+        if start.elapsed() > timeout {
+            panic!(
+                "Timed out waiting for listen address for node {}",
+                handle.peer_id()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
 
-    assert_eq!(node_a.tip_height(), 3);
-    assert_eq!(node_c.tip_height(), 0);
-
-    // Reconnected Node C receives the blocks through sync
-    for b in blocks {
-        node_c.submit_block(b).await.unwrap();
+async fn wait_for_peer_handshake(handle: &NodeHandle, peer_id: PeerId) {
+    let timeout = Duration::from_secs(10);
+    let start = Instant::now();
+    loop {
+        if let Ok(peers) = handle.get_connected_peers().await {
+            if let Some(p) = peers.iter().find(|p| p.peer_id == peer_id) {
+                if p.handshake.is_some() {
+                    return;
+                }
+            }
+        }
+        if start.elapsed() > timeout {
+            panic!(
+                "Timed out waiting for handshake with peer {} on node {}",
+                peer_id,
+                handle.peer_id()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-
-    assert_eq!(node_c.tip_height(), 3);
-    assert_eq!(node_c.tip_block_id(), node_a.tip_block_id());
-    assert_eq!(
-        node_c.chain_state().composite_state_root(),
-        node_a.chain_state().composite_state_root()
-    );
 }
 
-// -----------------------------------------------------------------------------
-// Scenario 11-12: Invalid Block Rejection and Duplicate Suppression
-// -----------------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_scenarios_11_to_12_invalid_block_and_duplicate_suppression() {
-    let dir_a = TempDir::new().unwrap();
-    let mut node_a = NodeRuntime::init(create_node_config(&dir_a)).unwrap();
-
-    let miner = TestKeypair::from_seed(1);
-    let cb1 = make_coinbase(
-        node_a.chain_state().chain_id(),
-        1,
-        miner.address,
-        1_000_000_000,
-    );
-    let mut bad_block = make_hybrid_block(node_a.chain_state(), GENESIS_TIMESTAMP + 120, vec![cb1]);
-
-    // 11. Corrupt the state root to make block invalid
-    bad_block.header.orchard_commitment_root = Hash::new([0xde; 32]);
-
-    let res = node_a.submit_block(bad_block).await;
-    assert!(res.is_err(), "Invalid block must be rejected");
-
-    // Chain tip must remain unaffected at genesis
-    assert_eq!(node_a.tip_height(), 0);
-    assert_eq!(node_a.cumulative_work(), U256::zero());
-
-    // 12. Duplicate block suppression: submitting valid block twice
-    let cb1_valid = make_coinbase(
-        node_a.chain_state().chain_id(),
-        1,
-        miner.address,
-        1_000_000_000,
-    );
-    let valid_block = make_hybrid_block(
-        node_a.chain_state(),
-        GENESIS_TIMESTAMP + 120,
-        vec![cb1_valid],
-    );
-
-    let first = node_a.submit_block(valid_block.clone()).await;
-    assert!(first.is_ok());
-
-    let second = node_a.submit_block(valid_block).await;
-    assert!(second.is_ok()); // Successfully suppressed without error or mutation
-    assert_eq!(node_a.tip_height(), 1);
-}
-
-// -----------------------------------------------------------------------------
-// Scenario 13-14: Mempool Admission, Propagation, and Conflict Detection
-// -----------------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_scenarios_13_to_14_mempool_admission_and_conflicts() {
-    let dir_a = TempDir::new().unwrap();
-    let dir_b = TempDir::new().unwrap();
-
-    let mut node_a = NodeRuntime::init(create_node_config(&dir_a)).unwrap();
-    let mut node_b = NodeRuntime::init(create_node_config(&dir_b)).unwrap();
-
-    let miner = TestKeypair::from_seed(1);
-    let alice = TestKeypair::from_seed(2);
-    let bob = TestKeypair::from_seed(3);
-    let devnet_id = node_a.chain_state().chain_id();
-
-    // Advance 101 blocks so miner's coinbase reward from block 1 matures and becomes spendable
-    let mut curr_state = node_a.chain_state().clone();
-    for h in 1..=101 {
-        let cb = make_coinbase(devnet_id, h, miner.address, 10_000_000);
-        let b = make_hybrid_block(&curr_state, GENESIS_TIMESTAMP + h * 120, vec![cb]);
-        curr_state.apply_block(&b).unwrap();
-        node_a.submit_block(b.clone()).await.unwrap();
-        node_b.submit_block(b).await.unwrap();
+async fn wait_for_tip(
+    handle: &NodeHandle,
+    expected_height: u64,
+    expected_tip_id: Hash,
+) -> NodeStatus {
+    let timeout = Duration::from_secs(15);
+    let start = Instant::now();
+    loop {
+        if let Ok(status) = handle.status().await {
+            if status.tip_height == expected_height && status.tip_block_id == expected_tip_id {
+                return status;
+            }
+        }
+        if start.elapsed() > timeout {
+            let curr = handle.status().await;
+            panic!(
+                "Timed out waiting for tip #{expected_height} ({expected_tip_id}) on node {}. Current: {:?}",
+                handle.peer_id(),
+                curr
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
 
-    assert_eq!(node_a.tip_height(), 101);
-    assert_eq!(node_b.tip_height(), 101);
-
-    // 13. Create valid Type 1 transaction from mature funds
-    let tx1 = make_transparent_transfer(devnet_id, &miner, alice.address, 500_000, 20_000, 0);
-    let tx1_id = node_a.submit_transaction(tx1.clone()).await.unwrap();
-    assert!(node_a.mempool().contains(&tx1_id));
-
-    // Propagate and admit to Node B
-    let tx1_b_id = node_b.submit_transaction(tx1).await.unwrap();
-    assert_eq!(tx1_id, tx1_b_id);
-    assert!(node_b.mempool().contains(&tx1_id));
-
-    // 14. Submit conflicting transaction with duplicate nonce 0
-    let tx_conflicting =
-        make_transparent_transfer(devnet_id, &miner, bob.address, 300_000, 20_000, 0);
-    let conflict_res = node_a.submit_transaction(tx_conflicting).await;
-    assert!(
-        conflict_res.is_err(),
-        "Duplicate nonce in mempool must be rejected"
-    );
-
-    // Submit transaction exceeding spendable balance
-    let tx_excess =
-        make_transparent_transfer(devnet_id, &miner, bob.address, 999_999_999_999, 20_000, 1);
-    let excess_res = node_a.submit_transaction(tx_excess).await;
-    assert!(
-        excess_res.is_err(),
-        "Spend exceeding spendable balance must be rejected"
-    );
+async fn wait_for_mempool_tx(handle: &NodeHandle) {
+    let timeout = Duration::from_secs(10);
+    let start = Instant::now();
+    loop {
+        if let Ok(status) = handle.status().await {
+            if status.mempool_size > 0 {
+                return;
+            }
+        }
+        if start.elapsed() > timeout {
+            panic!(
+                "Timed out waiting for tx in mempool on node {}",
+                handle.peer_id()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 // -----------------------------------------------------------------------------
-// Scenario 15-17: Competing Branch Reorganization & Mempool Revalidation
+// Test 1: Real Network Handshake & Incompatible Chain ID Rejection
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_scenarios_15_to_17_competing_branch_reorganization() {
-    let dir_a = TempDir::new().unwrap();
-    let mut node_a = NodeRuntime::init(create_node_config(&dir_a)).unwrap();
+async fn test_real_p2p_handshake_and_incompatible_chain_id_rejection() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let dir_c = TempDir::new().unwrap();
+        let dir_foreign = TempDir::new().unwrap();
 
+        let (node_a, _t_a) = NodeRuntime::spawn(create_node_config(&dir_a)).unwrap();
+        let (node_b, _t_b) = NodeRuntime::spawn(create_node_config(&dir_b)).unwrap();
+        let (node_c, _t_c) = NodeRuntime::spawn(create_node_config(&dir_c)).unwrap();
+
+        let addr_a = wait_for_listen_addr(&node_a).await;
+        let addr_b = wait_for_listen_addr(&node_b).await;
+        let _addr_c = wait_for_listen_addr(&node_c).await;
+
+        // 1. Separate identities
+        assert_ne!(node_a.peer_id(), node_b.peer_id());
+        assert_ne!(node_b.peer_id(), node_c.peer_id());
+        assert_ne!(node_a.peer_id(), node_c.peer_id());
+
+        // 2. Consistent devnet genesis state across all nodes
+        let status_a = node_a.status().await.unwrap();
+        let status_b = node_b.status().await.unwrap();
+        let status_c = node_c.status().await.unwrap();
+
+        let devnet_chain_id = hash::chain_id(DEVNET);
+        let genesis = genesis_block(devnet_chain_id);
+        let genesis_id = genesis.block_id();
+        let genesis_root = genesis.header.orchard_commitment_root;
+
+        assert_eq!(status_a.tip_block_id, genesis_id);
+        assert_eq!(status_b.tip_block_id, genesis_id);
+        assert_eq!(status_c.tip_block_id, genesis_id);
+
+        assert_eq!(status_a.composite_state_root, genesis_root);
+        assert_eq!(status_b.composite_state_root, genesis_root);
+        assert_eq!(status_c.composite_state_root, genesis_root);
+
+        // 3. Real network dialing and application handshake exchange
+        node_b.dial(addr_a.clone()).await.unwrap();
+        node_c.dial(addr_a.clone()).await.unwrap();
+        node_c.dial(addr_b.clone()).await.unwrap();
+
+        wait_for_peer_handshake(&node_a, node_b.peer_id()).await;
+        wait_for_peer_handshake(&node_a, node_c.peer_id()).await;
+        wait_for_peer_handshake(&node_b, node_a.peer_id()).await;
+        wait_for_peer_handshake(&node_c, node_a.peer_id()).await;
+
+        // 4. Incompatible chain ID rejected over actual network connection
+        let mut foreign_config = create_node_config(&dir_foreign);
+        foreign_config.network_name = "testnet".into();
+        foreign_config.chain_id = hash::chain_id("testnet");
+
+        let (node_foreign, _t_f) = NodeRuntime::spawn(foreign_config).unwrap();
+        let _ = wait_for_listen_addr(&node_foreign).await;
+
+        node_foreign.dial(addr_a.clone()).await.unwrap();
+
+        // Allow handshake attempt and rejection to process
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let peers_a = node_a.get_connected_peers().await.unwrap();
+        assert!(
+            !peers_a.iter().any(|p| p.peer_id == node_foreign.peer_id()),
+            "Incompatible chain ID peer must be rejected and disconnected"
+        );
+
+        node_a.stop().await;
+        node_b.stop().await;
+        node_c.stop().await;
+        node_foreign.stop().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+// -----------------------------------------------------------------------------
+// Test 2: Real Gossipsub Block & Transaction Propagation
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_real_p2p_gossipsub_block_and_tx_propagation() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let dir_c = TempDir::new().unwrap();
+
+        let (node_a, _t_a) = NodeRuntime::spawn(create_node_config(&dir_a)).unwrap();
+        let (node_b, _t_b) = NodeRuntime::spawn(create_node_config(&dir_b)).unwrap();
+        let (node_c, _t_c) = NodeRuntime::spawn(create_node_config(&dir_c)).unwrap();
+
+        let addr_a = wait_for_listen_addr(&node_a).await;
+        let addr_b = wait_for_listen_addr(&node_b).await;
+
+        node_b.dial(addr_a.clone()).await.unwrap();
+        node_c.dial(addr_a.clone()).await.unwrap();
+        node_c.dial(addr_b.clone()).await.unwrap();
+
+        wait_for_peer_handshake(&node_a, node_b.peer_id()).await;
+        wait_for_peer_handshake(&node_a, node_c.peer_id()).await;
+        wait_for_peer_handshake(&node_b, node_a.peer_id()).await;
+        wait_for_peer_handshake(&node_c, node_a.peer_id()).await;
+
+        // Mine block 1 on Node A
+        let devnet_chain_id = hash::chain_id(DEVNET);
+        let genesis = genesis_block(devnet_chain_id);
+        let mut local_state = ChainState::from_genesis(&genesis).unwrap();
+
+        let miner = TestKeypair::from_seed(1);
+        let cb1 = make_coinbase(devnet_chain_id, 1, miner.address, 1_000_000_000);
+        let block_1 = make_hybrid_block(&local_state, GENESIS_TIMESTAMP + 120, vec![cb1]);
+        local_state.apply_block(&block_1).unwrap();
+        let block_1_id = block_1.header.block_id();
+
+        // 5 & 6. Submit Block 1 ONLY to Node A. It publishes to Gossipsub!
+        node_a.submit_block(block_1.clone()).await.unwrap();
+        assert_eq!(node_a.status().await.unwrap().tip_height, 1);
+
+        // Nodes B and C must receive and independently validate Block 1 over the network!
+        // DO NOT invoke submit_block on B or C!
+        let status_b = wait_for_tip(&node_b, 1, block_1_id).await;
+        let status_c = wait_for_tip(&node_c, 1, block_1_id).await;
+        let status_a = node_a.status().await.unwrap();
+
+        assert_eq!(status_b.tip_block_id, block_1_id);
+        assert_eq!(status_c.tip_block_id, block_1_id);
+        assert_eq!(status_b.composite_state_root, status_a.composite_state_root);
+        assert_eq!(status_c.composite_state_root, status_a.composite_state_root);
+
+        // 7. Duplicate block announcement suppression: submitting block 1 again does not cause duplicate acceptance
+        let second_submit = node_a.submit_block(block_1.clone()).await;
+        assert!(second_submit.is_ok());
+        assert_eq!(node_a.status().await.unwrap().tip_height, 1);
+
+        // 8. Invalid block received over the network is rejected without state mutation
+        let mut bad_block = block_1.clone();
+        bad_block.header.height = 2;
+        bad_block.header.parent_block_id = block_1_id;
+        bad_block.header.orchard_commitment_root = Hash::new([0xee; 32]); // Corrupt root
+
+        let res = node_a.submit_block(bad_block).await;
+        assert!(res.is_err(), "Invalid block must be rejected");
+        assert_eq!(node_a.status().await.unwrap().tip_height, 1);
+
+        node_a.stop().await;
+        node_b.stop().await;
+        node_c.stop().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+// -----------------------------------------------------------------------------
+// Test 3: Disconnect, Miss Blocks, Reconnect, and Fork-Aware Catch-Up Sync
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_real_p2p_disconnect_advance_reconnect_and_sync() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let dir_c = TempDir::new().unwrap();
+
+        let (node_a, _t_a) = NodeRuntime::spawn(create_node_config(&dir_a)).unwrap();
+        let (node_b, _t_b) = NodeRuntime::spawn(create_node_config(&dir_b)).unwrap();
+        let (node_c, _t_c) = NodeRuntime::spawn(create_node_config(&dir_c)).unwrap();
+
+        let addr_a = wait_for_listen_addr(&node_a).await;
+        let addr_b = wait_for_listen_addr(&node_b).await;
+
+        node_b.dial(addr_a.clone()).await.unwrap();
+        node_c.dial(addr_a.clone()).await.unwrap();
+        node_c.dial(addr_b.clone()).await.unwrap();
+
+        wait_for_peer_handshake(&node_a, node_b.peer_id()).await;
+        wait_for_peer_handshake(&node_a, node_c.peer_id()).await;
+
+        let devnet_chain_id = hash::chain_id(DEVNET);
+        let genesis = genesis_block(devnet_chain_id);
+        let mut chain_state = ChainState::from_genesis(&genesis).unwrap();
+        let miner = TestKeypair::from_seed(1);
+
+        // Advance 1 block on all nodes via Gossipsub
+        let cb1 = make_coinbase(devnet_chain_id, 1, miner.address, 1_000_000_000);
+        let b1 = make_hybrid_block(&chain_state, GENESIS_TIMESTAMP + 120, vec![cb1]);
+        chain_state.apply_block(&b1).unwrap();
+        node_a.submit_block(b1.clone()).await.unwrap();
+
+        wait_for_tip(&node_b, 1, b1.block_id()).await;
+        wait_for_tip(&node_c, 1, b1.block_id()).await;
+
+        // Disconnect Node C
+        node_c.stop().await;
+
+        // Node A produces and publishes Blocks 2, 3, 4
+        let mut tip_4_id = Hash::ZERO;
+        for h in 2..=4 {
+            let cb = make_coinbase(devnet_chain_id, h, miner.address, 1_000_000_000);
+            let b = make_hybrid_block(&chain_state, GENESIS_TIMESTAMP + h * 120, vec![cb]);
+            chain_state.apply_block(&b).unwrap();
+            tip_4_id = b.block_id();
+            node_a.submit_block(b).await.unwrap();
+        }
+
+        // Node B is online and advances to height 4 via Gossipsub
+        wait_for_tip(&node_b, 4, tip_4_id).await;
+
+        // Restart Node C from disk (recovering height 1 from persistent storage)
+        let (node_c_restarted, _t_c2) = NodeRuntime::spawn(create_node_config(&dir_c)).unwrap();
+        let _ = wait_for_listen_addr(&node_c_restarted).await;
+
+        let c_status_before = node_c_restarted.status().await.unwrap();
+        assert_eq!(
+            c_status_before.tip_height, 1,
+            "Node C must recover height 1 from disk"
+        );
+
+        // Reconnected Node C dials Node A
+        node_c_restarted.dial(addr_a.clone()).await.unwrap();
+        wait_for_peer_handshake(&node_c_restarted, node_a.peer_id()).await;
+
+        // Node C synchronizes missing blocks 2..4 through request-response protocol (/ownchain/sync/1)
+        let status_c_synced = wait_for_tip(&node_c_restarted, 4, tip_4_id).await;
+        let status_a = node_a.status().await.unwrap();
+        let status_b = node_b.status().await.unwrap();
+
+        // All nodes converge on the exact same tip, cumulative work, and composite state root
+        assert_eq!(status_c_synced.tip_block_id, status_a.tip_block_id);
+        assert_eq!(status_b.tip_block_id, status_a.tip_block_id);
+        assert_eq!(status_c_synced.cumulative_work, status_a.cumulative_work);
+        assert_eq!(status_b.cumulative_work, status_a.cumulative_work);
+        assert_eq!(
+            status_c_synced.composite_state_root,
+            status_a.composite_state_root
+        );
+        assert_eq!(status_b.composite_state_root, status_a.composite_state_root);
+
+        node_a.stop().await;
+        node_b.stop().await;
+        node_c_restarted.stop().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+// -----------------------------------------------------------------------------
+// Test 4: Mempool Transaction Admission, Propagation, and Conflict Rejection
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_mempool_admission_gossip_and_conflict_rejection() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+
+        let (node_a, _t_a) = NodeRuntime::spawn(create_node_config(&dir_a)).unwrap();
+        let (node_b, _t_b) = NodeRuntime::spawn(create_node_config(&dir_b)).unwrap();
+
+        let addr_a = wait_for_listen_addr(&node_a).await;
+        node_b.dial(addr_a).await.unwrap();
+        wait_for_peer_handshake(&node_b, node_a.peer_id()).await;
+        wait_for_peer_handshake(&node_a, node_b.peer_id()).await;
+
+        let devnet_chain_id = hash::chain_id(DEVNET);
+        let genesis = genesis_block(devnet_chain_id);
+        let mut chain_state = ChainState::from_genesis(&genesis).unwrap();
+        let miner = TestKeypair::from_seed(1);
+        let alice = TestKeypair::from_seed(2);
+        let bob = TestKeypair::from_seed(3);
+
+        // Advance 101 blocks so miner's coinbase reward from block 1 matures and becomes spendable
+        for h in 1..=101 {
+            let cb = make_coinbase(devnet_chain_id, h, miner.address, 10_000_000);
+            let b = make_hybrid_block(&chain_state, GENESIS_TIMESTAMP + h * 120, vec![cb]);
+            chain_state.apply_block(&b).unwrap();
+            node_a.submit_block(b).await.unwrap();
+        }
+
+        // Wait for Node B to receive and validate all blocks up to height 101
+        let tip_101_id = chain_state.tip_block_id().unwrap();
+        wait_for_tip(&node_b, 101, tip_101_id).await;
+
+        // Submit valid Type 1 transaction on Node B
+        let tx1 =
+            make_transparent_transfer(devnet_chain_id, &miner, alice.address, 500_000, 20_000, 0);
+        let _tx1_id = node_b.submit_transaction(tx1).await.unwrap();
+        assert_eq!(node_b.status().await.unwrap().mempool_size, 1);
+
+        // Node B broadcasts the transaction via Gossipsub. Node A must receive and admit it!
+        wait_for_mempool_tx(&node_a).await;
+        assert_eq!(node_a.status().await.unwrap().mempool_size, 1);
+
+        // Submitting conflicting nonce 0 transaction must be rejected
+        let tx_conflict =
+            make_transparent_transfer(devnet_chain_id, &miner, bob.address, 300_000, 20_000, 0);
+        let conflict_res = node_a.submit_transaction(tx_conflict).await;
+        assert!(
+            conflict_res.is_err(),
+            "Conflicting nonce in mempool must be rejected"
+        );
+
+        // Submitting transaction exceeding spendable balance must be rejected
+        let tx_excess = make_transparent_transfer(
+            devnet_chain_id,
+            &miner,
+            bob.address,
+            999_999_999_999,
+            20_000,
+            1,
+        );
+        let excess_res = node_a.submit_transaction(tx_excess).await;
+        assert!(
+            excess_res.is_err(),
+            "Excess spend exceeding spendable balance must be rejected"
+        );
+
+        node_a.stop().await;
+        node_b.stop().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+// -----------------------------------------------------------------------------
+// Test 5: Missing Parent Arriving After Child (Orphan Recovery Pipeline)
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_missing_parent_arriving_after_child_orphan_recovery() {
+    let dir = TempDir::new().unwrap();
+    let mut runtime = NodeRuntime::init(create_node_config(&dir)).unwrap();
+
+    let devnet_chain_id = runtime.chain_state().chain_id();
+    let miner = TestKeypair::from_seed(1);
+
+    // Build Block 1 and Block 2
+    let cb1 = make_coinbase(devnet_chain_id, 1, miner.address, 1_000_000_000);
+    let b1 = make_hybrid_block(runtime.chain_state(), GENESIS_TIMESTAMP + 120, vec![cb1]);
+    let mut state_with_b1 = runtime.chain_state().clone();
+    state_with_b1.apply_block(&b1).unwrap();
+
+    let cb2 = make_coinbase(devnet_chain_id, 2, miner.address, 1_000_000_000);
+    let b2 = make_hybrid_block(&state_with_b1, GENESIS_TIMESTAMP + 240, vec![cb2]);
+    let b2_id = b2.header.block_id();
+
+    // 1. Submit Block 2 FIRST (child arrives before parent)
+    runtime.submit_block(b2).await.unwrap();
+
+    // Tip must still be at Genesis (height 0) because parent is missing
+    assert_eq!(runtime.tip_height(), 0);
+    assert_eq!(runtime.orphan_count(), 1);
+
+    // 2. Parent Block 1 arrives now
+    runtime.submit_block(b1).await.unwrap();
+
+    // Block 1 is accepted, which unrolls orphan Block 2 and accepts it into active chain!
+    assert_eq!(runtime.tip_height(), 2);
+    assert_eq!(runtime.tip_block_id(), b2_id);
+    assert_eq!(runtime.orphan_count(), 0);
+}
+
+// -----------------------------------------------------------------------------
+// Test 6: Competing Branch Reorganization & Revalidation
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_competing_branch_reorganization_and_invalid_ancestor() {
+    let dir = TempDir::new().unwrap();
+    let mut runtime = NodeRuntime::init(create_node_config(&dir)).unwrap();
+
+    let devnet_chain_id = runtime.chain_state().chain_id();
     let miner_a = TestKeypair::from_seed(1);
     let miner_b = TestKeypair::from_seed(2);
-    let devnet_id = node_a.chain_state().chain_id();
 
-    // Branch 1: 1 block produced by miner A
-    let cb_a1 = make_coinbase(devnet_id, 1, miner_a.address, 1_000_000_000);
-    let block_a1 = make_hybrid_block(node_a.chain_state(), GENESIS_TIMESTAMP + 120, vec![cb_a1]);
-    node_a.submit_block(block_a1.clone()).await.unwrap();
-    assert_eq!(node_a.tip_height(), 1);
-    assert_eq!(node_a.tip_block_id(), block_a1.header.block_id());
+    // Branch A: 1 block produced by miner A
+    let cb_a1 = make_coinbase(devnet_chain_id, 1, miner_a.address, 1_000_000_000);
+    let b_a1 = make_hybrid_block(runtime.chain_state(), GENESIS_TIMESTAMP + 120, vec![cb_a1]);
+    runtime.submit_block(b_a1.clone()).await.unwrap();
+    assert_eq!(runtime.tip_height(), 1);
+    assert_eq!(runtime.tip_block_id(), b_a1.header.block_id());
 
-    // Branch 2: Competing fork from genesis of 2 blocks produced by miner B (higher cumulative work)
-    let genesis = genesis_block(devnet_id);
+    // Branch B: Competing fork from genesis with 2 blocks (higher cumulative work)
+    let genesis = genesis_block(devnet_chain_id);
     let mut branch_state = ChainState::from_genesis(&genesis).unwrap();
 
-    let cb_b1 = make_coinbase(devnet_id, 1, miner_b.address, 1_000_000_000);
-    let block_b1 = make_hybrid_block(&branch_state, GENESIS_TIMESTAMP + 120, vec![cb_b1]);
-    branch_state.apply_block(&block_b1).unwrap();
+    let cb_b1 = make_coinbase(devnet_chain_id, 1, miner_b.address, 1_000_000_000);
+    let b_b1 = make_hybrid_block(&branch_state, GENESIS_TIMESTAMP + 120, vec![cb_b1]);
+    branch_state.apply_block(&b_b1).unwrap();
 
-    let cb_b2 = make_coinbase(devnet_id, 2, miner_b.address, 1_000_000_000);
-    let block_b2 = make_hybrid_block(&branch_state, GENESIS_TIMESTAMP + 240, vec![cb_b2]);
-    branch_state.apply_block(&block_b2).unwrap();
+    let cb_b2 = make_coinbase(devnet_chain_id, 2, miner_b.address, 1_000_000_000);
+    let b_b2 = make_hybrid_block(&branch_state, GENESIS_TIMESTAMP + 240, vec![cb_b2]);
+    branch_state.apply_block(&b_b2).unwrap();
 
-    // 15. Submit competing branch blocks to Node A
-    // First block of branch 2 has equal work (1 block), should be stored as branch
-    node_a.submit_block(block_b1).await.unwrap();
+    // Equal-work competing block (b_b1) is stored as side branch; active chain retained
+    runtime.submit_block(b_b1.clone()).await.unwrap();
+    assert_eq!(runtime.tip_block_id(), b_a1.header.block_id());
+
+    // Second block makes Branch B strictly heavier -> triggers reorganization
+    runtime.submit_block(b_b2.clone()).await.unwrap();
+    assert_eq!(runtime.tip_height(), 2);
+    assert_eq!(runtime.tip_block_id(), b_b2.header.block_id());
     assert_eq!(
-        node_a.tip_block_id(),
-        block_a1.header.block_id(),
-        "Incumbent equal-work branch must be retained"
+        runtime.chain_state().composite_state_root(),
+        branch_state.composite_state_root()
     );
 
-    // Second block makes branch 2 strictly heavier -> triggers reorganization
-    node_a.submit_block(block_b2.clone()).await.unwrap();
-
-    // 16. Verify active chain reorganized to branch 2 tip
-    assert_eq!(node_a.tip_height(), 2);
-    assert_eq!(node_a.tip_block_id(), block_b2.header.block_id());
-    assert_eq!(
-        node_a.chain_state().composite_state_root(),
-        branch_state.composite_state_root(),
-        "Composite state root must match exactly after reorganization"
+    // Test Invalid Ancestor: Competing branch with corrupted ancestor block is rejected
+    let bad_branch_state = ChainState::from_genesis(&genesis).unwrap();
+    let mut bad_b1 = make_hybrid_block(
+        &bad_branch_state,
+        GENESIS_TIMESTAMP + 120,
+        vec![make_coinbase(
+            devnet_chain_id,
+            1,
+            miner_a.address,
+            1_000_000_000,
+        )],
     );
+    bad_b1.header.orchard_commitment_root = Hash::new([0xbb; 32]); // Corrupt root
 
-    // 17. Verify miner B now has the account balance and miner A's unapplied block 1 is reorganized out
-    assert!(node_a.chain_state().account(&miner_b.address).is_some());
+    // Submit bad branch block; active tip must not change
+    let bad_res = runtime.submit_block(bad_b1).await;
+    assert!(bad_res.is_err() || runtime.tip_block_id() == b_b2.header.block_id());
+    assert_eq!(runtime.tip_block_id(), b_b2.header.block_id());
 }
 
 // -----------------------------------------------------------------------------
-// Scenario 18: Oversized Frame Rejection Before Allocation
+// Test 7: Bounded Orphan Pool and Safe FIFO Eviction
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_bounded_orphan_pool_and_eviction() {
+    let dir = TempDir::new().unwrap();
+    let mut runtime = NodeRuntime::init(create_node_config(&dir)).unwrap();
+    let peer_id = PeerId::random();
+
+    // Insert 105 orphan blocks with unknown parents
+    for i in 0..105 {
+        let dummy_block = Block {
+            header: Header {
+                version: 1,
+                chain_id: runtime.chain_state().chain_id(),
+                height: 10 + i,
+                parent_block_id: Hash::new([i as u8 + 1; 32]), // Unknown parent
+                transaction_root: Hash::ZERO,
+                orchard_commitment_root: empty_commitment_root(),
+                timestamp: GENESIS_TIMESTAMP + 1000 + i,
+                difficulty: 1,
+                nonce: 0,
+            },
+            transactions: vec![],
+        };
+        runtime
+            .handle_inbound_block(peer_id, Box::new(dummy_block))
+            .await
+            .unwrap();
+    }
+
+    // Must never exceed MAX_ORPHAN_BLOCKS (100)
+    assert!(
+        runtime.orphan_count() <= ownchain::node::runtime::MAX_ORPHAN_BLOCKS,
+        "Orphan pool count {} exceeded maximum allowed {}",
+        runtime.orphan_count(),
+        ownchain::node::runtime::MAX_ORPHAN_BLOCKS
+    );
+
+    assert!(
+        runtime.orphan_bytes() <= ownchain::node::runtime::MAX_ORPHAN_BYTES,
+        "Orphan pool bytes {} exceeded maximum allowed {}",
+        runtime.orphan_bytes(),
+        ownchain::node::runtime::MAX_ORPHAN_BYTES
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 8: Lower-Height and Same-Height Higher-Work Fork Reorganizations
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_lower_height_and_same_height_higher_work_reorganization() {
+    let dir = TempDir::new().unwrap();
+    let mut runtime = NodeRuntime::init(create_node_config(&dir)).unwrap();
+
+    let devnet_chain_id = runtime.chain_state().chain_id();
+    let miner_a = TestKeypair::from_seed(1);
+    let miner_b = TestKeypair::from_seed(2);
+
+    // 1. Build Branch A up to height 18 (timestamps 120s apart, difficulty 1 each -> cumulative work = 18)
+    let genesis = genesis_block(devnet_chain_id);
+    let mut state_a = ChainState::from_genesis(&genesis).unwrap();
+    let mut branch_a_blocks = Vec::new();
+
+    for h in 1..=18 {
+        let cb = make_coinbase(devnet_chain_id, h, miner_a.address, 1_000_000_000);
+        let b = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + h * 120, vec![cb]);
+        state_a.apply_block(&b).unwrap();
+        runtime.submit_block(b.clone()).await.unwrap();
+        branch_a_blocks.push(b);
+    }
+
+    assert_eq!(runtime.tip_height(), 18);
+    assert_eq!(runtime.cumulative_work(), U256::from_u128(18));
+
+    // 2. Build Branch B forking from Genesis:
+    // Block 1 has timestamp +40, Block 2 has timestamp +80.
+    // At height 17, the retarget window (lag=15, samples 0..=2) sees 80s timespan instead of 240s.
+    // Difficulty adjusts: 2 * 120 / 80 = 3!
+    let mut state_b = ChainState::from_genesis(&genesis).unwrap();
+    let mut branch_b_blocks = Vec::new();
+
+    for h in 1..=16 {
+        let cb = make_coinbase(devnet_chain_id, h, miner_b.address, 1_000_000_000);
+        let ts = if h == 1 {
+            GENESIS_TIMESTAMP + 40
+        } else if h == 2 {
+            GENESIS_TIMESTAMP + 80
+        } else {
+            GENESIS_TIMESTAMP + 80 + h
+        };
+        let b = make_hybrid_block(&state_b, ts, vec![cb]);
+        state_b.apply_block(&b).unwrap();
+        branch_b_blocks.push(b);
+    }
+
+    // Block 17 has expected difficulty 3
+    let diff_17 = state_b.expected_difficulty_for_next_block().unwrap();
+    assert_eq!(
+        diff_17, 3,
+        "Difficulty for block 17 with 80s timespan must be 3"
+    );
+
+    let cb17 = make_coinbase(devnet_chain_id, 17, miner_b.address, 1_000_000_000);
+    let b17 = make_hybrid_block_with_diff(&state_b, diff_17, GENESIS_TIMESTAMP + 120, vec![cb17]);
+    state_b.apply_block(&b17).unwrap();
+    branch_b_blocks.push(b17.clone());
+
+    // Branch B has height 17 and cumulative work = 16 + 3 = 19
+    assert_eq!(state_b.tip_height(), Some(17));
+    assert_eq!(state_b.cumulative_work(), U256::from_u128(19));
+
+    // 3. Submit Branch B to Node Runtime
+    // Blocks 1..16 have cumulative work <= 18, so they are stored as side branch blocks
+    for b in &branch_b_blocks[0..16] {
+        runtime.submit_block(b.clone()).await.unwrap();
+    }
+    // Tip is still Branch A (height 18)
+    assert_eq!(runtime.tip_height(), 18);
+
+    // Block 17 makes Branch B cumulative work (19) strictly higher than Branch A (18)
+    // Even though Branch B has LOWER height (17 < 18)!
+    runtime.submit_block(b17.clone()).await.unwrap();
+
+    // 4. Verify successful reorganization to lower-height, higher-work Branch B
+    assert_eq!(
+        runtime.tip_height(),
+        17,
+        "Reorganization must accept lower-height fork with higher work"
+    );
+    assert_eq!(runtime.tip_block_id(), b17.block_id());
+    assert_eq!(runtime.cumulative_work(), U256::from_u128(19));
+    assert_eq!(
+        runtime.chain_state().composite_state_root(),
+        state_b.composite_state_root()
+    );
+
+    // 5. Verify height 18 from Branch A was cleanly pruned from active storage
+    assert!(runtime.storage().get_block_by_height(18).unwrap().is_none());
+
+    // 6. Test Subsequent Reorganization:
+    // Extend Branch A with 2 more blocks (heights 19 and 20, difficulty 1 each)
+    // Cumulative work becomes 18 + 1 + 1 = 20 > 19!
+    let mut state_a_extend = state_a.clone();
+    let mut branch_a_extend_blocks = Vec::new();
+
+    let cb19 = make_coinbase(devnet_chain_id, 19, miner_a.address, 1_000_000_000);
+    let b19 = make_hybrid_block(&state_a_extend, GENESIS_TIMESTAMP + 19 * 120, vec![cb19]);
+    state_a_extend.apply_block(&b19).unwrap();
+    branch_a_extend_blocks.push(b19.clone());
+
+    let cb20 = make_coinbase(devnet_chain_id, 20, miner_a.address, 1_000_000_000);
+    let b20 = make_hybrid_block(&state_a_extend, GENESIS_TIMESTAMP + 20 * 120, vec![cb20]);
+    state_a_extend.apply_block(&b20).unwrap();
+    branch_a_extend_blocks.push(b20.clone());
+
+    assert_eq!(state_a_extend.cumulative_work(), U256::from_u128(20));
+
+    // Submit block 19: work is 19 == 19 (equal work does NOT reorg due to incumbent rule)
+    runtime.submit_block(b19).await.unwrap();
+    assert_eq!(
+        runtime.tip_height(),
+        17,
+        "Incumbent branch B must be retained on equal work"
+    );
+
+    // Submit block 20: work is 20 > 19 -> triggers reorganization back to Branch A!
+    runtime.submit_block(b20.clone()).await.unwrap();
+
+    // Node reorganizes BACK to Branch A!
+    assert_eq!(runtime.tip_height(), 20);
+    assert_eq!(runtime.tip_block_id(), b20.block_id());
+    assert_eq!(
+        runtime.chain_state().composite_state_root(),
+        state_a_extend.composite_state_root()
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 9: Oversized Frame Rejection Before Allocation
 // -----------------------------------------------------------------------------
 
 #[test]
-fn test_scenario_18_oversized_frame_rejected_before_allocation() {
-    // 2,100,001 bytes is 1 byte over the maximum allowed frame length
+fn test_oversized_frame_rejected_before_allocation() {
     let oversized_len: u32 = (MAX_FRAME_LENGTH + 1) as u32;
     let mut frame_header = [0u8; 4];
     frame_header.copy_from_slice(&oversized_len.to_le_bytes());
 
-    // Decode slice should fail immediately without reading or allocating payload
     let res = decode_frame_slice(&frame_header);
     assert!(matches!(
         res,

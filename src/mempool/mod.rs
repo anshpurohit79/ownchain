@@ -429,9 +429,16 @@ impl Mempool {
                 if raw_tx.len() < 436 {
                     return Err(MempoolError::Malformed("invalid Type 2 length".into()));
                 }
+                let unsigned_prefix = &raw_tx[..371];
+                let mut owner_sig = [0u8; 64];
+                owner_sig.copy_from_slice(&raw_tx[371..435]);
+                let guardian_section = &raw_tx[435..];
+
                 let payload = &raw_tx[tx::TX_ENVELOPE_LEN..];
                 let mut account_key = [0u8; 32];
                 account_key.copy_from_slice(&payload[..32]);
+                crate::auth::parse_strict_pubkey(&account_key)
+                    .map_err(|e| MempoolError::Malformed(format!("invalid account key: {e}")))?;
                 let account_addr = derive_address(&account_key);
                 let nonce = u64::from_le_bytes(payload[32..40].try_into().unwrap());
 
@@ -441,6 +448,38 @@ impl Mempool {
                 }
                 crate::auth::validate_guardian_keys_set(&new_guardians)
                     .map_err(|e| MempoolError::Malformed(format!("invalid guardian keys: {e}")))?;
+
+                let mut recovery_key = [0u8; 32];
+                recovery_key.copy_from_slice(&payload[304..336]);
+                crate::auth::validate_pubkey(&recovery_key)
+                    .map_err(|e| MempoolError::Malformed(format!("invalid recovery key: {e}")))?;
+
+                let guardian_entries =
+                    crate::auth::parse_guardian_sigs(guardian_section).map_err(|e| {
+                        MempoolError::Malformed(format!("malformed guardian signatures: {e}"))
+                    })?;
+
+                let expected_tx_len = 435 + 1 + guardian_entries.len() * 65;
+                if raw_tx.len() != expected_tx_len {
+                    return Err(MempoolError::Malformed(
+                        "invalid Type 2 wire length or trailing bytes".into(),
+                    ));
+                }
+
+                let unsigned_tx = crate::auth::canonical_unsigned_with_guardians(
+                    unsigned_prefix,
+                    &guardian_entries,
+                );
+                let preimage =
+                    crate::auth::compute_signing_preimage(chain_state.chain_id(), &unsigned_tx);
+
+                crate::auth::verify_signature(&account_key, &preimage, &owner_sig).map_err(
+                    |e| {
+                        MempoolError::InvalidSignature(format!(
+                            "owner signature verification failed: {e}"
+                        ))
+                    },
+                )?;
 
                 let acct = chain_state
                     .account(&account_addr)
@@ -473,6 +512,31 @@ impl Mempool {
                     });
                 }
 
+                check_mempool_allowance(acct, tip_h, fee as u128)?;
+
+                if acct.guardian_enabled {
+                    if guardian_entries.len() < 4 {
+                        return Err(MempoolError::Malformed(
+                            "reconfiguration requires at least 4 guardian signatures".into(),
+                        ));
+                    }
+                    crate::auth::verify_guardian_quorum(
+                        &acct.guardians,
+                        &preimage,
+                        &guardian_entries,
+                        4,
+                    )
+                    .map_err(|e| {
+                        MempoolError::InvalidSignature(format!(
+                            "reconfiguration guardian verification failed: {e}"
+                        ))
+                    })?;
+                } else if !guardian_entries.is_empty() {
+                    return Err(MempoolError::Malformed(
+                        "initial guardian configuration must not carry guardian signatures".into(),
+                    ));
+                }
+
                 Ok(AdmittedTxMeta {
                     tx_type: env.tx_type,
                     size: raw_tx.len(),
@@ -487,19 +551,136 @@ impl Mempool {
 
             TxType::GuardianAction => {
                 let payload = &raw_tx[tx::TX_ENVELOPE_LEN..];
-                if payload.len() < 42 {
-                    return Err(MempoolError::Malformed("invalid Type 3 length".into()));
+                if payload.len() < 45 {
+                    return Err(MempoolError::Malformed("truncated Type 3 payload".into()));
                 }
                 let mut target_key = [0u8; 32];
                 target_key.copy_from_slice(&payload[..32]);
-                let target_addr = derive_address(&target_key);
+                let target_addr = Hash::new(target_key);
+                let action_type = payload[32];
+                let params_len = u32::from_le_bytes(payload[41..45].try_into().unwrap()) as usize;
+                if payload.len() < 45 + params_len + 1 {
+                    return Err(MempoolError::Malformed(
+                        "truncated guardian action params".into(),
+                    ));
+                }
+                let params = &payload[45..45 + params_len];
 
-                let acct = chain_state
+                crate::auth::validate_guardian_action_params(action_type, params).map_err(|e| {
+                    MempoolError::Malformed(format!("invalid guardian action params: {e}"))
+                })?;
+
+                let unsigned_end = tx::TX_ENVELOPE_LEN + 45 + params_len;
+                let unsigned_prefix = &raw_tx[..unsigned_end];
+                let guardian_section = &raw_tx[unsigned_end..];
+
+                let guardian_entries =
+                    crate::auth::parse_guardian_sigs(guardian_section).map_err(|e| {
+                        MempoolError::Malformed(format!("malformed guardian signatures: {e}"))
+                    })?;
+
+                let expected_tx_len = unsigned_end + 1 + guardian_entries.len() * 65;
+                if raw_tx.len() != expected_tx_len {
+                    return Err(MempoolError::Malformed(
+                        "invalid Type 3 wire length or trailing bytes".into(),
+                    ));
+                }
+
+                let req_quorum = crate::auth::guardian_action_quorum(action_type).map_err(|e| {
+                    MempoolError::Malformed(format!("invalid guardian action quorum: {e}"))
+                })?;
+
+                let target = chain_state
                     .account(&target_addr)
                     .ok_or(MempoolError::AccountNotFound(target_addr))?;
-                if !acct.guardian_enabled {
-                    return Err(MempoolError::Malformed("guardians not enabled".into()));
+                if !target.guardian_enabled {
+                    return Err(MempoolError::Malformed(
+                        "guardians not enabled on target account".into(),
+                    ));
                 }
+
+                let unsigned_tx = crate::auth::canonical_unsigned_with_guardians(
+                    unsigned_prefix,
+                    &guardian_entries,
+                );
+                let preimage =
+                    crate::auth::compute_signing_preimage(chain_state.chain_id(), &unsigned_tx);
+
+                crate::auth::verify_guardian_quorum(
+                    &target.guardians,
+                    &preimage,
+                    &guardian_entries,
+                    req_quorum,
+                )
+                .map_err(|e| {
+                    MempoolError::InvalidSignature(format!(
+                        "guardian quorum verification failed: {e}"
+                    ))
+                })?;
+
+                match action_type {
+                    crate::auth::ACTION_STRENGTHEN_DELAYS => {
+                        let new_delay = u32::from_le_bytes(params[..4].try_into().unwrap());
+                        if new_delay < target.new_recipient_delay {
+                            return Err(MempoolError::Malformed(
+                                "cannot decrease delay with 3-of-7 quorum".into(),
+                            ));
+                        }
+                    }
+                    crate::auth::ACTION_STRENGTHEN_ALLOWANCE => {
+                        let new_lim = u128::from_le_bytes(params[..16].try_into().unwrap());
+                        let new_len = u64::from_le_bytes(params[16..24].try_into().unwrap());
+                        if target.allowance_limit > 0 && new_lim > target.allowance_limit {
+                            return Err(MempoolError::Malformed(
+                                "cannot increase limit with 3-of-7 quorum".into(),
+                            ));
+                        }
+                        if target.allowance_window_len > 0 && new_len < target.allowance_window_len
+                        {
+                            return Err(MempoolError::Malformed(
+                                "cannot shorten window with 3-of-7 quorum".into(),
+                            ));
+                        }
+                    }
+                    crate::auth::ACTION_REPLACE_GUARDIANS => {
+                        let mut new_guardians = [[0u8; 32]; 7];
+                        for i in 0..7 {
+                            new_guardians[i].copy_from_slice(&params[i * 32..(i + 1) * 32]);
+                        }
+                        crate::auth::validate_guardian_keys_set(&new_guardians).map_err(|e| {
+                            MempoolError::Malformed(format!(
+                                "invalid replacement guardian keys: {e}"
+                            ))
+                        })?;
+                    }
+                    crate::auth::ACTION_REPLACE_RECOVERY_KEY => {
+                        let mut new_rec = [0u8; 32];
+                        new_rec.copy_from_slice(&params[..32]);
+                        crate::auth::validate_pubkey(&new_rec).map_err(|e| {
+                            MempoolError::Malformed(format!(
+                                "invalid replacement recovery key: {e}"
+                            ))
+                        })?;
+                    }
+                    _ => {}
+                }
+
+                let current_pending = self.account_spends.get(&target_addr).copied().unwrap_or(0);
+                let needed = current_pending
+                    .checked_add(fee as u128)
+                    .ok_or_else(|| MempoolError::Malformed("fee overflow".into()))?;
+                let spendable = target
+                    .spendable_balance(tip_h)
+                    .map_err(|_| MempoolError::Malformed("spendable balance".into()))?;
+                if needed > spendable {
+                    return Err(MempoolError::InsufficientSpendableBalance {
+                        account: target_addr,
+                        spendable,
+                        required: needed,
+                    });
+                }
+
+                check_mempool_allowance(target, tip_h, fee as u128)?;
 
                 Ok(AdmittedTxMeta {
                     tx_type: env.tx_type,
@@ -517,6 +698,11 @@ impl Mempool {
                 if raw_tx.len() < 180 {
                     return Err(MempoolError::Malformed("invalid Type 4 length".into()));
                 }
+                let unsigned_prefix = &raw_tx[..115];
+                let mut sender_sig = [0u8; 64];
+                sender_sig.copy_from_slice(&raw_tx[115..179]);
+                let guardian_section = &raw_tx[179..];
+
                 let payload = &raw_tx[tx::TX_ENVELOPE_LEN..];
                 let mut sender_key = [0u8; 32];
                 sender_key.copy_from_slice(&payload[..32]);
@@ -524,15 +710,63 @@ impl Mempool {
                 let transfer_id = Hash::new(payload[32..64].try_into().unwrap());
                 let nonce = u64::from_le_bytes(payload[72..80].try_into().unwrap());
 
-                let acct = chain_state
-                    .account(&sender_addr)
-                    .ok_or(MempoolError::AccountNotFound(sender_addr))?;
-                if acct.is_frozen {
-                    return Err(MempoolError::AccountFrozen(sender_addr));
+                let guardian_entries =
+                    crate::auth::parse_guardian_sigs(guardian_section).map_err(|e| {
+                        MempoolError::Malformed(format!("malformed guardian signatures: {e}"))
+                    })?;
+
+                let expected_tx_len = 179 + 1 + guardian_entries.len() * 65;
+                if raw_tx.len() != expected_tx_len {
+                    return Err(MempoolError::Malformed(
+                        "invalid Type 4 wire length or trailing bytes".into(),
+                    ));
                 }
 
-                // Verify pending transfer exists
-                if !acct
+                let unsigned_tx = crate::auth::canonical_unsigned_with_guardians(
+                    unsigned_prefix,
+                    &guardian_entries,
+                );
+                let preimage =
+                    crate::auth::compute_signing_preimage(chain_state.chain_id(), &unsigned_tx);
+
+                crate::auth::verify_signature(&sender_key, &preimage, &sender_sig).map_err(
+                    |e| {
+                        MempoolError::InvalidSignature(format!(
+                            "sender signature verification failed: {e}"
+                        ))
+                    },
+                )?;
+
+                let sender = chain_state
+                    .account(&sender_addr)
+                    .ok_or(MempoolError::AccountNotFound(sender_addr))?;
+                if sender.is_frozen {
+                    return Err(MempoolError::AccountFrozen(sender_addr));
+                }
+                if !sender.guardian_enabled {
+                    return Err(MempoolError::Malformed(
+                        "sender account does not have guardians enabled".into(),
+                    ));
+                }
+
+                if guardian_entries.len() < 4 {
+                    return Err(MempoolError::Malformed(
+                        "cancellation requires at least 4 guardian signatures".into(),
+                    ));
+                }
+                crate::auth::verify_guardian_quorum(
+                    &sender.guardians,
+                    &preimage,
+                    &guardian_entries,
+                    4,
+                )
+                .map_err(|e| {
+                    MempoolError::InvalidSignature(format!(
+                        "guardian quorum verification failed: {e}"
+                    ))
+                })?;
+
+                if !sender
                     .pending_transfers
                     .iter()
                     .any(|p| p.transfer_id == transfer_id)
@@ -542,7 +776,7 @@ impl Mempool {
                     ));
                 }
 
-                let expected_nonce = self.expected_next_nonce(&sender_addr, acct.nonce);
+                let expected_nonce = self.expected_next_nonce(&sender_addr, sender.nonce);
                 if nonce != expected_nonce {
                     return Err(MempoolError::ConflictingNonce {
                         account: sender_addr,
@@ -550,6 +784,23 @@ impl Mempool {
                         found: nonce,
                     });
                 }
+
+                let current_pending = self.account_spends.get(&sender_addr).copied().unwrap_or(0);
+                let needed = current_pending
+                    .checked_add(fee as u128)
+                    .ok_or_else(|| MempoolError::Malformed("fee overflow".into()))?;
+                let spendable = sender
+                    .spendable_balance(tip_h)
+                    .map_err(|_| MempoolError::Malformed("spendable balance".into()))?;
+                if needed > spendable {
+                    return Err(MempoolError::InsufficientSpendableBalance {
+                        account: sender_addr,
+                        spendable,
+                        required: needed,
+                    });
+                }
+
+                check_mempool_allowance(sender, tip_h, fee as u128)?;
 
                 Ok(AdmittedTxMeta {
                     tx_type: env.tx_type,
@@ -674,6 +925,18 @@ impl Mempool {
                     .verify(&auth_digest, bundle.authorization().binding_signature())
                     .map_err(|_| MempoolError::InvalidSignature("binding signature".into()))?;
 
+                // Verify SpendAuth signatures on each action over auth_digest
+                for (idx, action) in bundle.actions().iter().enumerate() {
+                    action
+                        .rk()
+                        .verify(&auth_digest, action.authorization())
+                        .map_err(|_| {
+                            MempoolError::InvalidSignature(format!(
+                                "spend auth signature verification failed for action {idx}"
+                            ))
+                        })?;
+                }
+
                 let acct = chain_state
                     .account(&sender_addr)
                     .ok_or(MempoolError::AccountNotFound(sender_addr))?;
@@ -681,13 +944,32 @@ impl Mempool {
                     return Err(MempoolError::AccountFrozen(sender_addr));
                 }
 
-                // If guardians enabled, verify 4-of-7 quorum
+                let guardian_section = &payload[sig_end..];
+                let guardian_entries = crate::auth::parse_guardian_sigs(guardian_section)
+                    .map_err(|e| MempoolError::Malformed(format!("guardian sigs: {e}")))?;
+                let expected_payload_len = sig_end + 1 + guardian_entries.len() * 65;
+                if payload.len() != expected_payload_len {
+                    return Err(MempoolError::Malformed(
+                        "invalid Type 6 length or trailing bytes".into(),
+                    ));
+                }
+
                 if acct.guardian_enabled {
-                    let guardian_section = &payload[sig_end..];
-                    let entries = crate::auth::parse_guardian_sigs(guardian_section)
-                        .map_err(|e| MempoolError::Malformed(format!("guardian sigs: {e}")))?;
-                    crate::auth::verify_guardian_quorum(&acct.guardians, &auth_digest, &entries, 4)
-                        .map_err(|e| MempoolError::InvalidSignature(format!("quorum: {e}")))?;
+                    if guardian_entries.len() < 4 {
+                        return Err(MempoolError::Malformed(
+                            "protected account requires at least 4 guardian signatures".into(),
+                        ));
+                    }
+                    crate::orchard_tx::verify_type6_guardian_signatures(
+                        &auth_digest,
+                        &guardian_entries,
+                        &acct.guardians,
+                    )
+                    .map_err(|e| MempoolError::InvalidSignature(format!("quorum: {e}")))?;
+                } else if !guardian_entries.is_empty() {
+                    return Err(MempoolError::Malformed(
+                        "unprotected account must not carry guardian signatures".into(),
+                    ));
                 }
 
                 // Nonce and spendable balance check
@@ -1235,5 +1517,127 @@ mod tests {
         // tx2 should still be in mempool, revalidated against state where miner nonce is now 1
         assert!(pool.contains(&tx2_id));
         assert_eq!(pool.len(), 1);
+    }
+
+    fn make_test_key(seed: u8) -> SigningKey {
+        let mut key_bytes = [0u8; 32];
+        key_bytes[0] = seed;
+        key_bytes[31] = 0x01;
+        SigningKey::from_bytes(&key_bytes)
+    }
+
+    #[test]
+    fn test_mempool_type2_authorization_checks() {
+        let miner_sk = make_test_key(1);
+        let (state, _last_block) = setup_chain_with_funded_account(&miner_sk);
+        let cid = test_chain_id();
+        let miner_pk = miner_sk.verifying_key().to_bytes();
+
+        let mut guardians = [[0u8; 32]; 7];
+        for (i, g) in guardians.iter_mut().enumerate() {
+            *g = make_test_key(10 + i as u8).verifying_key().to_bytes();
+        }
+        let recovery_pk = make_test_key(99).verifying_key().to_bytes();
+
+        // 1. Valid initial configuration (no guardian signatures required)
+        let mut unsigned_prefix = Vec::with_capacity(371);
+        unsigned_prefix.push(2); // Type 2
+        unsigned_prefix.extend_from_slice(&1u16.to_le_bytes());
+        unsigned_prefix.extend_from_slice(cid.as_bytes());
+        unsigned_prefix.extend_from_slice(&miner_pk);
+        unsigned_prefix.extend_from_slice(&0u64.to_le_bytes()); // nonce 0
+        unsigned_prefix.extend_from_slice(&50_000u64.to_le_bytes()); // fee 50,000
+        for g in &guardians {
+            unsigned_prefix.extend_from_slice(g);
+        }
+        unsigned_prefix.extend_from_slice(&100u32.to_le_bytes()); // new_recipient_delay
+        unsigned_prefix.extend_from_slice(&200u32.to_le_bytes()); // withdrawal_delay
+        unsigned_prefix.extend_from_slice(&1_000_000u128.to_le_bytes()); // allowance_limit
+        unsigned_prefix.extend_from_slice(&50u64.to_le_bytes()); // allowance_window_len
+        unsigned_prefix.extend_from_slice(&recovery_pk);
+        assert_eq!(unsigned_prefix.len(), 371);
+
+        let unsigned_tx = crate::auth::canonical_unsigned_with_guardians(&unsigned_prefix, &[]);
+        let preimage = crate::auth::compute_signing_preimage(cid, &unsigned_tx);
+        let valid_owner_sig = miner_sk.sign(&preimage);
+
+        let mut valid_tx2 = unsigned_prefix.clone();
+        valid_tx2.extend_from_slice(&valid_owner_sig.to_bytes());
+        valid_tx2.push(0); // 0 guardian signatures
+
+        let mut pool = Mempool::new();
+        let admitted = pool.admit(&valid_tx2, &state);
+        assert!(admitted.is_ok(), "Valid Type 2 must be admitted");
+
+        // 2. Corrupted owner signature
+        let mut bad_sig_tx = valid_tx2.clone();
+        bad_sig_tx[371] ^= 0xff; // flip byte in owner signature
+        let mut pool_bad_sig = Mempool::new();
+        let res_bad_sig = pool_bad_sig.admit(&bad_sig_tx, &state);
+        assert!(matches!(
+            res_bad_sig,
+            Err(MempoolError::InvalidSignature(_))
+        ));
+
+        // 3. Invalid recovery key (all zero)
+        let mut bad_rec_tx = unsigned_prefix.clone();
+        bad_rec_tx[339..371].copy_from_slice(&[0u8; 32]); // zero recovery key
+        let unsigned_bad = crate::auth::canonical_unsigned_with_guardians(&bad_rec_tx, &[]);
+        let pre_bad = crate::auth::compute_signing_preimage(cid, &unsigned_bad);
+        let sig_bad = miner_sk.sign(&pre_bad);
+        bad_rec_tx.extend_from_slice(&sig_bad.to_bytes());
+        bad_rec_tx.push(0);
+        let mut pool_bad_rec = Mempool::new();
+        let res_bad_rec = pool_bad_rec.admit(&bad_rec_tx, &state);
+        assert!(matches!(res_bad_rec, Err(MempoolError::Malformed(_))));
+    }
+
+    #[test]
+    fn test_mempool_type3_guardian_action_authorization_checks() {
+        let miner_sk = make_test_key(1);
+        let (state, _last_block) = setup_chain_with_funded_account(&miner_sk);
+        let cid = test_chain_id();
+        let miner_pk = miner_sk.verifying_key().to_bytes();
+        let miner_addr = derive_address(&miner_pk);
+
+        // Try guardian action on account that does NOT have guardians enabled
+        let mut tx3 = Vec::new();
+        tx3.push(3); // Type 3
+        tx3.extend_from_slice(&1u16.to_le_bytes());
+        tx3.extend_from_slice(cid.as_bytes());
+        tx3.extend_from_slice(miner_addr.as_bytes());
+        tx3.push(crate::auth::ACTION_FREEZE);
+        tx3.extend_from_slice(&50_000u64.to_le_bytes()); // fee
+        tx3.extend_from_slice(&0u32.to_le_bytes()); // params_len = 0
+        tx3.push(0); // 0 guardian signatures
+
+        let mut pool = Mempool::new();
+        let res = pool.admit(&tx3, &state);
+        assert!(matches!(res, Err(MempoolError::Malformed(_))));
+    }
+
+    #[test]
+    fn test_mempool_type4_cancel_pending_authorization_checks() {
+        let miner_sk = make_test_key(1);
+        let (state, _last_block) = setup_chain_with_funded_account(&miner_sk);
+        let cid = test_chain_id();
+        let miner_pk = miner_sk.verifying_key().to_bytes();
+
+        // Try cancel pending on account without guardians
+        let mut tx4 = Vec::new();
+        tx4.push(4); // Type 4
+        tx4.extend_from_slice(&1u16.to_le_bytes());
+        tx4.extend_from_slice(cid.as_bytes());
+        tx4.extend_from_slice(&miner_pk);
+        tx4.extend_from_slice(&[0xaa; 32]); // transfer_id
+        tx4.extend_from_slice(&50_000u64.to_le_bytes()); // fee
+        tx4.extend_from_slice(&0u64.to_le_bytes()); // nonce
+        let fake_sig = [0u8; 64];
+        tx4.extend_from_slice(&fake_sig);
+        tx4.push(0); // 0 guardian sigs
+
+        let mut pool = Mempool::new();
+        let res = pool.admit(&tx4, &state);
+        assert!(res.is_err(), "Must be rejected");
     }
 }
