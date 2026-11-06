@@ -504,6 +504,17 @@ fn test_adversarial_type6_tampering() {
         err,
         OrchardValidationError::InvalidGuardianQuorum(_)
     ));
+
+    // 11. Mutate spend authorization signature -> SpendAuthSignatureInvalid
+    let mut bad_spend_auth = t6.raw_tx.clone();
+    let bundle_offset = TX_ENVELOPE_LEN + 68;
+    let spend_auth_sig_offset = bundle_offset + bundle_len - 128;
+    bad_spend_auth[spend_auth_sig_offset] ^= 0xff;
+    let err = validate_type6_transaction_stateless(&bad_spend_auth, chain_id, &vk).unwrap_err();
+    assert!(matches!(
+        err,
+        OrchardValidationError::SpendAuthSignatureInvalid { action_index: 0 }
+    ));
 }
 
 #[test]
@@ -617,8 +628,8 @@ fn test_type6_anchor_and_dummy_nullifier_rules() {
 
     // Nullifier Rule: Actions in Type 6 have SPENDS_DISABLED flags
     assert_eq!(*validated.bundle.flags(), Flags::SPENDS_DISABLED);
-    // The nullifiers generated are dummy nullifiers per ZIP-225 Section 7.
-    // They are not real spends, so they must not be tracked or committed to active nullifier sets.
+    // In OwnChain consensus, action nullifiers in SPENDS_DISABLED bundles are dummy nullifiers,
+    // which are tracked for uniqueness and committed to the chain's active nullifier set upon block application.
     let action = &validated.bundle.actions()[0];
     let dummy_nf = action.nullifier();
     assert_eq!(dummy_nf.to_bytes().len(), 32);

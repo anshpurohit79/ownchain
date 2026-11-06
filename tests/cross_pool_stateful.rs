@@ -6,18 +6,19 @@
 //! - Strict 4-of-7 guardian quorum authorization
 //! - Monetary balance conservation: sender debited A + F, pool credited A, fee accumulated F, T + S = I
 //! - Orchard commitment tree updates and composite state root binding
-//! - Non-tracking of dummy nullifiers (never added to active nullifier set)
+//! - Tracking and uniqueness enforcement of action dummy nullifiers
 //! - State atomicity on invalid execution
 //! - Chain reorg / rollback correctness
 
 use ed25519_dalek::{Signer, SigningKey};
 use orchard::{
-    builder::{Builder, BundleType},
+    builder::{Builder, BundleType, InProgress, Unauthorized},
     bundle::{BundleVersion, Flags},
     circuit::{OrchardCircuitVersion, ProvingKey},
     keys::{FullViewingKey, OutgoingViewingKey, Scope, SpendingKey},
     tree::Anchor,
     value::NoteValue,
+    Proof,
 };
 use ownchain::{
     account::derive_address,
@@ -253,16 +254,13 @@ fn setup_funded_chain() -> (ChainState, TestKeypair, TestKeypair, u64) {
     (state, miner, alice, ts)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_valid_type6_tx(
-    chain_id: Hash,
-    sender: &TestKeypair,
-    nonce: u64,
+fn build_proven_type6_bundle(
     shielded_amount: u64,
-    fee_atoms: u64,
     seed: u8,
-    guardian_signers: &[(u8, &TestKeypair)],
-) -> Vec<u8> {
+) -> (
+    orchard::Bundle<InProgress<Proof, Unauthorized>, i64>,
+    orchard::note::Nullifier,
+) {
     let mut rng = StdRng::from_seed([seed; 32]);
     let pk = get_proving_key();
 
@@ -289,8 +287,21 @@ fn build_valid_type6_tx(
         .unwrap();
 
     let (unauth_bundle, _) = builder.build::<i64>(&mut rng).unwrap().unwrap();
+    let nf = *unauth_bundle.actions()[0].nullifier();
     let proven_bundle = unauth_bundle.create_proof(pk, &mut rng).unwrap();
+    (proven_bundle, nf)
+}
 
+fn build_type6_tx_from_proven(
+    chain_id: Hash,
+    sender: &TestKeypair,
+    nonce: u64,
+    shielded_amount: u64,
+    fee_atoms: u64,
+    proven_bundle: &orchard::Bundle<InProgress<Proof, Unauthorized>, i64>,
+    guardian_signers: &[(u8, &TestKeypair)],
+) -> Vec<u8> {
+    let mut rng = StdRng::seed_from_u64(42);
     let auth_digest = compute_type6_bundle_auth_digest(
         *chain_id.as_bytes(),
         1u16,
@@ -298,10 +309,11 @@ fn build_valid_type6_tx(
         nonce,
         shielded_amount as u128,
         fee_atoms,
-        &proven_bundle,
+        proven_bundle,
     );
 
     let authorized_bundle = proven_bundle
+        .clone()
         .apply_signatures(&mut rng, auth_digest, &[])
         .unwrap();
     let bundle_bytes = serialize_bundle(&authorized_bundle);
@@ -331,6 +343,28 @@ fn build_valid_type6_tx(
     raw_tx
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_valid_type6_tx(
+    chain_id: Hash,
+    sender: &TestKeypair,
+    nonce: u64,
+    shielded_amount: u64,
+    fee_atoms: u64,
+    seed: u8,
+    guardian_signers: &[(u8, &TestKeypair)],
+) -> Vec<u8> {
+    let (proven, _) = build_proven_type6_bundle(shielded_amount, seed);
+    build_type6_tx_from_proven(
+        chain_id,
+        sender,
+        nonce,
+        shielded_amount,
+        fee_atoms,
+        &proven,
+        guardian_signers,
+    )
+}
+
 // ===========================================================================
 // Test 1: Valid Type 6 Execution on Unprotected Account
 // ===========================================================================
@@ -344,7 +378,9 @@ fn test_valid_type6_execution_unprotected() {
     let shielded_amount = 50_000_000u64;
     let fee_atoms = 1_000_000u64;
 
-    let t2s = build_valid_type6_tx(id, &alice, 0, shielded_amount, fee_atoms, 0x11, &[]);
+    let (proven_102, nf_102) = build_proven_type6_bundle(shielded_amount, 0x11);
+    let t2s =
+        build_type6_tx_from_proven(id, &alice, 0, shielded_amount, fee_atoms, &proven_102, &[]);
 
     let cb102 = make_coinbase(id, 102, miner.address, fee_atoms);
     let b102 = make_hybrid_block(&state, ts, vec![cb102, t2s]);
@@ -371,8 +407,19 @@ fn test_valid_type6_execution_unprotected() {
     // Check Orchard Commitment Tree: root updated with newly appended note commitment
     assert_ne!(state.orchard_tree().root(), pre_tree_root);
 
-    // Check Dummy Nullifier Non-Tracking: nullifier set remains empty!
-    assert!(state.nullifier_set().is_empty());
+    // Check Action Dummy Nullifier Tracking: dummy nullifier from Type 6 is tracked in active nullifier set
+    assert_eq!(state.nullifier_set().len(), 1);
+    let action_nf = Hash::new(nf_102.to_bytes());
+    assert!(state.nullifier_set().contains(&action_nf));
+
+    // Verify nullifier root participates in composite state root
+    let expected_nf_root = merkle::nullifier_merkle_root(&[action_nf]);
+    assert_eq!(state.nullifier_state_root(), expected_nf_root);
+    assert_ne!(state.nullifier_state_root(), merkle::state_empty_root());
+    assert_eq!(
+        state.composite_state_root(),
+        b102.header.orchard_commitment_root
+    );
 
     // Check Global Monetary Conservation: T + S == I
     let mut t_sum = 0u128;
@@ -1198,8 +1245,15 @@ fn test_apply_block_rejects_invalid_candidates_without_mutating_state() {
     let mut bad_sig_t2s = t2s.clone();
     let sig_idx = ownchain::tx::TX_ENVELOPE_LEN + 68 + bundle_len;
     bad_sig_t2s[sig_idx] ^= 0xff;
-    let bad_sig_block = make_candidate_block(&state, ts, vec![cb, bad_sig_t2s]);
+    let bad_sig_block = make_candidate_block(&state, ts, vec![cb.clone(), bad_sig_t2s]);
     assert!(state.apply_block(&bad_sig_block).is_err());
+
+    // Case 5: Corrupted SpendAuth signature in Type 6 rejected by apply_block
+    let mut bad_auth_t2s = t2s.clone();
+    let spend_auth_offset = ownchain::tx::TX_ENVELOPE_LEN + 68 + bundle_len - 128;
+    bad_auth_t2s[spend_auth_offset] ^= 0xff;
+    let bad_auth_block = make_candidate_block(&state, ts, vec![cb, bad_auth_t2s]);
+    assert!(state.apply_block(&bad_auth_block).is_err());
 
     // Absolute state preservation
     assert_eq!(state.tip_height(), snap_height);
@@ -1209,4 +1263,48 @@ fn test_apply_block_rejects_invalid_candidates_without_mutating_state() {
     assert_eq!(state.orchard_tree().root(), snap_tree_root);
     assert_eq!(state.cumulative_issuance(), snap_issuance);
     assert_eq!(state.accepted_transaction_ids(), snap_tx_ids.as_slice());
+}
+
+// ===========================================================================
+// Test 19: Type 6 Action Nullifier Accounting & Double-Spend Protection
+// ===========================================================================
+#[test]
+fn test_type6_nullifier_accounting_and_double_spend_protection() {
+    let (mut state, miner, alice, mut ts) = setup_funded_chain();
+    let id = devnet_chain_id();
+
+    ts += 120;
+    let amount = 50_000_000u64;
+    let fee = 1_000_000u64;
+    let (proven_bundle, nf) = build_proven_type6_bundle(amount, 0x7a);
+    let t2s_a = build_type6_tx_from_proven(id, &alice, 0, amount, fee, &proven_bundle, &[]);
+    let cb102 = make_coinbase(id, 102, miner.address, fee);
+    let b102 = make_hybrid_block(&state, ts, vec![cb102, t2s_a]);
+    state.apply_block(&b102).expect("block 102 must apply");
+
+    let action_nf = Hash::new(nf.to_bytes());
+    assert_eq!(state.nullifier_set().len(), 1);
+    assert!(state.nullifier_set().contains(&action_nf));
+
+    // Verify composite state root strictly incorporates the nullifier root
+    let nf_root = merkle::nullifier_merkle_root(&[action_nf]);
+    assert_eq!(state.nullifier_state_root(), nf_root);
+    assert_ne!(state.nullifier_state_root(), merkle::state_empty_root());
+    assert_eq!(
+        state.composite_state_root(),
+        b102.header.orchard_commitment_root
+    );
+
+    // Block 103 candidate attempting to reuse the exact same bundle nullifier in a new tx
+    ts += 120;
+    let t2s_b = build_type6_tx_from_proven(id, &alice, 1, amount, fee, &proven_bundle, &[]);
+    let cb103 = make_coinbase(id, 103, miner.address, fee);
+    let b103_cand = make_candidate_block(&state, ts, vec![cb103, t2s_b]);
+
+    let err = state.simulate_candidate_state_root(&b103_cand).unwrap_err();
+    assert!(err.to_string().contains("nullifier double-spend"));
+
+    // State remains unmutated
+    assert_eq!(state.tip_height().unwrap(), 102);
+    assert_eq!(state.nullifier_set().len(), 1);
 }

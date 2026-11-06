@@ -1355,6 +1355,33 @@ impl ChainState {
                                 ChainError::State("binding signature verification failed".into())
                             })?;
 
+                        // Verify SpendAuth signatures on each action over auth_digest
+                        for (idx, action) in bundle.actions().iter().enumerate() {
+                            action
+                                .rk()
+                                .verify(&auth_digest, action.authorization())
+                                .map_err(|_| {
+                                    ChainError::State(format!(
+                                        "spend auth signature verification failed for action {idx}"
+                                    ))
+                                })?;
+                        }
+
+                        // Nullifiers check (dummy spends under SPENDS_DISABLED must be tracked)
+                        let mut tx_nfs = Vec::new();
+                        for act in bundle.actions() {
+                            let nf = Hash::new(act.nullifier().to_bytes());
+                            if tx_nfs.contains(&nf) {
+                                return Err(ChainError::State(
+                                    "duplicate nullifier within transaction".into(),
+                                ));
+                            }
+                            if candidate_nullifiers.contains(&nf) {
+                                return Err(ChainError::State("nullifier double-spend".into()));
+                            }
+                            tx_nfs.push(nf);
+                        }
+
                         let sender = candidate_accounts
                             .get_mut(&sender_addr)
                             .ok_or_else(|| ChainError::State("sender account not found".into()))?;
@@ -1436,7 +1463,10 @@ impl ChainState {
                             ChainError::State("block fee accumulation overflow".into())
                         })?;
 
-                        // Append output commitments to Orchard tree (dummy nullifiers are ignored)
+                        // Extend candidate nullifiers with action dummy nullifiers
+                        candidate_nullifiers.extend(tx_nfs);
+
+                        // Append output commitments to Orchard tree
                         for act in bundle.actions() {
                             candidate_tree.append(act.cmx());
                         }
@@ -1611,11 +1641,10 @@ impl ChainState {
                         // 5. Extend candidate nullifiers
                         candidate_nullifiers.extend(tx_nfs);
 
-                        // 6. Append output commitments to Orchard tree if outputs are enabled
-                        if bundle.flags().outputs_enabled() {
-                            for act in bundle.actions() {
-                                candidate_tree.append(act.cmx());
-                            }
+                        // 6. Append every action's cmx commitment to Orchard tree
+                        // (including dummy output commitments under Flags::OUTPUTS_DISABLED)
+                        for act in bundle.actions() {
+                            candidate_tree.append(act.cmx());
                         }
                     }
 

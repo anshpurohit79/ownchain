@@ -223,6 +223,12 @@ struct TestFixtures {
 
     // 2-action bundle with duplicate spends
     type7_proven_dup_spends: Bundle<InProgress<Proof, Unauthorized>, i64>,
+
+    // Genuine dummy-spend bundle: 1 real spend, 2 outputs, 1 auto dummy spend
+    type7_proven_dummy_spend: Bundle<InProgress<Proof, Unauthorized>, i64>,
+    dummy_spend_action_index: usize,
+    dummy_spend_nullifier: Hash,
+    real_spend_nullifier: Hash,
 }
 
 static FIXTURES: OnceLock<TestFixtures> = OnceLock::new();
@@ -351,6 +357,51 @@ fn get_fixtures() -> &'static TestFixtures {
         let (unauth7_dup, _) = b7_dup.build::<i64>(&mut rng).unwrap().unwrap();
         let type7_proven_dup_spends = unauth7_dup.create_proof(&pk, &mut rng).unwrap();
 
+        // 6. Build genuine dummy spend bundle:
+        // Spends 100M note, releases 60M + 1M fee, 2 change outputs (20M and 19M)
+        // Under Flags::ENABLED, 1 spend + 2 outputs automatically generates 1 dummy spend.
+        let mut b7_dummy = Builder::new(
+            BundleType::UNPADDED,
+            BundleVersion::orchard_v2(),
+            Flags::ENABLED,
+            seed_anchor_100m,
+        )
+        .unwrap();
+        b7_dummy
+            .add_spend(user_fvk.clone(), seed_note_100m, seed_path_100m.clone())
+            .unwrap();
+        b7_dummy
+            .add_output(
+                Some(user_ovk.clone()),
+                user_address,
+                NoteValue::from_raw(20_000_000),
+                [0u8; 512],
+            )
+            .unwrap();
+        b7_dummy
+            .add_output(
+                Some(user_ovk.clone()),
+                user_address,
+                NoteValue::from_raw(19_000_000),
+                [0u8; 512],
+            )
+            .unwrap();
+        let (unauth7_dummy, meta7_dummy) = b7_dummy.build::<i64>(&mut rng).unwrap().unwrap();
+        assert_eq!(unauth7_dummy.actions().len(), 2);
+        let real_spend_idx = meta7_dummy.spend_action_index(0).unwrap();
+        let dummy_spend_idx = (0..2).find(|&i| i != real_spend_idx).unwrap();
+        let dummy_spend_nullifier = Hash::new(
+            unauth7_dummy.actions()[dummy_spend_idx]
+                .nullifier()
+                .to_bytes(),
+        );
+        let real_spend_nullifier = Hash::new(
+            unauth7_dummy.actions()[real_spend_idx]
+                .nullifier()
+                .to_bytes(),
+        );
+        let type7_proven_dummy_spend = unauth7_dummy.create_proof(&pk, &mut rng).unwrap();
+
         TestFixtures {
             pk,
             vk,
@@ -371,6 +422,10 @@ fn get_fixtures() -> &'static TestFixtures {
             type6_proven_50m,
             type7_proven_outputs_disabled,
             type7_proven_dup_spends,
+            type7_proven_dummy_spend,
+            dummy_spend_action_index: dummy_spend_idx,
+            dummy_spend_nullifier,
+            real_spend_nullifier,
         }
     })
 }
@@ -518,8 +573,20 @@ fn test_1_valid_type7_withdrawal_with_change() {
     // Verify commitment tree updated with change output (now 2 leaves)
     assert_eq!(state.orchard_tree().count(), 2);
 
-    // Verify nullifier added
-    assert_eq!(state.nullifier_set().len(), 1);
+    // Verify nullifiers added (1 from Type 6 + 1 from Type 7)
+    assert_eq!(state.nullifier_set().len(), 2);
+    let t6_nf = Hash::new(
+        fixtures.type6_proven_100m.actions()[0]
+            .nullifier()
+            .to_bytes(),
+    );
+    let t7_nf = Hash::new(
+        fixtures.type7_proven_with_change.actions()[0]
+            .nullifier()
+            .to_bytes(),
+    );
+    assert!(state.nullifier_set().contains(&t6_nf));
+    assert!(state.nullifier_set().contains(&t7_nf));
 
     // Verify conservation: T + S = I
     let t_total: u128 = state.accounts().values().map(|a| a.balance).sum();
@@ -574,8 +641,27 @@ fn test_2_valid_type7_withdrawal_outputs_disabled() {
     // Verify pool balance is 0
     assert_eq!(state.shielded_pool_balance(), 0);
 
-    // Verify commitment tree did NOT append dummy note (leaf count remains 1)
-    assert_eq!(state.orchard_tree().count(), 1);
+    // Verify commitment tree appended dummy output commitment (now 2 leaves: 1 from Type 6, 1 from Type 7)
+    assert_eq!(state.orchard_tree().count(), 2);
+    assert_eq!(state.nullifier_set().len(), 2);
+    let t6_nf = Hash::new(
+        fixtures.type6_proven_50m.actions()[0]
+            .nullifier()
+            .to_bytes(),
+    );
+    let t7_nf = Hash::new(
+        fixtures.type7_proven_outputs_disabled.actions()[0]
+            .nullifier()
+            .to_bytes(),
+    );
+    assert!(state.nullifier_set().contains(&t6_nf));
+    assert!(state.nullifier_set().contains(&t7_nf));
+
+    // Verify historical anchor and tree root match at height 103
+    assert_eq!(
+        state.historical_anchors().get(&103),
+        Some(&state.orchard_tree().root())
+    );
 
     // Verify conservation: T + S = I
     let t_total: u128 = state.accounts().values().map(|a| a.balance).sum();
@@ -1159,14 +1245,15 @@ fn test_16_dummy_spend_nullifier_handling() {
     let id = devnet_chain_id();
     let bob = TestKeypair::from_seed(3);
 
+    // Block 102: Alice shields 100M atoms via Type 6
     ts += 120;
     let t6 = make_type6_tx(
         id,
         &alice,
         0,
-        50_000_000,
+        100_000_000,
         1_000_000,
-        &fixtures.type6_proven_50m,
+        &fixtures.type6_proven_100m,
     );
     let b102 = make_hybrid_block(
         &state,
@@ -1175,29 +1262,49 @@ fn test_16_dummy_spend_nullifier_handling() {
     );
     state.apply_block(&b102).unwrap();
 
+    // Block 103: Genuine dummy-spend Type 7 transaction
+    // 1 real spend (100M note) + 2 outputs (20M + 19M) under Flags::ENABLED
+    // Builder metadata identified the automatically generated dummy spend.
     ts += 120;
+    let release_amount = 60_000_000u128;
+    let fee_atoms = 1_000_000u64;
     let t7 = make_type7_tx(
         id,
         &fixtures.user_sk,
         bob.address,
-        49_000_000,
-        1_000_000,
-        &fixtures.type7_proven_outputs_disabled,
+        release_amount,
+        fee_atoms,
+        &fixtures.type7_proven_dummy_spend,
     );
-    let b103 = make_hybrid_block(
-        &state,
-        ts,
-        vec![make_coinbase(id, 103, miner.address, 1_000_000), t7],
-    );
-    state.apply_block(&b103).unwrap();
+    let cb103 = make_coinbase(id, 103, miner.address, fee_atoms);
+    let b103 = make_hybrid_block(&state, ts, vec![cb103, t7]);
 
-    // Verify nullifier is tracked in chain state
-    let action_nf = Hash::new(
-        fixtures.type7_proven_outputs_disabled.actions()[0]
-            .nullifier()
-            .to_bytes(),
-    );
-    assert!(state.nullifier_set().contains(&action_nf));
+    // 1. Candidate simulation: verify dummy spend nullifier is in candidate nullifier set
+    let cand = state
+        .evaluate_candidate(&b103)
+        .expect("candidate evaluation must succeed");
+    assert!(cand.nullifier_set.contains(&fixtures.dummy_spend_nullifier));
+    assert!(cand.nullifier_set.contains(&fixtures.real_spend_nullifier));
+
+    // 2. Block application: verify dummy spend nullifier is in committed chain state
+    state
+        .apply_block(&b103)
+        .expect("block with dummy spend must apply");
+    assert!(state
+        .nullifier_set()
+        .contains(&fixtures.dummy_spend_nullifier));
+    assert!(state
+        .nullifier_set()
+        .contains(&fixtures.real_spend_nullifier));
+
+    // Nullifier count: 1 (Type 6 dummy) + 1 (Type 7 real spend) + 1 (Type 7 dummy spend) = 3
+    assert_eq!(state.nullifier_set().len(), 3);
+    // Tree leaves: 1 (Type 6 note) + 2 (Type 7 notes: 20M and 19M) = 3
+    assert_eq!(state.orchard_tree().count(), 3);
+    // Shielded pool balance: 100M - 61M = 39M
+    assert_eq!(state.shielded_pool_balance(), 39_000_000);
+    // Recipient balance
+    assert_eq!(state.account(&bob.address).unwrap().balance, 60_000_000);
 }
 
 // ---------------------------------------------------------------------------
@@ -1538,13 +1645,85 @@ fn test_22_state_atomicity_and_reorg_rollback() {
 
     assert_eq!(state.tip_height().unwrap(), 103);
     assert_eq!(state.account(&bob.address).unwrap().balance, 60_000_000);
-    assert_eq!(state.nullifier_set().len(), 1);
+    // Nullifiers: 1 from Type 6 in block 102 + 1 from Type 7 in block 103 = 2
+    assert_eq!(state.nullifier_set().len(), 2);
 
     // 3. Rollback to height 102
     state.rollback_to(102).unwrap();
     assert_eq!(state.tip_height().unwrap(), 102);
     assert_eq!(state.shielded_pool_balance(), snap102.shielded_pool_balance);
-    assert_eq!(state.nullifier_set().len(), 0);
+    // Nullifier set restored to height 102 state (1 nullifier from Type 6)
+    assert_eq!(state.nullifier_set().len(), 1);
+    assert_eq!(state.nullifier_set(), &snap102.nullifier_set);
     assert_eq!(state.account(&bob.address), None);
     assert_eq!(state.orchard_tree().root(), snap102.orchard_tree.root());
+}
+
+// ===========================================================================
+// 7. Mixed Blocks (Type 6 and Type 7 Coexistence)
+// ===========================================================================
+
+#[test]
+fn test_23_mixed_block_containing_both_type6_and_type7() {
+    let fixtures = get_fixtures();
+    let (mut state, miner, alice, mut ts) = setup_funded_chain();
+    let id = devnet_chain_id();
+    let bob = TestKeypair::from_seed(3);
+
+    // Block 102: Alice shields 100M atoms via Type 6
+    ts += 120;
+    let t6_init = make_type6_tx(
+        id,
+        &alice,
+        0,
+        100_000_000,
+        1_000_000,
+        &fixtures.type6_proven_100m,
+    );
+    let cb102 = make_coinbase(id, 102, miner.address, 1_000_000);
+    let b102 = make_hybrid_block(&state, ts, vec![cb102, t6_init]);
+    state.apply_block(&b102).unwrap();
+    assert_eq!(state.shielded_pool_balance(), 100_000_000);
+
+    // Block 103: Mixed block containing BOTH Type 6 and Type 7 in the same block!
+    // Tx 1: Alice shields another 50M atoms via Type 6 (fee 1M)
+    // Tx 2: User withdraws 60M atoms via Type 7 to Bob (fee 1M, leaves 39M change)
+    // Total fees: 1M + 1M = 2M. Coinbase payout = 2M.
+    ts += 120;
+    let t6_subsequent = make_type6_tx(
+        id,
+        &alice,
+        1, // nonce 1
+        50_000_000,
+        1_000_000,
+        &fixtures.type6_proven_50m,
+    );
+    let t7 = make_type7_tx(
+        id,
+        &fixtures.user_sk,
+        bob.address,
+        60_000_000,
+        1_000_000,
+        &fixtures.type7_proven_with_change,
+    );
+    let cb103 = make_coinbase(id, 103, miner.address, 2_000_000);
+    let b103 = make_hybrid_block(&state, ts, vec![cb103, t6_subsequent, t7]);
+
+    state
+        .apply_block(&b103)
+        .expect("mixed block with Type 6 and Type 7 must apply");
+
+    // Shielded pool balance: 100M + 50M - 61M = 89_000_000
+    assert_eq!(state.shielded_pool_balance(), 89_000_000);
+    // Bob received 60M
+    assert_eq!(state.account(&bob.address).unwrap().balance, 60_000_000);
+    // Tree leaves: 1 (block 102) + 1 (T6 block 103) + 1 (T7 change block 103) = 3 leaves
+    assert_eq!(state.orchard_tree().count(), 3);
+    // Nullifiers: 1 (block 102) + 1 (T6 block 103) + 1 (T7 block 103) = 3 nullifiers
+    assert_eq!(state.nullifier_set().len(), 3);
+    // Global conservation: T + S = I
+    let t_total: u128 = state.accounts().values().map(|a| a.balance).sum();
+    let s_total = state.shielded_pool_balance();
+    let i_total = state.cumulative_issuance();
+    assert_eq!(t_total + s_total, i_total);
 }
