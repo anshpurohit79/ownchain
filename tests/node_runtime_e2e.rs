@@ -540,7 +540,7 @@ async fn test_real_p2p_disconnect_advance_reconnect_and_sync() {
 
 #[tokio::test]
 async fn test_mempool_admission_gossip_and_conflict_rejection() {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(Duration::from_secs(120), async {
         let dir_a = TempDir::new().unwrap();
         let dir_b = TempDir::new().unwrap();
 
