@@ -983,10 +983,15 @@ impl ChainState {
                                 target.new_recipient_delay = new_delay;
                             }
                             crate::auth::ACTION_STRENGTHEN_ALLOWANCE => {
-                                // Strengthen allowance: cannot increase limit or shorten window
+                                // Strengthen allowance: cannot increase limit or shorten window, cannot disable allowance
                                 let new_lim = u128::from_le_bytes(params[..16].try_into().unwrap());
                                 let new_len =
                                     u64::from_le_bytes(params[16..24].try_into().unwrap());
+                                if new_lim == 0 || new_len == 0 {
+                                    return Err(ChainError::State(
+                                        "cannot disable allowance with 3-of-7 quorum".into(),
+                                    ));
+                                }
                                 if target.allowance_limit > 0 && new_lim > target.allowance_limit {
                                     return Err(ChainError::State(
                                         "cannot increase limit with 3-of-7 quorum".into(),
