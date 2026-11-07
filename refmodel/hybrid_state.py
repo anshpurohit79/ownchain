@@ -536,6 +536,18 @@ class HybridChainState:
 
         if account.spendable_balance(self.height) < tx.fee_atoms:
             raise HybridStateError("Insufficient balance for fee")
+
+        # Validate ACTION_STRENGTHEN_ALLOWANCE before mutating account state to preserve atomicity on failure
+        if tx.action_type == ACTION_STRENGTHEN_ALLOWANCE:
+            new_limit = int.from_bytes(tx.params[:16], "little") if len(tx.params) >= 16 else account.allowance_limit
+            new_duration = struct.unpack("<Q", tx.params[16:24])[0] if len(tx.params) >= 24 else account.allowance_window_len
+            if new_limit == 0 or new_duration == 0:
+                raise HybridStateError("Cannot disable allowance with 3-of-7 quorum")
+            if account.allowance_limit > 0 and new_limit > account.allowance_limit:
+                raise HybridStateError("Cannot increase allowance limit with 3-of-7 quorum")
+            if account.allowance_window_len > 0 and new_duration < account.allowance_window_len:
+                raise HybridStateError("Cannot shorten window duration with 3-of-7 quorum")
+
         account.balance -= tx.fee_atoms
 
         # Execute action
@@ -559,16 +571,8 @@ class HybridChainState:
             new_delay = struct.unpack("<I", tx.params[:4])[0]
             account.new_recipient_delay = new_delay
         elif tx.action_type == ACTION_STRENGTHEN_ALLOWANCE:
-            new_limit = int.from_bytes(tx.params[:16], "little") if len(tx.params) >= 16 else account.allowance_limit
-            new_duration = struct.unpack("<Q", tx.params[16:24])[0] if len(tx.params) >= 24 else account.allowance_window_len
-            if account.allowance_limit > 0 and new_limit > account.allowance_limit:
-                raise HybridStateError("Cannot increase allowance limit with 3-of-7 quorum")
-            if account.allowance_window_len > 0 and new_duration < account.allowance_window_len:
-                raise HybridStateError("Cannot shorten window duration with 3-of-7 quorum")
-            if new_limit > 0 or len(tx.params) >= 16:
-                account.allowance_limit = new_limit
-            if new_duration > 0 or len(tx.params) >= 24:
-                account.allowance_window_len = new_duration
+            account.allowance_limit = new_limit
+            account.allowance_window_len = new_duration
         elif tx.action_type == ACTION_WEAKEN_ALLOWANCE:
             new_limit = int.from_bytes(tx.params[:16], "little") if len(tx.params) >= 16 else account.allowance_limit
             new_duration = struct.unpack("<Q", tx.params[16:24])[0] if len(tx.params) >= 24 else account.allowance_window_len

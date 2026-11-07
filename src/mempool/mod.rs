@@ -644,6 +644,11 @@ impl Mempool {
                     crate::auth::ACTION_STRENGTHEN_ALLOWANCE => {
                         let new_lim = u128::from_le_bytes(params[..16].try_into().unwrap());
                         let new_len = u64::from_le_bytes(params[16..24].try_into().unwrap());
+                        if new_lim == 0 || new_len == 0 {
+                            return Err(MempoolError::Malformed(
+                                "cannot disable allowance with 3-of-7 quorum".into(),
+                            ));
+                        }
                         if target.allowance_limit > 0 && new_lim > target.allowance_limit {
                             return Err(MempoolError::Malformed(
                                 "cannot increase limit with 3-of-7 quorum".into(),
@@ -1688,6 +1693,229 @@ mod tests {
         let mut pool = Mempool::new();
         let res = pool.admit(&tx3, &state);
         assert!(matches!(res, Err(MempoolError::Malformed(_))));
+    }
+
+    #[test]
+    fn test_mempool_type3_strengthen_allowance_zero_bypass_regression() {
+        let miner_sk = make_test_key(1);
+        let (mut state, last_block) = setup_chain_with_funded_account(&miner_sk);
+        let cid = test_chain_id();
+        let miner_pk = miner_sk.verifying_key().to_bytes();
+        let miner_addr = derive_address(&miner_pk);
+
+        let guardian_sks: Vec<SigningKey> = (10..17).map(make_test_key).collect();
+        let mut guardians = [[0u8; 32]; 7];
+        for (i, sk) in guardian_sks.iter().enumerate() {
+            guardians[i] = sk.verifying_key().to_bytes();
+        }
+        let recovery_pk = make_test_key(99).verifying_key().to_bytes();
+
+        // Configure guardians with active allowance: 1_000_000 limit, 50 window length
+        let mut unsigned_prefix = Vec::with_capacity(371);
+        unsigned_prefix.push(2); // Type 2
+        unsigned_prefix.extend_from_slice(&1u16.to_le_bytes());
+        unsigned_prefix.extend_from_slice(cid.as_bytes());
+        unsigned_prefix.extend_from_slice(&miner_pk);
+        unsigned_prefix.extend_from_slice(&0u64.to_le_bytes()); // nonce 0
+        unsigned_prefix.extend_from_slice(&50_000u64.to_le_bytes()); // fee 50,000
+        for g in &guardians {
+            unsigned_prefix.extend_from_slice(g);
+        }
+        unsigned_prefix.extend_from_slice(&100u32.to_le_bytes()); // new_recipient_delay
+        unsigned_prefix.extend_from_slice(&200u32.to_le_bytes()); // withdrawal_delay
+        unsigned_prefix.extend_from_slice(&1_000_000u128.to_le_bytes()); // allowance_limit
+        unsigned_prefix.extend_from_slice(&50u64.to_le_bytes()); // allowance_window_len
+        unsigned_prefix.extend_from_slice(&recovery_pk);
+
+        let unsigned_tx = crate::auth::canonical_unsigned_with_guardians(&unsigned_prefix, &[]);
+        let preimage = crate::auth::compute_signing_preimage(cid, &unsigned_tx);
+        let owner_sig = miner_sk.sign(&preimage);
+
+        let mut config_tx2 = unsigned_prefix;
+        config_tx2.extend_from_slice(&owner_sig.to_bytes());
+        config_tx2.push(0); // 0 guardian signatures
+
+        // Apply config to chain state at height 102
+        let cb = make_coinbase(cid, 102, *miner_addr.as_bytes());
+        let cb_id = transaction_id(&cb);
+        let cfg_id = transaction_id(&config_tx2);
+        let mut blk = Block {
+            header: Header {
+                version: 1,
+                chain_id: cid,
+                height: 102,
+                parent_block_id: last_block.block_id(),
+                transaction_root: merkle::tx_root(&[cb_id, cfg_id]),
+                orchard_commitment_root: empty_commitment_root(),
+                timestamp: last_block.header.timestamp + 120,
+                difficulty: state.expected_difficulty_for_next_block().unwrap_or(1),
+                nonce: 0,
+            },
+            transactions: vec![cb, config_tx2],
+        };
+        let root = state
+            .simulate_candidate_state_root(&blk)
+            .expect("simulated state root");
+        blk.header.orchard_commitment_root = root;
+        state.apply_block(&blk).unwrap();
+
+        assert_eq!(
+            state.account(&miner_addr).unwrap().allowance_limit,
+            1_000_000
+        );
+        assert_eq!(state.account(&miner_addr).unwrap().allowance_window_len, 50);
+
+        let make_strengthen_tx = |new_lim: u128, new_len: u64| -> Vec<u8> {
+            let mut params = Vec::with_capacity(24);
+            params.extend_from_slice(&new_lim.to_le_bytes());
+            params.extend_from_slice(&new_len.to_le_bytes());
+
+            let mut prefix = Vec::new();
+            prefix.push(3); // Type 3
+            prefix.extend_from_slice(&1u16.to_le_bytes());
+            prefix.extend_from_slice(cid.as_bytes());
+            prefix.extend_from_slice(miner_addr.as_bytes());
+            prefix.push(crate::auth::ACTION_STRENGTHEN_ALLOWANCE);
+            prefix.extend_from_slice(&50_000u64.to_le_bytes()); // fee
+            prefix.extend_from_slice(&(params.len() as u32).to_le_bytes());
+            prefix.extend_from_slice(&params);
+
+            let indices = [0u8, 1, 2];
+            let unsigned = crate::auth::canonical_unsigned_with_indices(&prefix, &indices);
+            let preimage = crate::auth::compute_signing_preimage(cid, &unsigned);
+
+            let mut tx = prefix;
+            tx.push(3); // 3 guardian signatures
+            for idx in indices {
+                tx.push(idx);
+                let sig = guardian_sks[idx as usize].sign(&preimage);
+                tx.extend_from_slice(&sig.to_bytes());
+            }
+            tx
+        };
+
+        // 1. Zero limit is rejected by mempool
+        let tx_zero_lim = make_strengthen_tx(0, 50);
+        let mut pool = Mempool::new();
+        let res_zero_lim = pool.admit(&tx_zero_lim, &state);
+        assert!(matches!(
+            res_zero_lim,
+            Err(MempoolError::Malformed(msg)) if msg.contains("cannot disable allowance with 3-of-7 quorum")
+        ));
+        assert_eq!(pool.len(), 0);
+
+        // 2. Zero window length is rejected by mempool
+        let tx_zero_len = make_strengthen_tx(1_000_000, 0);
+        let mut pool2 = Mempool::new();
+        let res_zero_len = pool2.admit(&tx_zero_len, &state);
+        assert!(matches!(
+            res_zero_len,
+            Err(MempoolError::Malformed(msg)) if msg.contains("cannot disable allowance with 3-of-7 quorum")
+        ));
+        assert_eq!(pool2.len(), 0);
+
+        // 3. Both zero is rejected by mempool
+        let tx_zero_both = make_strengthen_tx(0, 0);
+        let mut pool3 = Mempool::new();
+        let res_zero_both = pool3.admit(&tx_zero_both, &state);
+        assert!(matches!(
+            res_zero_both,
+            Err(MempoolError::Malformed(msg)) if msg.contains("cannot disable allowance with 3-of-7 quorum")
+        ));
+        assert_eq!(pool3.len(), 0);
+
+        // 4. Increasing limit is rejected by mempool
+        let tx_inc = make_strengthen_tx(2_000_000, 50);
+        let mut pool4 = Mempool::new();
+        let res_inc = pool4.admit(&tx_inc, &state);
+        assert!(matches!(
+            res_inc,
+            Err(MempoolError::Malformed(msg)) if msg.contains("cannot increase limit with 3-of-7 quorum")
+        ));
+        assert_eq!(pool4.len(), 0);
+
+        // 5. Shortening window is rejected by mempool
+        let tx_short = make_strengthen_tx(1_000_000, 20);
+        let mut pool5 = Mempool::new();
+        let res_short = pool5.admit(&tx_short, &state);
+        assert!(matches!(
+            res_short,
+            Err(MempoolError::Malformed(msg)) if msg.contains("cannot shorten window with 3-of-7 quorum")
+        ));
+        assert_eq!(pool5.len(), 0);
+
+        // 6. Legitimate tightening is admitted to mempool
+        let tx_tight = make_strengthen_tx(600_000, 100);
+        let mut pool6 = Mempool::new();
+        let res_tight = pool6.admit(&tx_tight, &state);
+        assert!(
+            res_tight.is_ok(),
+            "Legitimate tightening must be admitted: {res_tight:?}"
+        );
+        assert_eq!(pool6.len(), 1);
+
+        // 7. Positive-value re-enabling on disabled allowance is admitted to mempool
+        let mut weaken_params = Vec::with_capacity(24);
+        weaken_params.extend_from_slice(&0u128.to_le_bytes());
+        weaken_params.extend_from_slice(&0u64.to_le_bytes());
+
+        let mut weaken_prefix = Vec::new();
+        weaken_prefix.push(3);
+        weaken_prefix.extend_from_slice(&1u16.to_le_bytes());
+        weaken_prefix.extend_from_slice(cid.as_bytes());
+        weaken_prefix.extend_from_slice(miner_addr.as_bytes());
+        weaken_prefix.push(crate::auth::ACTION_WEAKEN_ALLOWANCE);
+        weaken_prefix.extend_from_slice(&50_000u64.to_le_bytes());
+        weaken_prefix.extend_from_slice(&(weaken_params.len() as u32).to_le_bytes());
+        weaken_prefix.extend_from_slice(&weaken_params);
+
+        let weaken_indices = [0u8, 1, 2, 3];
+        let unsigned_weaken =
+            crate::auth::canonical_unsigned_with_indices(&weaken_prefix, &weaken_indices);
+        let preimage_weaken = crate::auth::compute_signing_preimage(cid, &unsigned_weaken);
+
+        let mut weaken_tx = weaken_prefix;
+        weaken_tx.push(4);
+        for idx in weaken_indices {
+            weaken_tx.push(idx);
+            let sig = guardian_sks[idx as usize].sign(&preimage_weaken);
+            weaken_tx.extend_from_slice(&sig.to_bytes());
+        }
+
+        let cb103 = make_coinbase(cid, 103, *miner_addr.as_bytes());
+        let cb103_id = transaction_id(&cb103);
+        let w_id = transaction_id(&weaken_tx);
+        let mut blk103 = Block {
+            header: Header {
+                version: 1,
+                chain_id: cid,
+                height: 103,
+                parent_block_id: blk.block_id(),
+                transaction_root: merkle::tx_root(&[cb103_id, w_id]),
+                orchard_commitment_root: empty_commitment_root(),
+                timestamp: blk.header.timestamp + 120,
+                difficulty: state.expected_difficulty_for_next_block().unwrap_or(1),
+                nonce: 0,
+            },
+            transactions: vec![cb103, weaken_tx],
+        };
+        let root103 = state
+            .simulate_candidate_state_root(&blk103)
+            .expect("simulated state root");
+        blk103.header.orchard_commitment_root = root103;
+        state.apply_block(&blk103).unwrap();
+
+        assert_eq!(state.account(&miner_addr).unwrap().allowance_limit, 0);
+        assert_eq!(state.account(&miner_addr).unwrap().allowance_window_len, 0);
+
+        let tx_enable = make_strengthen_tx(500_000, 75);
+        let mut pool7 = Mempool::new();
+        let res_enable = pool7.admit(&tx_enable, &state);
+        assert!(
+            res_enable.is_ok(),
+            "Positive-value re-enabling must be admitted: {res_enable:?}"
+        );
+        assert_eq!(pool7.len(), 1);
     }
 
     #[test]

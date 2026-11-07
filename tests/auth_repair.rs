@@ -24,7 +24,7 @@ use ownchain::auth::{
     ACTION_WEAKEN_ALLOWANCE, ACTION_WEAKEN_DELAYS,
 };
 use ownchain::block::Block;
-use ownchain::chain::ChainState;
+use ownchain::chain::{ChainError, ChainState};
 use ownchain::genesis;
 use ownchain::hash::{self, Hash};
 use ownchain::header::Header;
@@ -1972,4 +1972,369 @@ fn test_weak_recovery_keys_rejected_in_type2_and_type3() {
         ],
     );
     assert!(state.apply_block(&block_action).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// 7. F-01 Regression: 3-of-7 Guardian Allowance Strengthening Zero Bypass
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_f01_guardian_allowance_strengthen_zero_bypass_regression() {
+    let (mut state, miner, alice, mut ts) = setup_funded_chain();
+    let id = devnet_chain_id();
+
+    let guardian_keys: Vec<TestKeypair> = (0x10..0x17).map(TestKeypair::from_seed).collect();
+    let guardians: [[u8; 32]; 7] = [
+        guardian_keys[0].pubkey,
+        guardian_keys[1].pubkey,
+        guardian_keys[2].pubkey,
+        guardian_keys[3].pubkey,
+        guardian_keys[4].pubkey,
+        guardian_keys[5].pubkey,
+        guardian_keys[6].pubkey,
+    ];
+    let recovery1 = TestKeypair::from_seed(0x91);
+
+    let g_3 = &[
+        (0, &guardian_keys[0]),
+        (1, &guardian_keys[1]),
+        (2, &guardian_keys[2]),
+    ];
+    let g_4 = &[
+        (0, &guardian_keys[0]),
+        (1, &guardian_keys[1]),
+        (2, &guardian_keys[2]),
+        (3, &guardian_keys[3]),
+    ];
+
+    // Configure guardians with active allowance: 1_000_000 limit, 100 window length
+    ts += 120;
+    let config = make_configure_guardians(
+        id,
+        &alice,
+        0,
+        50_000,
+        &guardians,
+        10,
+        144,
+        1_000_000,
+        100,
+        &recovery1.pubkey,
+        &[],
+    );
+    let cb102 = make_coinbase(id, 102, miner.address, 50_000);
+    let b102 = make_hybrid_block(&state, ts, vec![cb102, config]);
+    state.apply_block(&b102).unwrap();
+
+    let initial_alice = state.account(&alice.address).unwrap().clone();
+    assert_eq!(initial_alice.allowance_limit, 1_000_000);
+    assert_eq!(initial_alice.allowance_window_len, 100);
+    assert_eq!(initial_alice.allowance_spent, 0);
+    assert_eq!(state.tip_height(), Some(102));
+    assert_eq!(state.tip_block_id(), Some(b102.block_id()));
+
+    // 1. Regression: Three guardians attempt to set active limit to zero -> REJECT
+    ts += 120;
+    let mut param_zero_limit = Vec::new();
+    param_zero_limit.extend_from_slice(&0u128.to_le_bytes()); // limit = 0
+    param_zero_limit.extend_from_slice(&100u64.to_le_bytes()); // window = 100
+    let act_zero_limit = make_guardian_action(
+        id,
+        alice.address,
+        ACTION_STRENGTHEN_ALLOWANCE,
+        50_000,
+        &param_zero_limit,
+        g_3,
+    );
+    let bad_block_1 = make_candidate_block(
+        &state,
+        ts,
+        vec![
+            make_coinbase(id, 103, miner.address, 50_000),
+            act_zero_limit,
+        ],
+    );
+    assert_eq!(
+        state.evaluate_candidate(&bad_block_1).unwrap_err(),
+        ChainError::State("cannot disable allowance with 3-of-7 quorum".into())
+    );
+    assert!(state.apply_block(&bad_block_1).is_err());
+    // Verify atomicity after rejected zero limit: state and account unchanged
+    let alice_after_rej1 = state.account(&alice.address).unwrap();
+    assert_eq!(alice_after_rej1.balance, initial_alice.balance);
+    assert_eq!(alice_after_rej1.allowance_limit, 1_000_000);
+    assert_eq!(alice_after_rej1.allowance_window_len, 100);
+    assert_eq!(
+        alice_after_rej1.allowance_spent,
+        initial_alice.allowance_spent
+    );
+    assert_eq!(state.tip_height(), Some(102));
+    assert_eq!(state.tip_block_id(), Some(b102.block_id()));
+
+    // 2. Regression: Three guardians attempt to set active window length to zero -> REJECT
+    let mut param_zero_window = Vec::new();
+    param_zero_window.extend_from_slice(&1_000_000u128.to_le_bytes()); // limit = 1_000_000
+    param_zero_window.extend_from_slice(&0u64.to_le_bytes()); // window = 0
+    let act_zero_window = make_guardian_action(
+        id,
+        alice.address,
+        ACTION_STRENGTHEN_ALLOWANCE,
+        50_000,
+        &param_zero_window,
+        g_3,
+    );
+    let bad_block_2 = make_candidate_block(
+        &state,
+        ts,
+        vec![
+            make_coinbase(id, 103, miner.address, 50_000),
+            act_zero_window,
+        ],
+    );
+    assert_eq!(
+        state.evaluate_candidate(&bad_block_2).unwrap_err(),
+        ChainError::State("cannot disable allowance with 3-of-7 quorum".into())
+    );
+    assert!(state.apply_block(&bad_block_2).is_err());
+    // Verify atomicity after rejected zero window: state and account unchanged
+    let alice_after_rej2 = state.account(&alice.address).unwrap();
+    assert_eq!(alice_after_rej2.balance, initial_alice.balance);
+    assert_eq!(alice_after_rej2.allowance_limit, 1_000_000);
+    assert_eq!(alice_after_rej2.allowance_window_len, 100);
+    assert_eq!(
+        alice_after_rej2.allowance_spent,
+        initial_alice.allowance_spent
+    );
+    assert_eq!(state.tip_height(), Some(102));
+    assert_eq!(state.tip_block_id(), Some(b102.block_id()));
+
+    // 3. Regression: Three guardians attempt to set both limit and window to zero -> REJECT
+    let mut param_zero_both = Vec::new();
+    param_zero_both.extend_from_slice(&0u128.to_le_bytes());
+    param_zero_both.extend_from_slice(&0u64.to_le_bytes());
+    let act_zero_both = make_guardian_action(
+        id,
+        alice.address,
+        ACTION_STRENGTHEN_ALLOWANCE,
+        50_000,
+        &param_zero_both,
+        g_3,
+    );
+    let bad_block_3 = make_candidate_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 103, miner.address, 50_000), act_zero_both],
+    );
+    assert_eq!(
+        state.evaluate_candidate(&bad_block_3).unwrap_err(),
+        ChainError::State("cannot disable allowance with 3-of-7 quorum".into())
+    );
+    assert!(state.apply_block(&bad_block_3).is_err());
+    // Verify atomicity after rejected zero both: state and account unchanged
+    let alice_after_rej3 = state.account(&alice.address).unwrap();
+    assert_eq!(alice_after_rej3.balance, initial_alice.balance);
+    assert_eq!(alice_after_rej3.allowance_limit, 1_000_000);
+    assert_eq!(alice_after_rej3.allowance_window_len, 100);
+    assert_eq!(
+        alice_after_rej3.allowance_spent,
+        initial_alice.allowance_spent
+    );
+    assert_eq!(state.tip_height(), Some(102));
+    assert_eq!(state.tip_block_id(), Some(b102.block_id()));
+
+    // 4. Regression: Three guardians attempt to increase the limit -> REJECT
+    let mut param_inc_limit = Vec::new();
+    param_inc_limit.extend_from_slice(&2_000_000u128.to_le_bytes()); // > 1_000_000
+    param_inc_limit.extend_from_slice(&100u64.to_le_bytes());
+    let act_inc_limit = make_guardian_action(
+        id,
+        alice.address,
+        ACTION_STRENGTHEN_ALLOWANCE,
+        50_000,
+        &param_inc_limit,
+        g_3,
+    );
+    let bad_block_4 = make_candidate_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 103, miner.address, 50_000), act_inc_limit],
+    );
+    assert_eq!(
+        state.evaluate_candidate(&bad_block_4).unwrap_err(),
+        ChainError::State("cannot increase limit with 3-of-7 quorum".into())
+    );
+    assert!(state.apply_block(&bad_block_4).is_err());
+    // Verify atomicity after rejected limit increase: state and account unchanged
+    let alice_after_rej4 = state.account(&alice.address).unwrap();
+    assert_eq!(alice_after_rej4.balance, initial_alice.balance);
+    assert_eq!(alice_after_rej4.allowance_limit, 1_000_000);
+    assert_eq!(alice_after_rej4.allowance_window_len, 100);
+    assert_eq!(
+        alice_after_rej4.allowance_spent,
+        initial_alice.allowance_spent
+    );
+    assert_eq!(state.tip_height(), Some(102));
+    assert_eq!(state.tip_block_id(), Some(b102.block_id()));
+
+    // 5. Regression: Three guardians attempt to shorten the window -> REJECT
+    let mut param_short_window = Vec::new();
+    param_short_window.extend_from_slice(&1_000_000u128.to_le_bytes());
+    param_short_window.extend_from_slice(&50u64.to_le_bytes()); // < 100
+    let act_short_window = make_guardian_action(
+        id,
+        alice.address,
+        ACTION_STRENGTHEN_ALLOWANCE,
+        50_000,
+        &param_short_window,
+        g_3,
+    );
+    let bad_block_5 = make_candidate_block(
+        &state,
+        ts,
+        vec![
+            make_coinbase(id, 103, miner.address, 50_000),
+            act_short_window,
+        ],
+    );
+    assert_eq!(
+        state.evaluate_candidate(&bad_block_5).unwrap_err(),
+        ChainError::State("cannot shorten window with 3-of-7 quorum".into())
+    );
+    assert!(state.apply_block(&bad_block_5).is_err());
+    // Verify atomicity after rejected window shortening: state and account unchanged
+    let alice_after_rej5 = state.account(&alice.address).unwrap();
+    assert_eq!(alice_after_rej5.balance, initial_alice.balance);
+    assert_eq!(alice_after_rej5.allowance_limit, 1_000_000);
+    assert_eq!(alice_after_rej5.allowance_window_len, 100);
+    assert_eq!(
+        alice_after_rej5.allowance_spent,
+        initial_alice.allowance_spent
+    );
+    assert_eq!(state.tip_height(), Some(102));
+    assert_eq!(state.tip_block_id(), Some(b102.block_id()));
+
+    // 6. Regression: Three guardians decrease a positive allowance limit -> ACCEPT
+    let mut param_tight_limit = Vec::new();
+    param_tight_limit.extend_from_slice(&600_000u128.to_le_bytes()); // decreased limit
+    param_tight_limit.extend_from_slice(&100u64.to_le_bytes());
+    let act_tight_limit = make_guardian_action(
+        id,
+        alice.address,
+        ACTION_STRENGTHEN_ALLOWANCE,
+        50_000,
+        &param_tight_limit,
+        g_3,
+    );
+    let good_block_103 = make_hybrid_block(
+        &state,
+        ts,
+        vec![
+            make_coinbase(id, 103, miner.address, 50_000),
+            act_tight_limit,
+        ],
+    );
+    state.apply_block(&good_block_103).unwrap();
+    assert_eq!(
+        state.account(&alice.address).unwrap().allowance_limit,
+        600_000
+    );
+    assert_eq!(
+        state.account(&alice.address).unwrap().allowance_window_len,
+        100
+    );
+    assert_eq!(state.tip_height(), Some(103));
+    assert_eq!(state.tip_block_id(), Some(good_block_103.block_id()));
+
+    // 7. Regression: Three guardians lengthen an allowance window -> ACCEPT
+    ts += 120;
+    let mut param_lengthen_window = Vec::new();
+    param_lengthen_window.extend_from_slice(&600_000u128.to_le_bytes());
+    param_lengthen_window.extend_from_slice(&300u64.to_le_bytes()); // lengthened window
+    let act_lengthen_window = make_guardian_action(
+        id,
+        alice.address,
+        ACTION_STRENGTHEN_ALLOWANCE,
+        50_000,
+        &param_lengthen_window,
+        g_3,
+    );
+    let good_block_104 = make_hybrid_block(
+        &state,
+        ts,
+        vec![
+            make_coinbase(id, 104, miner.address, 50_000),
+            act_lengthen_window,
+        ],
+    );
+    state.apply_block(&good_block_104).unwrap();
+    assert_eq!(
+        state.account(&alice.address).unwrap().allowance_limit,
+        600_000
+    );
+    assert_eq!(
+        state.account(&alice.address).unwrap().allowance_window_len,
+        300
+    );
+    assert_eq!(state.tip_height(), Some(104));
+    assert_eq!(state.tip_block_id(), Some(good_block_104.block_id()));
+
+    // 8. Regression: Four guardians disable allowance protection through weakening action -> ACCEPT
+    ts += 120;
+    let mut param_weaken_disable = Vec::new();
+    param_weaken_disable.extend_from_slice(&0u128.to_le_bytes());
+    param_weaken_disable.extend_from_slice(&0u64.to_le_bytes());
+    let act_weaken_disable = make_guardian_action(
+        id,
+        alice.address,
+        ACTION_WEAKEN_ALLOWANCE,
+        50_000,
+        &param_weaken_disable,
+        g_4,
+    );
+    let good_block_105 = make_hybrid_block(
+        &state,
+        ts,
+        vec![
+            make_coinbase(id, 105, miner.address, 50_000),
+            act_weaken_disable,
+        ],
+    );
+    state.apply_block(&good_block_105).unwrap();
+    assert_eq!(state.account(&alice.address).unwrap().allowance_limit, 0);
+    assert_eq!(
+        state.account(&alice.address).unwrap().allowance_window_len,
+        0
+    );
+    assert_eq!(state.tip_height(), Some(105));
+    assert_eq!(state.tip_block_id(), Some(good_block_105.block_id()));
+
+    // 9. Regression: Three guardians enable a previously disabled allowance through valid strengthening parameters -> ACCEPT
+    ts += 120;
+    let mut param_enable = Vec::new();
+    param_enable.extend_from_slice(&400_000u128.to_le_bytes());
+    param_enable.extend_from_slice(&150u64.to_le_bytes());
+    let act_enable = make_guardian_action(
+        id,
+        alice.address,
+        ACTION_STRENGTHEN_ALLOWANCE,
+        50_000,
+        &param_enable,
+        g_3,
+    );
+    let good_block_106 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 106, miner.address, 50_000), act_enable],
+    );
+    state.apply_block(&good_block_106).unwrap();
+    assert_eq!(
+        state.account(&alice.address).unwrap().allowance_limit,
+        400_000
+    );
+    assert_eq!(
+        state.account(&alice.address).unwrap().allowance_window_len,
+        150
+    );
+    assert_eq!(state.tip_height(), Some(106));
+    assert_eq!(state.tip_block_id(), Some(good_block_106.block_id()));
 }

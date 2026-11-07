@@ -1085,6 +1085,172 @@ class TestHybridConsensusState(unittest.TestCase):
         self.state.apply_guardian_action(tx_weaken_4)
         self.assertEqual(alice.allowance_window_len, 360)
 
+
+    # -----------------------------------------------------------------------
+    # F-01 Regression: 3-of-7 Guardian Allowance Strengthening Zero Bypass
+    # -----------------------------------------------------------------------
+    def test_f01_guardian_allowance_strengthen_zero_bypass_regression(self):
+        """A 3-of-7 action must never weaken or disable an active allowance by setting limit or duration to zero."""
+        alice = self.state.get_or_create_account(self.addr_alice)
+        alice.balance = 500_000_000
+        alice.guardian_enabled = True
+        alice.allowance_limit = 100_000_000
+        alice.allowance_window_len = 720
+        alice.allowance_spent = 0
+        initial_balance = alice.balance
+        initial_nonce = alice.nonce
+
+        # 1. 3 guardians attempt to set limit to zero -> REJECT
+        params_zero_lim = (0).to_bytes(16, "little") + (720).to_bytes(8, "little")
+        tx_zero_lim = GuardianActionTx(
+            chain_id=DEVNET_CHAIN_ID,
+            account=self.addr_alice,
+            action_type=ACTION_STRENGTHEN_ALLOWANCE,
+            fee_atoms=25_000,
+            params=params_zero_lim,
+            guardian_sigs=[(0, b"s0"), (1, b"s1"), (2, b"s2")],
+        )
+        with self.assertRaises(HybridStateError) as ctx:
+            self.state.apply_guardian_action(tx_zero_lim)
+        self.assertIn("Cannot disable allowance with 3-of-7 quorum", str(ctx.exception))
+        # Atomicity check: balance, allowance limit, duration, and spent unchanged
+        self.assertEqual(alice.balance, initial_balance)
+        self.assertEqual(alice.allowance_limit, 100_000_000)
+        self.assertEqual(alice.allowance_window_len, 720)
+        self.assertEqual(alice.allowance_spent, 0)
+
+        # 2. 3 guardians attempt to set window duration to zero -> REJECT
+        params_zero_dur = (100_000_000).to_bytes(16, "little") + (0).to_bytes(8, "little")
+        tx_zero_dur = GuardianActionTx(
+            chain_id=DEVNET_CHAIN_ID,
+            account=self.addr_alice,
+            action_type=ACTION_STRENGTHEN_ALLOWANCE,
+            fee_atoms=25_000,
+            params=params_zero_dur,
+            guardian_sigs=[(0, b"s0"), (1, b"s1"), (2, b"s2")],
+        )
+        with self.assertRaises(HybridStateError) as ctx:
+            self.state.apply_guardian_action(tx_zero_dur)
+        self.assertIn("Cannot disable allowance with 3-of-7 quorum", str(ctx.exception))
+        # Atomicity check: balance, allowance limit, duration, and spent unchanged
+        self.assertEqual(alice.balance, initial_balance)
+        self.assertEqual(alice.allowance_limit, 100_000_000)
+        self.assertEqual(alice.allowance_window_len, 720)
+        self.assertEqual(alice.allowance_spent, 0)
+
+        # 3. 3 guardians attempt to set both to zero -> REJECT
+        params_zero_both = (0).to_bytes(16, "little") + (0).to_bytes(8, "little")
+        tx_zero_both = GuardianActionTx(
+            chain_id=DEVNET_CHAIN_ID,
+            account=self.addr_alice,
+            action_type=ACTION_STRENGTHEN_ALLOWANCE,
+            fee_atoms=25_000,
+            params=params_zero_both,
+            guardian_sigs=[(0, b"s0"), (1, b"s1"), (2, b"s2")],
+        )
+        with self.assertRaises(HybridStateError) as ctx:
+            self.state.apply_guardian_action(tx_zero_both)
+        self.assertIn("Cannot disable allowance with 3-of-7 quorum", str(ctx.exception))
+        # Atomicity check: balance, allowance limit, duration, and spent unchanged
+        self.assertEqual(alice.balance, initial_balance)
+        self.assertEqual(alice.allowance_limit, 100_000_000)
+        self.assertEqual(alice.allowance_window_len, 720)
+        self.assertEqual(alice.allowance_spent, 0)
+
+        # 4. 3 guardians decrease positive allowance limit -> ACCEPT
+        params_tight_lim = (60_000_000).to_bytes(16, "little") + (720).to_bytes(8, "little")
+        tx_tight_lim = GuardianActionTx(
+            chain_id=DEVNET_CHAIN_ID,
+            account=self.addr_alice,
+            action_type=ACTION_STRENGTHEN_ALLOWANCE,
+            fee_atoms=25_000,
+            params=params_tight_lim,
+            guardian_sigs=[(0, b"s0"), (1, b"s1"), (2, b"s2")],
+        )
+        self.state.apply_guardian_action(tx_tight_lim)
+        self.assertEqual(alice.allowance_limit, 60_000_000)
+        self.assertEqual(alice.allowance_window_len, 720)
+        self.assertEqual(alice.balance, initial_balance - 25_000)
+
+        # 5. 3 guardians lengthen allowance window -> ACCEPT
+        params_lengthen = (60_000_000).to_bytes(16, "little") + (1440).to_bytes(8, "little")
+        tx_lengthen = GuardianActionTx(
+            chain_id=DEVNET_CHAIN_ID,
+            account=self.addr_alice,
+            action_type=ACTION_STRENGTHEN_ALLOWANCE,
+            fee_atoms=25_000,
+            params=params_lengthen,
+            guardian_sigs=[(0, b"s0"), (1, b"s1"), (2, b"s2")],
+        )
+        self.state.apply_guardian_action(tx_lengthen)
+        self.assertEqual(alice.allowance_limit, 60_000_000)
+        self.assertEqual(alice.allowance_window_len, 1440)
+
+        # 6. 3 guardians attempt to increase limit -> REJECT
+        params_inc_lim = (80_000_000).to_bytes(16, "little") + (1440).to_bytes(8, "little")
+        tx_inc_lim = GuardianActionTx(
+            chain_id=DEVNET_CHAIN_ID,
+            account=self.addr_alice,
+            action_type=ACTION_STRENGTHEN_ALLOWANCE,
+            fee_atoms=25_000,
+            params=params_inc_lim,
+            guardian_sigs=[(0, b"s0"), (1, b"s1"), (2, b"s2")],
+        )
+        with self.assertRaises(HybridStateError) as ctx:
+            self.state.apply_guardian_action(tx_inc_lim)
+        self.assertIn("Cannot increase allowance limit with 3-of-7 quorum", str(ctx.exception))
+        # Atomicity check: balance, allowance limit, duration, and spent unchanged
+        self.assertEqual(alice.balance, initial_balance - 50_000)
+        self.assertEqual(alice.allowance_limit, 60_000_000)
+        self.assertEqual(alice.allowance_window_len, 1440)
+        self.assertEqual(alice.allowance_spent, 0)
+
+        # 7. 3 guardians attempt to shorten window -> REJECT
+        params_short_dur = (60_000_000).to_bytes(16, "little") + (500).to_bytes(8, "little")
+        tx_short_dur = GuardianActionTx(
+            chain_id=DEVNET_CHAIN_ID,
+            account=self.addr_alice,
+            action_type=ACTION_STRENGTHEN_ALLOWANCE,
+            fee_atoms=25_000,
+            params=params_short_dur,
+            guardian_sigs=[(0, b"s0"), (1, b"s1"), (2, b"s2")],
+        )
+        with self.assertRaises(HybridStateError) as ctx:
+            self.state.apply_guardian_action(tx_short_dur)
+        self.assertIn("Cannot shorten window duration with 3-of-7 quorum", str(ctx.exception))
+        # Atomicity check: balance, allowance limit, duration, and spent unchanged
+        self.assertEqual(alice.balance, initial_balance - 50_000)
+        self.assertEqual(alice.allowance_limit, 60_000_000)
+        self.assertEqual(alice.allowance_window_len, 1440)
+        self.assertEqual(alice.allowance_spent, 0)
+
+        # 8. 4 guardians disable allowance protection through weakening action -> ACCEPT
+        tx_weaken_disable = GuardianActionTx(
+            chain_id=DEVNET_CHAIN_ID,
+            account=self.addr_alice,
+            action_type=ACTION_WEAKEN_ALLOWANCE,
+            fee_atoms=25_000,
+            params=params_zero_both,
+            guardian_sigs=[(0, b"s0"), (1, b"s1"), (2, b"s2"), (3, b"s3")],
+        )
+        self.state.apply_guardian_action(tx_weaken_disable)
+        self.assertEqual(alice.allowance_limit, 0)
+        self.assertEqual(alice.allowance_window_len, 0)
+
+        # 9. 3 guardians enable a previously disabled allowance with valid parameters -> ACCEPT
+        params_enable = (50_000_000).to_bytes(16, "little") + (300).to_bytes(8, "little")
+        tx_enable = GuardianActionTx(
+            chain_id=DEVNET_CHAIN_ID,
+            account=self.addr_alice,
+            action_type=ACTION_STRENGTHEN_ALLOWANCE,
+            fee_atoms=25_000,
+            params=params_enable,
+            guardian_sigs=[(0, b"s0"), (1, b"s1"), (2, b"s2")],
+        )
+        self.state.apply_guardian_action(tx_enable)
+        self.assertEqual(alice.allowance_limit, 50_000_000)
+        self.assertEqual(alice.allowance_window_len, 300)
+
     # -----------------------------------------------------------------------
     # Invariant 28: Established M1-A Transaction Merkle Compatibility
     # -----------------------------------------------------------------------
