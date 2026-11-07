@@ -5,7 +5,7 @@
 //! * height `0`;
 //! * an all-zero parent block ID;
 //! * no transactions (so the transaction root is the empty Merkle root);
-//! * the canonical empty Orchard commitment-tree root;
+//! * the canonical composite genesis state root;
 //! * difficulty `1` and nonce `0`;
 //! * timestamp `1792454400` (`2026-10-20T00:00:00Z`);
 //! * the network's chain ID, `BLAKE2b-256(UTF8("OwnChain/<network>/v1"))`.
@@ -18,8 +18,7 @@
 use crate::block::Block;
 use crate::hash::Hash;
 use crate::header::{Header, VERSION_INITIAL};
-use crate::merkle;
-use crate::orchard_root::empty_commitment_root;
+use crate::merkle::{self, genesis_state_root};
 
 /// The fixed genesis timestamp: `1792454400` = `2026-10-20T00:00:00Z`.
 pub const GENESIS_TIMESTAMP: u64 = 1_792_454_400;
@@ -45,6 +44,8 @@ pub fn genesis_transaction_root() -> Hash {
 ///
 /// The `chain_id` must be the ID of the network the node is running;
 /// `hash::chain_id` derives it from the network name.
+/// The `orchard_commitment_root` slot holds the composite genesis state root
+/// per protocol v1 §6.4.
 pub fn genesis_header(chain_id: Hash) -> Header {
     Header {
         version: VERSION_INITIAL,
@@ -52,7 +53,7 @@ pub fn genesis_header(chain_id: Hash) -> Header {
         height: GENESIS_HEIGHT,
         parent_block_id: Hash::ZERO,
         transaction_root: genesis_transaction_root(),
-        orchard_commitment_root: empty_commitment_root(),
+        orchard_commitment_root: genesis_state_root(),
         timestamp: GENESIS_TIMESTAMP,
         difficulty: GENESIS_DIFFICULTY,
         nonce: GENESIS_NONCE,

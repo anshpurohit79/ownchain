@@ -11,12 +11,23 @@
 //! Milestone M1-C2: RandomX proof-of-work integration and network difficulty
 //! consensus enforcement.
 //!
-//! Milestone M1-E Stage 1: production Orchard transaction decoding and stateless
-//! cryptographic validation.
+//! Milestone M1-E: production Orchard transaction decoding, stateless
+//! cryptographic validation, and block validation integration.
 //!
-//! Design decisions live in `docs/protocol-v1.md`. Wallets, p2p networking,
-//! mempool, and stateful Orchard consensus accounting belong to later milestones.
+//! Milestone M1-H: cross-pool consensus integration, stateful Orchard
+//! incremental commitment tree, 10-block ancestor anchor window, nullifier
+//! set double-spend tracking, transparent account ledger with 7-guardian
+//! governance, coinbase maturity tranches, Type 6 & Type 7 cross-pool transfers,
+//! global monetary conservation (T + S = I), and composite state root verification.
+//!
+//! Milestone M1-I: node runtime, persistent storage, libp2p networking,
+//! block synchronization, and mempool transaction admission.
+//!
+//! Design decisions live in `docs/protocol-v1.md`. Wallet key management,
+//! note scanning, mining daemon, and production network release belong to future milestones.
 
+pub mod account;
+pub mod auth;
 pub mod block;
 pub mod chain;
 pub mod difficulty;
@@ -24,10 +35,15 @@ pub mod error;
 pub mod genesis;
 pub mod hash;
 pub mod header;
+pub mod mempool;
 pub mod merkle;
+pub mod node;
 pub mod orchard_root;
+pub mod orchard_tree;
 pub mod orchard_tx;
+pub mod p2p;
 pub mod randomx;
+pub mod storage;
 pub mod tx;
 pub mod validation;
 

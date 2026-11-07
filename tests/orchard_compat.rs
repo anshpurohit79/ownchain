@@ -339,7 +339,7 @@ fn get_fixtures() -> &'static TestFixtures {
         let tx_action_effect = compute_action_effect_from_action(&tx_unauth.actions()[0]);
         let transfer_sighash = compute_tx_auth_digest(
             devnet_chain_id,
-            1, // OrchardTransfer
+            ownchain::tx::TX_TYPE_SHIELDED_TRANSFER,
             1, // tx_version
             fee_atoms,
             tx_unauth.flag_byte(),
@@ -437,12 +437,18 @@ fn test_valid_orchard_v2_transfer() {
 
     // 6. Test production bundle validation APIs
     let transfer_envelope = ownchain::tx::TxEnvelope {
-        tx_type: TxType::OrchardTransfer,
+        tx_type: TxType::ShieldedTransfer,
         version: 1,
         chain_id: Hash::new(f.devnet_chain_id),
     };
     assert_eq!(
-        compute_bundle_auth_digest(f.devnet_chain_id, 1, 1, 5_000, bundle),
+        compute_bundle_auth_digest(
+            f.devnet_chain_id,
+            ownchain::tx::TX_TYPE_SHIELDED_TRANSFER,
+            1,
+            5_000,
+            bundle
+        ),
         f.transfer_sighash
     );
     assert_eq!(
@@ -628,8 +634,8 @@ fn test_negative_duplicate_nullifier_chain_state() {
     assert!(bundle.verify_proof(vk).is_ok());
 
     // 2. CHAIN-STATE RULE (HARNESS SIMULATION):
-    // NOTE (M1-D gate boundary): This is a harness-level policy simulation.
-    // Actual production nullifier set tracking and persistence in ChainState is deferred to M1-E.
+    // NOTE (Historical M1-D gate boundary): This was originally a harness-level policy simulation.
+    // Production nullifier set tracking and persistence in ChainState was integrated in M1-H.
     let mut simulated_seen_nullifiers: HashSet<[u8; 32]> = HashSet::new();
 
     // First block inclusion succeeds
@@ -656,8 +662,8 @@ fn test_negative_unknown_historical_anchor() {
     assert!(bundle.verify_proof(vk).is_ok());
 
     // 2. CHAIN-STATE RULE (HARNESS SIMULATION):
-    // NOTE (M1-D gate boundary): This is a harness-level policy simulation.
-    // Actual production commitment tree root tracking and ancestor anchor checks in ChainState are deferred to M1-E.
+    // NOTE (Historical M1-D gate boundary): This was originally a harness-level policy simulation.
+    // Production commitment tree root tracking and ancestor anchor checks in ChainState were integrated in M1-H.
     let mut simulated_historical_anchors: HashSet<[u8; 32]> = HashSet::new();
     simulated_historical_anchors.insert(valid_anchor_bytes);
 
@@ -960,7 +966,7 @@ fn test_authorization_digest_mutations_and_invalidation() {
 
     let baseline_sighash = compute_tx_auth_digest(
         f.devnet_chain_id,
-        1,     // OrchardTransfer
+        ownchain::tx::TX_TYPE_SHIELDED_TRANSFER,
         1,     // tx_version
         5_000, // fee_atoms
         bundle.flag_byte(),
@@ -1489,9 +1495,9 @@ fn test_stateless_transaction_validation_transfer() {
     let bundle_bytes = serialize_bundle(&f.transfer_bundle);
 
     // 1. Build canonical wire transaction:
-    // tx_type: 1 (OrchardTransfer) || tx_version: 1 || chain_id: 32 bytes || fee_atoms: 5_000 || bundle
+    // tx_type: 5 (ShieldedTransfer) || tx_version: 1 || chain_id: 32 bytes || fee_atoms: 5_000 || bundle
     let mut raw_tx = Vec::new();
-    raw_tx.push(1u8); // tx_type
+    raw_tx.push(ownchain::tx::TX_TYPE_SHIELDED_TRANSFER); // tx_type
     raw_tx.extend_from_slice(&1u16.to_le_bytes()); // tx_version = 1
     raw_tx.extend_from_slice(&f.devnet_chain_id); // chain_id
     raw_tx.extend_from_slice(&5_000u64.to_le_bytes()); // fee_atoms = 5_000
@@ -1502,7 +1508,7 @@ fn test_stateless_transaction_validation_transfer() {
     let validated: ValidatedOrchardTx = validate_transaction_stateless(&raw_tx, devnet_hash, vk)
         .expect("Production stateless transfer validation succeeds");
 
-    assert_eq!(validated.tx_type(), TxType::OrchardTransfer);
+    assert_eq!(validated.tx_type(), TxType::ShieldedTransfer);
     assert_eq!(validated.chain_id(), devnet_hash);
     assert_eq!(validated.fee_atoms(), Some(5_000));
     assert_eq!(validated.coinbase_height(), None);
@@ -1597,10 +1603,10 @@ fn test_stateless_consensus_bounds_and_action_limits() {
     assert_eq!(MAX_ACTIONS_PER_TX, 50);
     assert_eq!(MAX_ACTIONS_PER_BLOCK, 2000);
 
-    // 2. Exact consensus fee arithmetic (§4)
-    assert_eq!(consensus_fee(0, 0), Some(1_000));
-    assert_eq!(consensus_fee(1, 1_000), Some(2_000));
-    assert_eq!(consensus_fee(50, 100_000), Some(150_000));
+    // 2. Exact consensus fee arithmetic (§4): max(1, 100 * size)
+    assert_eq!(consensus_fee(0, 0), Some(1));
+    assert_eq!(consensus_fee(1, 1_000), Some(100_000));
+    assert_eq!(consensus_fee(50, 100_000), Some(10_000_000));
     // Checked arithmetic overflow protection
     assert_eq!(consensus_fee(usize::MAX, usize::MAX), None);
 
@@ -1610,7 +1616,7 @@ fn test_stateless_consensus_bounds_and_action_limits() {
 
     // 3a. Exceeding non-coinbase 1,000,000 byte limit
     let mut oversized_transfer = vec![0u8; 1_000_001];
-    oversized_transfer[0] = 1; // OrchardTransfer
+    oversized_transfer[0] = ownchain::tx::TX_TYPE_SHIELDED_TRANSFER;
     oversized_transfer[1..3].copy_from_slice(&1u16.to_le_bytes());
     match validate_transaction_stateless(&oversized_transfer, devnet_hash, vk) {
         Err(OrchardValidationError::TransactionTooLarge { actual, limit }) => {

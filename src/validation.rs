@@ -19,8 +19,9 @@
 //! Stateful checks that require historical anchor validation against active chain
 //! commitment-tree roots, nullifier double-spend tracking against the chain,
 //! commitment tree updates and header `orchard_commitment_root` calculation for
-//! transaction-bearing blocks, subsidy limits, and pool balance accounting remain
-//! deferred to the subsequent stateful consensus integration stage.
+//! transaction-bearing blocks, subsidy limits, and pool balance accounting are
+//! enforced in stateful consensus by `ChainState::evaluate_candidate` and
+//! `ChainState::apply_block`.
 //! This module never invents a rule the specification does not state; in
 //! particular it does not implement the "two hours ahead of local time"
 //! deferral rule, because §4 explicitly classifies that as a local-clock
@@ -31,7 +32,6 @@ use core::fmt;
 use crate::block::{Block, MAX_BLOCK_SIZE, MAX_TRANSACTION_SIZE, TX_COUNT_LEN, TX_LENGTH_LEN};
 use crate::hash::Hash;
 use crate::header::{HEADER_LEN, VERSION_INITIAL};
-use crate::orchard_root::empty_commitment_root;
 use crate::tx::{self, TxType};
 
 /// The number of ancestor blocks the timestamp rule considers.
@@ -479,12 +479,17 @@ impl<'a> ValidationContext<'a> {
 /// Stateful checks (historical anchors against active chain commitment-tree roots,
 /// nullifier double-spend tracking against the chain, commitment tree updates,
 /// header `orchard_commitment_root` calculation for transaction-bearing blocks, subsidy limits,
-/// and pool-balance accounting) remain deferred.
+/// and pool-balance accounting) are enforced during candidate evaluation and block application
+/// in [`crate::chain::ChainState`].
 ///
 /// The function is pure: it never mutates any state. A caller may therefore
 /// validate first and only then commit the block, which is what
 /// [`crate::chain::ChainState::apply_block`] does.
-pub fn validate_block(
+/// Validates all candidate block rules without requiring solved proof-of-work.
+///
+/// This performs structural, cryptographic (Halo2 proofs, transaction signatures),
+/// envelope, difficulty declaration, timestamp, and transaction root validation.
+pub fn validate_candidate_block(
     block: &Block,
     context: &ValidationContext<'_>,
 ) -> Result<(), ValidationError> {
@@ -493,6 +498,15 @@ pub fn validate_block(
     validate_transactions(block, context)?;
     validate_orchard_root(block)?;
     validate_timestamp(block, context)?;
+    Ok(())
+}
+
+/// Fully validates a completed block, including candidate rules and RandomX proof-of-work.
+pub fn validate_block(
+    block: &Block,
+    context: &ValidationContext<'_>,
+) -> Result<(), ValidationError> {
+    validate_candidate_block(block, context)?;
     validate_pow(block, context)?;
     Ok(())
 }
@@ -616,11 +630,11 @@ fn validate_genesis(block: &Block, context: &ValidationContext<'_>) -> Result<()
         });
     }
 
-    let expected_orchard_root = empty_commitment_root();
-    if header.orchard_commitment_root != expected_orchard_root {
+    let expected_state_root = crate::merkle::genesis_state_root();
+    if header.orchard_commitment_root != expected_state_root {
         return Err(ValidationError::InvalidGenesis {
             reason: format!(
-                "orchard commitment root is {}, expected {expected_orchard_root}",
+                "state root is {}, expected {expected_state_root}",
                 header.orchard_commitment_root
             ),
         });
@@ -666,15 +680,26 @@ fn validate_transactions(
     if context.parent.is_some() {
         let mut total_actions = 0usize;
         for raw in &block.transactions {
-            if raw.len() > tx::TX_ENVELOPE_LEN + 8 {
-                let mut bundle_slice = &raw[tx::TX_ENVELOPE_LEN + 8..];
-                if let Ok(n_actions) = crate::orchard_tx::decode_compact_size(&mut bundle_slice) {
-                    total_actions = total_actions.checked_add(n_actions).ok_or(
-                        ValidationError::TooManyBlockActions {
-                            actual: usize::MAX,
-                            limit: crate::orchard_tx::MAX_ACTIONS_PER_BLOCK,
-                        },
-                    )?;
+            let tag = *raw.first().unwrap_or(&0xff);
+            let bundle_offset = match tag {
+                tx::TX_TYPE_COINBASE => None,
+                tx::TX_TYPE_SHIELDED_TRANSFER => Some(tx::TX_ENVELOPE_LEN + 8),
+                tx::TX_TYPE_TRANSPARENT_TO_SHIELDED => Some(tx::TX_ENVELOPE_LEN + 68),
+                tx::TX_TYPE_SHIELDED_TO_TRANSPARENT => Some(tx::TX_ENVELOPE_LEN + 60),
+                _ => None,
+            };
+            if let Some(offset) = bundle_offset {
+                if raw.len() > offset {
+                    let mut bundle_slice = &raw[offset..];
+                    if let Ok(n_actions) = crate::orchard_tx::decode_compact_size(&mut bundle_slice)
+                    {
+                        total_actions = total_actions.checked_add(n_actions).ok_or(
+                            ValidationError::TooManyBlockActions {
+                                actual: usize::MAX,
+                                limit: crate::orchard_tx::MAX_ACTIONS_PER_BLOCK,
+                            },
+                        )?;
+                    }
                 }
             }
         }
@@ -808,42 +833,129 @@ fn validate_transactions(
     // Stateful checks (historical anchors against active chain commitment-tree
     // roots, nullifier double-spend tracking against the chain, commitment tree
     // updates, header orchard_commitment_root for tx-bearing blocks, subsidy limits,
-    // and pool balance accounting) remain deferred.
+    // and pool balance accounting) are enforced at the stateful consensus boundary
+    // in `ChainState::evaluate_candidate` and `ChainState::apply_block`.
     if context.parent.is_some() {
         let vk = crate::orchard_tx::verifying_key();
         let mut total_actions = 0usize;
 
         for (index, raw) in block.transactions.iter().enumerate() {
-            let validated =
-                crate::orchard_tx::validate_transaction_stateless(raw, context.chain_id, vk)
-                    .map_err(|error| ValidationError::InvalidOrchardTransaction { index, error })?;
-
-            let action_count = validated.bundle().actions().len();
-            total_actions = total_actions.checked_add(action_count).ok_or(
-                ValidationError::TooManyBlockActions {
-                    actual: usize::MAX,
-                    limit: crate::orchard_tx::MAX_ACTIONS_PER_BLOCK,
-                },
-            )?;
-
-            if validated.tx_type() == TxType::OrchardTransfer {
-                let declared_fee = validated.fee_atoms().unwrap_or(0);
-                match crate::orchard_tx::check_transaction_fee(
-                    action_count,
-                    raw.len(),
-                    declared_fee,
-                ) {
-                    Ok(_) => {}
-                    Err(crate::orchard_tx::FeeError::Overflow) => {
-                        return Err(ValidationError::FeeCalculationOverflow { index });
-                    }
-                    Err(crate::orchard_tx::FeeError::Mismatch { declared, expected }) => {
-                        return Err(ValidationError::IncorrectTransactionFee {
-                            index,
-                            declared,
-                            expected,
+            let env = &envelopes[index];
+            match env.tx_type {
+                TxType::Coinbase => {
+                    if raw.len() != 83 {
+                        return Err(ValidationError::InvalidCoinbase {
+                            reason: format!(
+                                "invalid coinbase wire length: expected 83 (transparent-only), found {}",
+                                raw.len()
+                            ),
                         });
                     }
+                    // Transparent coinbase: structural fields verified above;
+                    // value and tranche maturity verified in state execution.
+                    continue;
+                }
+                TxType::TransparentTransfer => {
+                    if raw.len() != 195 {
+                        return Err(ValidationError::MalformedTransaction {
+                            index,
+                            reason: format!(
+                                "invalid TransparentTransfer wire length: expected 195, found {}",
+                                raw.len()
+                            ),
+                        });
+                    }
+                    let fee = tx::transaction_fee(raw).unwrap_or(0);
+                    let min_fee = tx::min_fee(raw.len())
+                        .ok_or(ValidationError::FeeCalculationOverflow { index })?;
+                    if fee < min_fee {
+                        return Err(ValidationError::IncorrectTransactionFee {
+                            index,
+                            declared: fee,
+                            expected: min_fee,
+                        });
+                    }
+                }
+                TxType::ShieldedTransfer => {
+                    let validated = crate::orchard_tx::validate_transaction_stateless(
+                        raw,
+                        context.chain_id,
+                        vk,
+                    )
+                    .map_err(|error| ValidationError::InvalidOrchardTransaction { index, error })?;
+
+                    let action_count = validated.bundle().actions().len();
+                    total_actions = total_actions.checked_add(action_count).ok_or(
+                        ValidationError::TooManyBlockActions {
+                            actual: usize::MAX,
+                            limit: crate::orchard_tx::MAX_ACTIONS_PER_BLOCK,
+                        },
+                    )?;
+
+                    let declared_fee = validated.fee_atoms().unwrap_or(0);
+                    match crate::orchard_tx::check_transaction_fee(
+                        action_count,
+                        raw.len(),
+                        declared_fee,
+                    ) {
+                        Ok(_) => {}
+                        Err(crate::orchard_tx::FeeError::Overflow) => {
+                            return Err(ValidationError::FeeCalculationOverflow { index });
+                        }
+                        Err(crate::orchard_tx::FeeError::Mismatch { declared, expected }) => {
+                            return Err(ValidationError::IncorrectTransactionFee {
+                                index,
+                                declared,
+                                expected,
+                            });
+                        }
+                    }
+                }
+                TxType::ConfigureGuardians
+                | TxType::GuardianAction
+                | TxType::CancelPendingTransfer => {
+                    let fee = tx::transaction_fee(raw).unwrap_or(0);
+                    let min_fee = tx::min_fee(raw.len())
+                        .ok_or(ValidationError::FeeCalculationOverflow { index })?;
+                    if fee < min_fee {
+                        return Err(ValidationError::IncorrectTransactionFee {
+                            index,
+                            declared: fee,
+                            expected: min_fee,
+                        });
+                    }
+                }
+                TxType::TransparentToShielded => {
+                    let validated = crate::orchard_tx::validate_type6_transaction_stateless(
+                        raw,
+                        context.chain_id,
+                        vk,
+                    )
+                    .map_err(|error| ValidationError::InvalidOrchardTransaction { index, error })?;
+
+                    let action_count = validated.bundle.actions().len();
+                    total_actions = total_actions.checked_add(action_count).ok_or(
+                        ValidationError::TooManyBlockActions {
+                            actual: usize::MAX,
+                            limit: crate::orchard_tx::MAX_ACTIONS_PER_BLOCK,
+                        },
+                    )?;
+                }
+                TxType::ShieldedToTransparent => {
+                    let validated = crate::orchard_tx::validate_type7_transaction_stateless(
+                        raw,
+                        context.chain_id,
+                        vk,
+                    )
+                    .map_err(|error| ValidationError::InvalidOrchardTransaction { index, error })?;
+
+                    let action_count = validated.bundle.actions().len();
+                    total_actions = total_actions.checked_add(action_count).ok_or(
+                        ValidationError::TooManyBlockActions {
+                            actual: usize::MAX,
+                            limit: crate::orchard_tx::MAX_ACTIONS_PER_BLOCK,
+                        },
+                    )?;
                 }
             }
         }
@@ -880,18 +992,19 @@ fn parse_envelope_at(
 ///
 /// While stateless Orchard bundle verification is now active, incremental
 /// commitment-tree state updates and root calculation for transaction-bearing
-/// blocks remain deferred to the subsequent stateful consensus integration stage.
-/// The check is therefore applied exactly where it is currently decidable without
-/// stateful tree tracking — a block that carries no transactions commits to no Orchard
+/// blocks require stateful chain context and are enforced in stateful consensus
+/// by `ChainState::evaluate_candidate` and `ChainState::apply_block`.
+/// In this stateless validator, the check is applied where it is decidable without
+/// stateful tree tracking — an empty block carries no transactions and commits to no Orchard
 /// commitment, so its header must carry the canonical empty Orchard root.
 fn validate_orchard_root(block: &Block) -> Result<(), ValidationError> {
     if !block.transactions.is_empty() {
-        // Deferred to stateful consensus integration: commitment tree state updates
-        // and header orchard_commitment_root verification for transaction-bearing blocks.
+        // Enforced in stateful consensus (ChainState::evaluate_candidate and ChainState::apply_block):
+        // incremental tree updates and header orchard_commitment_root verification.
         return Ok(());
     }
 
-    let expected = empty_commitment_root();
+    let expected = crate::merkle::genesis_state_root();
     if block.header.orchard_commitment_root != expected {
         return Err(ValidationError::OrchardRootMismatch {
             computed: expected,

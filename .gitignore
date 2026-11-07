@@ -15,3 +15,7 @@ Thumbs.db
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+# Python
+__pycache__/
+*.pyc
