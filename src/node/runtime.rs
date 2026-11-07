@@ -119,6 +119,7 @@ pub struct NodeStatus {
     pub cumulative_work: U256,
     pub composite_state_root: Hash,
     pub mempool_size: usize,
+    pub orphan_pool_size: usize,
     pub peer_id: PeerId,
 }
 
@@ -241,6 +242,30 @@ impl NodeHandle {
             .map_err(|_| "Node runtime has shut down".to_string())?;
         rx.await
             .map_err(|_| "Node runtime dropped response".to_string())?
+    }
+
+    pub async fn dial_peer(&self, addr: Multiaddr) -> Result<(), String> {
+        self.dial(addr).await
+    }
+
+    pub async fn get_tip_height(&self) -> Result<u64, String> {
+        Ok(self.status().await?.tip_height)
+    }
+
+    pub async fn get_tip_block_id(&self) -> Result<Hash, String> {
+        Ok(self.status().await?.tip_block_id)
+    }
+
+    pub async fn get_cumulative_work(&self) -> Result<U256, String> {
+        Ok(self.status().await?.cumulative_work)
+    }
+
+    pub async fn get_composite_state_root(&self) -> Result<Hash, String> {
+        Ok(self.status().await?.composite_state_root)
+    }
+
+    pub async fn get_orphan_count(&self) -> Result<usize, String> {
+        Ok(self.status().await?.orphan_pool_size)
     }
 
     pub async fn disconnect(&self, peer_id: PeerId) -> Result<(), String> {
@@ -391,12 +416,17 @@ impl NodeRuntime {
     pub fn spawn(
         config: NodeConfig,
     ) -> Result<(NodeHandle, tokio::task::JoinHandle<()>), RuntimeError> {
-        let mut runtime = Self::init(config)?;
-        let handle = runtime.handle();
+        let runtime = Self::init(config)?;
+        Ok(runtime.spawn_actor())
+    }
+
+    /// Spawns an initialized node runtime in a background Tokio task and returns its handle.
+    pub fn spawn_actor(mut self) -> (NodeHandle, tokio::task::JoinHandle<()>) {
+        let handle = self.handle();
         let join_handle = tokio::spawn(async move {
-            runtime.run(None).await;
+            self.run(None).await;
         });
-        Ok((handle, join_handle))
+        (handle, join_handle)
     }
 
     pub fn peer_id(&self) -> PeerId {
@@ -584,6 +614,7 @@ impl NodeRuntime {
                                 cumulative_work: self.cumulative_work(),
                                 composite_state_root: self.chain_state.composite_state_root(),
                                 mempool_size: self.mempool.len(),
+                                orphan_pool_size: self.orphan_count(),
                                 peer_id: self.peer_id,
                             };
                             let _ = respond_to.send(status);
@@ -973,12 +1004,55 @@ impl NodeRuntime {
                 block_ids: vec![parent_id],
             };
             let mut retrieved_parents = Vec::new();
-            if let Ok(SyncResponse::Blocks(parents)) = self
-                .network_handle
-                .send_sync_request(source_peer, req)
-                .await
-            {
-                retrieved_parents = parents;
+            if source_peer != self.peer_id {
+                if let Ok(SyncResponse::Blocks(parents)) = self
+                    .network_handle
+                    .send_sync_request(source_peer, req.clone())
+                    .await
+                {
+                    retrieved_parents = parents;
+                }
+            }
+            if retrieved_parents.is_empty() {
+                // If source_peer was local or didn't return parent, query connected peers
+                if let Ok(peers) = self.network_handle.get_connected_peers().await {
+                    for peer in peers {
+                        if peer.peer_id != self.peer_id && peer.handshake.is_some() {
+                            if let Ok(SyncResponse::Blocks(parents)) = self
+                                .network_handle
+                                .send_sync_request(peer.peer_id, req.clone())
+                                .await
+                            {
+                                if !parents.is_empty() {
+                                    retrieved_parents = parents;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if retrieved_parents.is_empty() {
+                // Also try GetMissingParent request
+                let req_mp = SyncRequest::GetMissingParent {
+                    child_block_id: block_id,
+                };
+                if let Ok(peers) = self.network_handle.get_connected_peers().await {
+                    for peer in peers {
+                        if peer.peer_id != self.peer_id && peer.handshake.is_some() {
+                            if let Ok(SyncResponse::Blocks(parents)) = self
+                                .network_handle
+                                .send_sync_request(peer.peer_id, req_mp.clone())
+                                .await
+                            {
+                                if !parents.is_empty() {
+                                    retrieved_parents = parents;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
             }
             return Ok((None, retrieved_parents));
         }

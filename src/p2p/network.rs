@@ -4,7 +4,7 @@
 //! - Rust libp2p with TCP, Noise, Yamux.
 //! - Gossipsub for block and transaction gossip.
 //! - Kademlia DHT for peer discovery and operator bootstrap peers.
-//! - Application handshake `/ownchain/1`.
+//! - Application handshake carried over `/ownchain/sync/1`.
 //! - Bounded sync protocol via RequestResponse.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -81,7 +81,7 @@ pub enum NetworkCommand {
 /// Events emitted by the network service to the node runtime.
 #[derive(Debug)]
 pub enum NetworkEvent {
-    /// A new peer successfully connected and completed the `/ownchain/1` handshake.
+    /// A new peer successfully connected and completed the handshake over `/ownchain/sync/1`.
     PeerHandshakeCompleted {
         peer_id: PeerId,
         handshake: HandshakeMessage,

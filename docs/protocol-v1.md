@@ -469,7 +469,7 @@ Every validating node validates blocks and transactions according to these atomi
 | Block/transaction gossip | libp2p Gossipsub with application-level validation before accepting data into local consensus state |
 | Peer discovery | Kademlia DHT plus manually configured bootstrap peers; discovery nodes are not consensus authorities |
 | Block synchronization | Versioned request/response messages for headers and block bodies; validate all received data locally |
-| Application protocol | `/ownchain/1` with explicit protocol version and network/chain ID in handshake |
+| Application protocol | `/ownchain/sync/1` request/response (with mandatory initial handshake verifying protocol version, chain ID, and tip status) and Gossipsub (`/ownchain/blocks/v1`, `/ownchain/txs/v1`) |
 | Default ports | Development/testnet TCP `40333`; mainnet TCP `30333` if/when a mainnet is separately approved |
 | Bootstrapping | Peer addresses may be supplied by the operator. Seed nodes are convenience infrastructure only. |
 | Message encoding | Explicit versioned application messages with a `u32` little-endian length prefix; maximum application frame length is 2,100,000 bytes. Consensus serialization remains separate and does not include peer-to-peer framing. |

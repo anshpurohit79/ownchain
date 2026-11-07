@@ -1,4 +1,4 @@
-//! Application handshake protocol `/ownchain/1`.
+//! Application handshake protocol.
 //!
 //! Defined in `docs/protocol-v1.md` §8 and M1-I specification:
 //! Every peer exchange begins with a handshake verifying:
@@ -8,13 +8,15 @@
 //! - Node software version
 //! - Peer chain status (height, tip ID, cumulative work)
 //!
-//! Incompatible protocol versions or chain IDs cause immediate peer disconnection.
+//! Handshake messages are exchanged as the mandatory first `Handshake` request/response
+//! carried over `/ownchain/sync/1`. Incompatible protocol versions or chain IDs cause
+//! immediate peer disconnection.
 
 use crate::difficulty::U256;
 use crate::hash::Hash;
 
-/// The OwnChain application handshake protocol identifier.
-pub const HANDSHAKE_PROTOCOL_ID: &str = "/ownchain/1";
+/// The OwnChain application handshake identifier (carried over `/ownchain/sync/1`).
+pub const HANDSHAKE_PROTOCOL_ID: &str = "/ownchain/sync/1";
 
 /// The currently supported handshake protocol version.
 pub const HANDSHAKE_PROTOCOL_VERSION: u16 = 1;

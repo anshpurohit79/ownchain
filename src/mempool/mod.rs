@@ -86,6 +86,10 @@ pub enum MempoolError {
     NullifierAlreadySpent(Hash),
     /// Nullifier conflicts with another pending transaction in the mempool.
     ConflictingNullifier { nullifier: Hash, existing_tx: Hash },
+    /// Duplicate nullifier within the same transaction.
+    DuplicateNullifierInTx(Hash),
+    /// Value balance mismatch.
+    ValueBalanceMismatch { value_balance: i64, expected: i64 },
     /// Total deshield amount exceeds shielded pool balance.
     InsufficientShieldedPoolBalance { available: u128, required: u128 },
     /// Malformed transaction payload or guardian signatures.
@@ -133,6 +137,16 @@ impl core::fmt::Display for MempoolError {
             } => write!(
                 f,
                 "nullifier {nullifier} conflicts with pending tx {existing_tx}"
+            ),
+            MempoolError::DuplicateNullifierInTx(nf) => {
+                write!(f, "duplicate nullifier {nf} within transaction")
+            }
+            MempoolError::ValueBalanceMismatch {
+                value_balance,
+                expected,
+            } => write!(
+                f,
+                "value balance mismatch: got {value_balance}, expected {expected}"
             ),
             MempoolError::InsufficientShieldedPoolBalance {
                 available,
@@ -832,9 +846,13 @@ impl Mempool {
                 }
 
                 // Nullifier extraction and conflict check
+                let mut tx_nfs = BTreeSet::new();
                 let mut nfs = Vec::with_capacity(bundle.actions().len());
                 for action in bundle.actions() {
                     let nf = Hash::new(action.nullifier().to_bytes());
+                    if !tx_nfs.insert(nf) {
+                        return Err(MempoolError::DuplicateNullifierInTx(nf));
+                    }
                     if chain_state.nullifier_set().contains(&nf) {
                         return Err(MempoolError::NullifierAlreadySpent(nf));
                     }
@@ -887,6 +905,13 @@ impl Mempool {
                 let bundle_bytes = &payload[68..bundle_end];
                 let bundle = deserialize_bundle(bundle_bytes)?;
 
+                let n_actions = bundle.actions().len();
+                if n_actions == 0 || n_actions > crate::orchard_tx::MAX_ACTIONS_PER_TX {
+                    return Err(MempoolError::Malformed(format!(
+                        "invalid action count {n_actions}"
+                    )));
+                }
+
                 if *bundle.flags() != orchard::bundle::Flags::SPENDS_DISABLED {
                     return Err(MempoolError::Malformed(
                         "Type 6 requires SPENDS_DISABLED".into(),
@@ -896,6 +921,23 @@ impl Mempool {
                     return Err(MempoolError::Malformed(
                         "Type 6 anchor must be empty tree".into(),
                     ));
+                }
+
+                let vb = *bundle.value_balance();
+                if vb >= 0 {
+                    return Err(MempoolError::Malformed(
+                        "Type 6 value balance must be negative".into(),
+                    ));
+                }
+
+                let expected_vb = -i64::try_from(shielded_amount).map_err(|_| {
+                    MempoolError::Malformed("shielded amount exceeds i64 bounds".into())
+                })?;
+                if vb != expected_vb {
+                    return Err(MempoolError::ValueBalanceMismatch {
+                        value_balance: vb,
+                        expected: expected_vb,
+                    });
                 }
 
                 // Stateless bundle proof check
@@ -1003,9 +1045,13 @@ impl Mempool {
                 check_mempool_allowance(acct, tip_h, total_spend)?;
 
                 // Nullifier extraction
+                let mut tx_nfs = BTreeSet::new();
                 let mut nfs = Vec::with_capacity(bundle.actions().len());
                 for action in bundle.actions() {
                     let nf = Hash::new(action.nullifier().to_bytes());
+                    if !tx_nfs.insert(nf) {
+                        return Err(MempoolError::DuplicateNullifierInTx(nf));
+                    }
                     if chain_state.nullifier_set().contains(&nf) {
                         return Err(MempoolError::NullifierAlreadySpent(nf));
                     }
@@ -1054,10 +1100,37 @@ impl Mempool {
                 let bundle_bytes = &payload[60..expected_len];
                 let bundle = deserialize_bundle(bundle_bytes)?;
 
+                let n_actions = bundle.actions().len();
+                if n_actions == 0 || n_actions > crate::orchard_tx::MAX_ACTIONS_PER_TX {
+                    return Err(MempoolError::Malformed(format!(
+                        "invalid action count {n_actions}"
+                    )));
+                }
+
                 if !bundle.flags().spends_enabled() {
                     return Err(MempoolError::Malformed(
                         "Type 7 requires spends enabled".into(),
                     ));
+                }
+
+                let vb = *bundle.value_balance();
+                if vb <= 0 {
+                    return Err(MempoolError::Malformed(
+                        "Type 7 value balance must be positive".into(),
+                    ));
+                }
+
+                let total_deshield = release_amount
+                    .checked_add(fee as u128)
+                    .ok_or_else(|| MempoolError::Malformed("total deshield overflow".into()))?;
+                let expected_vb = i64::try_from(total_deshield).map_err(|_| {
+                    MempoolError::Malformed("total deshield exceeds i64 bounds".into())
+                })?;
+                if vb != expected_vb {
+                    return Err(MempoolError::ValueBalanceMismatch {
+                        value_balance: vb,
+                        expected: expected_vb,
+                    });
                 }
 
                 let vk = verifying_key();
@@ -1094,9 +1167,6 @@ impl Mempool {
                     .map_err(|_| MempoolError::InvalidSignature("binding signature".into()))?;
 
                 // Shielded pool balance check
-                let total_deshield = release_amount
-                    .checked_add(fee as u128)
-                    .ok_or_else(|| MempoolError::Malformed("deshield overflow".into()))?;
                 let current_deshield = self
                     .total_pending_deshield
                     .checked_add(total_deshield)
@@ -1110,9 +1180,13 @@ impl Mempool {
                 }
 
                 // Nullifiers
+                let mut tx_nfs = BTreeSet::new();
                 let mut nfs = Vec::with_capacity(bundle.actions().len());
                 for action in bundle.actions() {
                     let nf = Hash::new(action.nullifier().to_bytes());
+                    if !tx_nfs.insert(nf) {
+                        return Err(MempoolError::DuplicateNullifierInTx(nf));
+                    }
                     if chain_state.nullifier_set().contains(&nf) {
                         return Err(MempoolError::NullifierAlreadySpent(nf));
                     }
@@ -1639,5 +1713,495 @@ mod tests {
         let mut pool = Mempool::new();
         let res = pool.admit(&tx4, &state);
         assert!(res.is_err(), "Must be rejected");
+    }
+
+    use crate::orchard_tree::EMPTY_ROOTS;
+    use crate::orchard_tx::serialize_bundle;
+    use orchard::builder::{Builder, BundleType, InProgress, Unauthorized};
+    use orchard::bundle::{BundleVersion, Flags};
+    use orchard::circuit::{OrchardCircuitVersion, ProvingKey};
+    use orchard::keys::{
+        FullViewingKey, OutgoingViewingKey, Scope, SpendAuthorizingKey, SpendingKey,
+    };
+    use orchard::note::{ExtractedNoteCommitment, Note};
+    use orchard::tree::{Anchor, MerkleHashOrchard, MerklePath};
+    use orchard::value::NoteValue;
+    use orchard::Proof;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use std::sync::OnceLock;
+
+    static PROVING_KEY: OnceLock<ProvingKey> = OnceLock::new();
+
+    fn get_proving_key() -> &'static ProvingKey {
+        PROVING_KEY.get_or_init(|| ProvingKey::build(OrchardCircuitVersion::FixedPostNu6_2))
+    }
+
+    fn single_leaf_witness(cmx: &ExtractedNoteCommitment) -> (Anchor, MerklePath) {
+        let auth_path = EMPTY_ROOTS.map(|bytes| MerkleHashOrchard::from_bytes(&bytes).unwrap());
+        let path = MerklePath::from_parts(0, auth_path);
+        let anchor = path.root(*cmx);
+        (anchor, path)
+    }
+
+    fn build_test_type6_bundle(
+        shielded_amount: u64,
+        seed: u8,
+    ) -> (
+        orchard::Bundle<InProgress<Proof, Unauthorized>, i64>,
+        Note,
+        ExtractedNoteCommitment,
+    ) {
+        let mut rng = StdRng::from_seed([seed; 32]);
+        let pk = get_proving_key();
+
+        let recipient_sk = SpendingKey::from_bytes([0xaa; 32]).unwrap();
+        let recipient_fvk = FullViewingKey::from(&recipient_sk);
+        let recipient_address = recipient_fvk.address_at(0u32, Scope::External);
+
+        let mut builder = Builder::new(
+            BundleType::UNPADDED,
+            BundleVersion::orchard_v2(),
+            Flags::SPENDS_DISABLED,
+            Anchor::empty_tree(),
+        )
+        .unwrap();
+
+        let ovk = OutgoingViewingKey::from([0x55; 32]);
+        builder
+            .add_output(
+                Some(ovk.clone()),
+                recipient_address,
+                NoteValue::from_raw(shielded_amount),
+                [0u8; 512],
+            )
+            .unwrap();
+
+        let (unauth_bundle, meta) = builder.build::<i64>(&mut rng).unwrap().unwrap();
+        let note = unauth_bundle
+            .recover_output_with_ovk(meta.output_action_index(0).unwrap(), &ovk)
+            .unwrap()
+            .0;
+        let cmx: ExtractedNoteCommitment = note.commitment().into();
+        let proven_bundle = unauth_bundle.create_proof(pk, &mut rng).unwrap();
+        (proven_bundle, note, cmx)
+    }
+
+    fn make_test_type6_tx(
+        chain_id: Hash,
+        sender_sk: &SigningKey,
+        nonce: u64,
+        shielded_amount: u128,
+        fee_atoms: u64,
+        proven_bundle: &orchard::Bundle<InProgress<Proof, Unauthorized>, i64>,
+    ) -> Vec<u8> {
+        let mut rng = StdRng::seed_from_u64(42);
+        let sender_pk = sender_sk.verifying_key().to_bytes();
+        let auth_digest = compute_type6_bundle_auth_digest(
+            *chain_id.as_bytes(),
+            1u16,
+            sender_pk,
+            nonce,
+            shielded_amount,
+            fee_atoms,
+            proven_bundle,
+        );
+        let authorized_bundle = proven_bundle
+            .clone()
+            .apply_signatures(&mut rng, auth_digest, &[])
+            .unwrap();
+        let bundle_bytes = serialize_bundle(&authorized_bundle);
+        let sender_sig = sender_sk.sign(&auth_digest).to_bytes();
+
+        let mut raw_tx = Vec::new();
+        raw_tx.push(6u8); // Type 6
+        raw_tx.extend_from_slice(&1u16.to_le_bytes());
+        raw_tx.extend_from_slice(chain_id.as_bytes());
+
+        raw_tx.extend_from_slice(&sender_pk);
+        raw_tx.extend_from_slice(&nonce.to_le_bytes());
+        raw_tx.extend_from_slice(&shielded_amount.to_le_bytes());
+        raw_tx.extend_from_slice(&fee_atoms.to_le_bytes());
+        raw_tx.extend_from_slice(&(bundle_bytes.len() as u32).to_le_bytes());
+        raw_tx.extend_from_slice(&bundle_bytes);
+        raw_tx.extend_from_slice(&sender_sig);
+        raw_tx.push(0); // 0 guardian signatures
+        raw_tx
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_test_type7_bundle(
+        user_sk: &SpendingKey,
+        seed_note: Note,
+        seed_path: MerklePath,
+        anchor: Anchor,
+        _release_amount: u64,
+        change_amount: u64,
+        _fee_atoms: u64,
+        seed: u8,
+    ) -> orchard::Bundle<InProgress<Proof, Unauthorized>, i64> {
+        let mut rng = StdRng::from_seed([seed; 32]);
+        let pk = get_proving_key();
+        let user_fvk = FullViewingKey::from(user_sk);
+        let user_address = user_fvk.address_at(0u32, Scope::External);
+        let user_ovk = OutgoingViewingKey::from([0x55; 32]);
+
+        let mut builder = Builder::new(
+            BundleType::UNPADDED,
+            BundleVersion::orchard_v2(),
+            Flags::ENABLED,
+            anchor,
+        )
+        .unwrap();
+
+        builder.add_spend(user_fvk, seed_note, seed_path).unwrap();
+        if change_amount > 0 {
+            builder
+                .add_output(
+                    Some(user_ovk),
+                    user_address,
+                    NoteValue::from_raw(change_amount),
+                    [0u8; 512],
+                )
+                .unwrap();
+        }
+
+        let (unauth, _) = builder.build::<i64>(&mut rng).unwrap().unwrap();
+        unauth.create_proof(pk, &mut rng).unwrap()
+    }
+
+    fn make_test_type7_tx(
+        chain_id: Hash,
+        user_sk: &SpendingKey,
+        recipient: Hash,
+        release_amount: u128,
+        fee_atoms: u64,
+        proven_bundle: &orchard::Bundle<InProgress<Proof, Unauthorized>, i64>,
+    ) -> Vec<u8> {
+        let mut rng = StdRng::seed_from_u64(99);
+        let auth_digest = compute_type7_bundle_auth_digest(
+            *chain_id.as_bytes(),
+            1u16,
+            *recipient.as_bytes(),
+            release_amount,
+            fee_atoms,
+            proven_bundle,
+        );
+        let spend_auth_key = SpendAuthorizingKey::from(user_sk);
+        let spend_auth_keys: Vec<SpendAuthorizingKey> = (0..proven_bundle.actions().len())
+            .map(|_| spend_auth_key.clone())
+            .collect();
+        let authorized_bundle = proven_bundle
+            .clone()
+            .apply_signatures(&mut rng, auth_digest, &spend_auth_keys)
+            .unwrap();
+        let bundle_bytes = serialize_bundle(&authorized_bundle);
+
+        let mut raw_tx = Vec::new();
+        raw_tx.push(7u8); // Type 7
+        raw_tx.extend_from_slice(&1u16.to_le_bytes());
+        raw_tx.extend_from_slice(chain_id.as_bytes());
+
+        raw_tx.extend_from_slice(recipient.as_bytes());
+        raw_tx.extend_from_slice(&release_amount.to_le_bytes());
+        raw_tx.extend_from_slice(&fee_atoms.to_le_bytes());
+        raw_tx.extend_from_slice(&(bundle_bytes.len() as u32).to_le_bytes());
+        raw_tx.extend_from_slice(&bundle_bytes);
+        raw_tx
+    }
+
+    #[test]
+    fn test_mempool_type6_value_balance_mismatch_rejected() {
+        let miner_sk = make_test_key(1);
+        let (state, _last_block) = setup_chain_with_funded_account(&miner_sk);
+        let cid = test_chain_id();
+
+        // Build valid proven bundle with 50_000_000 atoms (value_balance = -50_000_000)
+        let (proven, _, _) = build_test_type6_bundle(50_000_000, 0x11);
+
+        // Put outer shielded_amount = 80_000_000 with fee = 1_000_000
+        // Valid proof and signatures, but outer shielded_amount != bundle value balance
+        let bad_type6 = make_test_type6_tx(cid, &miner_sk, 0, 80_000_000, 1_000_000, &proven);
+
+        let mut pool = Mempool::new();
+        let res = pool.admit(&bad_type6, &state);
+        assert_eq!(
+            res,
+            Err(MempoolError::ValueBalanceMismatch {
+                value_balance: -50_000_000,
+                expected: -80_000_000,
+            }),
+            "Type 6 with inconsistent shielded amount must be rejected with ValueBalanceMismatch"
+        );
+    }
+
+    #[test]
+    fn test_mempool_type7_value_balance_mismatch_rejected() {
+        let miner_sk = make_test_key(1);
+        let (mut state, last_block) = setup_chain_with_funded_account(&miner_sk);
+        let cid = test_chain_id();
+        let miner_pk = miner_sk.verifying_key().to_bytes();
+        let miner_addr = derive_address(&miner_pk);
+        let user_sk = SpendingKey::from_bytes([0xaa; 32]).unwrap();
+
+        // 1. Advance chain with valid Type 6 block to deposit 100M note into tree and pool
+        let (type6_proven, seed_note, seed_cmx) = build_test_type6_bundle(100_000_000, 0x22);
+        let valid_type6 =
+            make_test_type6_tx(cid, &miner_sk, 0, 100_000_000, 1_000_000, &type6_proven);
+
+        let (anchor, path) = single_leaf_witness(&seed_cmx);
+
+        let next_h = last_block.header.height + 1;
+        let cb = make_coinbase(cid, next_h, *miner_addr.as_bytes());
+        let cb_id = transaction_id(&cb);
+        let tx6_id = transaction_id(&valid_type6);
+        let mut blk = Block {
+            header: Header {
+                version: 1,
+                chain_id: cid,
+                height: next_h,
+                parent_block_id: last_block.block_id(),
+                transaction_root: merkle::tx_root(&[cb_id, tx6_id]),
+                orchard_commitment_root: empty_commitment_root(),
+                timestamp: last_block.header.timestamp + 120,
+                difficulty: 1,
+                nonce: 0,
+            },
+            transactions: vec![cb, valid_type6],
+        };
+        let root = state.simulate_candidate_state_root(&blk).expect("root");
+        blk.header.orchard_commitment_root = root;
+        state.apply_block(&blk).expect("apply type 6 block");
+
+        // 2. Build Type 7 bundle spending 100M note, with change 39M (value_balance = 61_000_000)
+        let type7_proven = build_test_type7_bundle(
+            &user_sk, seed_note, path, anchor, 60_000_000, 39_000_000, 1_000_000, 0x33,
+        );
+
+        // Put outer release_amount = 40_000_000 and fee = 1_000_000 (expected_vb = 41_000_000)
+        // Bundle value balance is 61_000_000. Outer total deshield is 41_000_000.
+        let recipient = Hash::new([0x33; 32]);
+        let bad_type7 = make_test_type7_tx(
+            cid,
+            &user_sk,
+            recipient,
+            40_000_000,
+            1_000_000,
+            &type7_proven,
+        );
+
+        let mut pool = Mempool::new();
+        let res = pool.admit(&bad_type7, &state);
+        assert_eq!(
+            res,
+            Err(MempoolError::ValueBalanceMismatch {
+                value_balance: 61_000_000,
+                expected: 41_000_000,
+            }),
+            "Type 7 with inconsistent release amount must be rejected with ValueBalanceMismatch"
+        );
+    }
+
+    #[test]
+    fn test_mempool_valid_type6_and_type7_admission() {
+        let miner_sk = make_test_key(1);
+        let (mut state, last_block) = setup_chain_with_funded_account(&miner_sk);
+        let cid = test_chain_id();
+        let miner_pk = miner_sk.verifying_key().to_bytes();
+        let miner_addr = derive_address(&miner_pk);
+        let user_sk = SpendingKey::from_bytes([0xaa; 32]).unwrap();
+
+        // 1. Valid Type 6 transaction admitted to mempool
+        let (type6_proven, seed_note, seed_cmx) = build_test_type6_bundle(100_000_000, 0x44);
+        let valid_type6 =
+            make_test_type6_tx(cid, &miner_sk, 0, 100_000_000, 1_000_000, &type6_proven);
+
+        let mut pool = Mempool::new();
+        let tx6_id = pool
+            .admit(&valid_type6, &state)
+            .expect("Valid Type 6 must be admitted");
+        assert!(pool.contains(&tx6_id));
+        assert_eq!(pool.len(), 1);
+
+        // 2. Include Type 6 in block so anchor and pool balance are updated on chain
+        let (anchor, path) = single_leaf_witness(&seed_cmx);
+        let next_h = last_block.header.height + 1;
+        let cb = make_coinbase(cid, next_h, *miner_addr.as_bytes());
+        let cb_id = transaction_id(&cb);
+        let mut blk = Block {
+            header: Header {
+                version: 1,
+                chain_id: cid,
+                height: next_h,
+                parent_block_id: last_block.block_id(),
+                transaction_root: merkle::tx_root(&[cb_id, tx6_id]),
+                orchard_commitment_root: empty_commitment_root(),
+                timestamp: last_block.header.timestamp + 120,
+                difficulty: 1,
+                nonce: 0,
+            },
+            transactions: vec![cb, valid_type6],
+        };
+        let root = state.simulate_candidate_state_root(&blk).expect("root");
+        blk.header.orchard_commitment_root = root;
+        state.apply_block(&blk).expect("apply block");
+
+        // 3. Valid Type 7 transaction (releases 60M + 1M fee, value_balance = 61M) admitted to mempool
+        let type7_proven = build_test_type7_bundle(
+            &user_sk, seed_note, path, anchor, 60_000_000, 39_000_000, 1_000_000, 0x55,
+        );
+        let recipient = Hash::new([0x33; 32]);
+        let valid_type7 = make_test_type7_tx(
+            cid,
+            &user_sk,
+            recipient,
+            60_000_000,
+            1_000_000,
+            &type7_proven,
+        );
+
+        let mut pool7 = Mempool::new();
+        let tx7_id = pool7
+            .admit(&valid_type7, &state)
+            .expect("Valid Type 7 must be admitted");
+        assert!(pool7.contains(&tx7_id));
+        assert_eq!(pool7.len(), 1);
+    }
+
+    #[test]
+    fn test_mempool_duplicate_nullifiers_within_same_tx_rejected() {
+        let miner_sk = make_test_key(1);
+        let (mut state, last_block) = setup_chain_with_funded_account(&miner_sk);
+        let cid = test_chain_id();
+        let miner_pk = miner_sk.verifying_key().to_bytes();
+        let miner_addr = derive_address(&miner_pk);
+        let user_sk = SpendingKey::from_bytes([0xaa; 32]).unwrap();
+
+        // Deposit note to get an anchor
+        let (type6_proven, seed_note, seed_cmx) = build_test_type6_bundle(100_000_000, 0x66);
+        let valid_type6 =
+            make_test_type6_tx(cid, &miner_sk, 0, 100_000_000, 1_000_000, &type6_proven);
+        let (anchor, seed_path) = single_leaf_witness(&seed_cmx);
+
+        let next_h = last_block.header.height + 1;
+        let cb = make_coinbase(cid, next_h, *miner_addr.as_bytes());
+        let cb_id = transaction_id(&cb);
+        let tx6_id = transaction_id(&valid_type6);
+        let mut blk = Block {
+            header: Header {
+                version: 1,
+                chain_id: cid,
+                height: next_h,
+                parent_block_id: last_block.block_id(),
+                transaction_root: merkle::tx_root(&[cb_id, tx6_id]),
+                orchard_commitment_root: empty_commitment_root(),
+                timestamp: last_block.header.timestamp + 120,
+                difficulty: 1,
+                nonce: 0,
+            },
+            transactions: vec![cb, valid_type6],
+        };
+        let root = state.simulate_candidate_state_root(&blk).expect("root");
+        blk.header.orchard_commitment_root = root;
+        state.apply_block(&blk).expect("apply block");
+
+        // Build 2-action bundle spending seed_note twice (yielding duplicate nullifiers)
+        let mut rng = StdRng::from_seed([0x77; 32]);
+        let pk = get_proving_key();
+        let user_fvk = FullViewingKey::from(&user_sk);
+        let user_address = user_fvk.address_at(0u32, Scope::External);
+        let user_ovk = OutgoingViewingKey::from([0x55; 32]);
+
+        let mut builder = Builder::new(
+            BundleType::UNPADDED,
+            BundleVersion::orchard_v2(),
+            Flags::ENABLED,
+            anchor,
+        )
+        .unwrap();
+
+        builder
+            .add_spend(user_fvk.clone(), seed_note, seed_path.clone())
+            .unwrap();
+        builder
+            .add_spend(user_fvk.clone(), seed_note, seed_path.clone())
+            .unwrap();
+        builder
+            .add_output(
+                Some(user_ovk.clone()),
+                user_address,
+                NoteValue::from_raw(139_000_000),
+                [0u8; 512],
+            )
+            .unwrap();
+
+        let (unauth_dup, _) = builder.build::<i64>(&mut rng).unwrap().unwrap();
+        let type7_dup_proven = unauth_dup.create_proof(pk, &mut rng).unwrap();
+
+        let recipient = Hash::new([0x33; 32]);
+        let dup_type7 = make_test_type7_tx(
+            cid,
+            &user_sk,
+            recipient,
+            60_000_000,
+            1_000_000,
+            &type7_dup_proven,
+        );
+
+        let mut pool = Mempool::new();
+        let res = pool.admit(&dup_type7, &state);
+        assert!(
+            matches!(res, Err(MempoolError::DuplicateNullifierInTx(_))),
+            "Type 7 with duplicate nullifiers must be rejected with DuplicateNullifierInTx"
+        );
+
+        // Also test Type 5 with duplicate nullifiers
+        let mut builder5 = Builder::new(
+            BundleType::UNPADDED,
+            BundleVersion::orchard_v2(),
+            Flags::ENABLED,
+            anchor,
+        )
+        .unwrap();
+        builder5
+            .add_spend(user_fvk.clone(), seed_note, seed_path.clone())
+            .unwrap();
+        builder5.add_spend(user_fvk, seed_note, seed_path).unwrap();
+        builder5
+            .add_output(
+                Some(user_ovk),
+                user_address,
+                NoteValue::from_raw(199_000_000),
+                [0u8; 512],
+            )
+            .unwrap();
+        let (unauth5_dup, _) = builder5.build::<i64>(&mut rng).unwrap().unwrap();
+        let type5_dup_proven = unauth5_dup.create_proof(pk, &mut rng).unwrap();
+        let sighash5 = crate::orchard_tx::compute_bundle_auth_digest(
+            *cid.as_bytes(),
+            crate::tx::TxType::ShieldedTransfer.tag(),
+            1u16,
+            1_000_000,
+            &type5_dup_proven,
+        );
+        let spend_auth_key = SpendAuthorizingKey::from(&user_sk);
+        let spend_auth_keys5 = vec![spend_auth_key.clone(), spend_auth_key];
+        let authorized5 = type5_dup_proven
+            .apply_signatures(&mut rng, sighash5, &spend_auth_keys5)
+            .unwrap();
+        let bundle5_bytes = serialize_bundle(&authorized5);
+
+        let mut raw_tx5 = Vec::new();
+        raw_tx5.push(5u8); // Type 5
+        raw_tx5.extend_from_slice(&1u16.to_le_bytes());
+        raw_tx5.extend_from_slice(cid.as_bytes());
+        raw_tx5.extend_from_slice(&1_000_000u64.to_le_bytes()); // fee
+        raw_tx5.extend_from_slice(&bundle5_bytes);
+
+        let res5 = pool.admit(&raw_tx5, &state);
+        assert!(
+            matches!(res5, Err(MempoolError::DuplicateNullifierInTx(_))),
+            "Type 5 with duplicate nullifiers must be rejected with DuplicateNullifierInTx"
+        );
     }
 }
