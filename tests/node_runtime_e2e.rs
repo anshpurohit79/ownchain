@@ -41,6 +41,7 @@ use ownchain::merkle;
 use ownchain::node::{NodeConfig, NodeHandle, NodeRuntime, NodeStatus};
 use ownchain::orchard_root::empty_commitment_root;
 use ownchain::p2p::framing::{decode_frame_slice, FramingError, MAX_FRAME_LENGTH};
+use ownchain::p2p::{NetworkEvent, NetworkService, SyncRequest, SyncResponse};
 
 #[derive(Clone)]
 struct TestKeypair {
@@ -1117,4 +1118,938 @@ fn test_oversized_frame_rejected_before_allocation() {
         res,
         Err(FramingError::FrameTooLarge { actual, max }) if actual == 2_100_001 && max == 2_100_000
     ));
+}
+
+// -----------------------------------------------------------------------------
+// Test 11: Real P2P Simultaneous Synchronization
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_real_p2p_simultaneous_synchronization() {
+    tokio::time::timeout(Duration::from_secs(45), async {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+
+        let devnet_chain_id = hash::chain_id(DEVNET);
+        let genesis = genesis_block(devnet_chain_id);
+        let mut state_a = ChainState::from_genesis(&genesis).unwrap();
+        let mut state_b = ChainState::from_genesis(&genesis).unwrap();
+
+        let miner_a = TestKeypair::from_seed(1);
+        let miner_b = TestKeypair::from_seed(2);
+
+        // Build 3 blocks on Branch A for Node A (total work 3)
+        let mut blocks_a = Vec::new();
+        for h in 1..=3 {
+            let cb = make_coinbase(devnet_chain_id, h, miner_a.address, 1_000_000_000);
+            let b = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + h * 120, vec![cb]);
+            state_a.apply_block(&b).unwrap();
+            blocks_a.push(b);
+        }
+
+        // Build 5 blocks on Branch B for Node B (total work 5)
+        let mut blocks_b = Vec::new();
+        for h in 1..=5 {
+            let cb = make_coinbase(devnet_chain_id, h, miner_b.address, 1_000_000_000);
+            let b = make_hybrid_block(&state_b, GENESIS_TIMESTAMP + h * 120 + 1, vec![cb]);
+            state_b.apply_block(&b).unwrap();
+            blocks_b.push(b);
+        }
+
+        let config_a = NodeConfig {
+            network_name: "devnet".to_string(),
+            chain_id: devnet_chain_id,
+            listen_addr: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            data_dir: dir_a.path().to_path_buf(),
+            max_peers: 50,
+            bootstrap_peers: vec![],
+            mempool_config: Default::default(),
+        };
+
+        let config_b = NodeConfig {
+            network_name: "devnet".to_string(),
+            chain_id: devnet_chain_id,
+            listen_addr: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            data_dir: dir_b.path().to_path_buf(),
+            max_peers: 50,
+            bootstrap_peers: vec![],
+            mempool_config: Default::default(),
+        };
+
+        let (handle_a, _s_a) = NodeRuntime::spawn(config_a).unwrap();
+        let (handle_b, _s_b) = NodeRuntime::spawn(config_b).unwrap();
+
+        // Submit Branch A blocks to Node A
+        for b in blocks_a {
+            handle_a.submit_block(b).await.unwrap();
+        }
+        assert_eq!(handle_a.get_tip_height().await.unwrap(), 3);
+        assert_eq!(
+            handle_a.get_cumulative_work().await.unwrap(),
+            U256::from_u128(3)
+        );
+
+        // Submit Branch B blocks to Node B
+        for b in &blocks_b {
+            handle_b.submit_block(b.clone()).await.unwrap();
+        }
+        assert_eq!(handle_b.get_tip_height().await.unwrap(), 5);
+        assert_eq!(
+            handle_b.get_cumulative_work().await.unwrap(),
+            U256::from_u128(5)
+        );
+
+        // Connect nodes
+        let addr_b = wait_for_listen_addr(&handle_b).await;
+        handle_a.dial(addr_b).await.unwrap();
+        wait_for_peer_handshake(&handle_a, handle_b.peer_id()).await;
+        wait_for_peer_handshake(&handle_b, handle_a.peer_id()).await;
+
+        // Trigger simultaneous sync in both directions concurrently
+        let sync_a = handle_a.sync_with_peer(handle_b.peer_id(), 5);
+        let sync_b = handle_b.sync_with_peer(handle_a.peer_id(), 3);
+
+        let (res_a, res_b) = tokio::join!(sync_a, sync_b);
+        assert!(
+            res_a.is_ok(),
+            "Node A sync with Node B must succeed: {:?}",
+            res_a
+        );
+        assert!(
+            res_b.is_ok(),
+            "Node B sync with Node A must succeed: {:?}",
+            res_b
+        );
+
+        let expected_tip_b = blocks_b.last().unwrap().block_id();
+        let status_a = wait_for_tip(&handle_a, 5, expected_tip_b).await;
+        let status_b = wait_for_tip(&handle_b, 5, expected_tip_b).await;
+
+        // Verify both nodes converged on the heavier Branch B
+        assert_eq!(status_a.tip_height, 5);
+        assert_eq!(status_b.tip_height, 5);
+        assert_eq!(status_a.tip_block_id, expected_tip_b);
+        assert_eq!(status_b.tip_block_id, expected_tip_b);
+        assert_eq!(status_a.cumulative_work, U256::from_u128(5));
+        assert_eq!(status_b.cumulative_work, U256::from_u128(5));
+        assert_eq!(status_a.composite_state_root, status_b.composite_state_root);
+
+        handle_a.stop().await;
+        handle_b.stop().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+// -----------------------------------------------------------------------------
+// Test 12: Controlled Runtime Responsiveness During Active Outbound Synchronization
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_real_p2p_runtime_responsiveness_during_sync() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir_a = TempDir::new().unwrap();
+
+        let devnet_chain_id = hash::chain_id(DEVNET);
+        let genesis = genesis_block(devnet_chain_id);
+        let mut state_b = ChainState::from_genesis(&genesis).unwrap();
+        let miner_b = TestKeypair::from_seed(3);
+
+        // Build 6 blocks for remote peer B
+        let mut blocks_b = Vec::new();
+        for h in 1..=6 {
+            let cb = make_coinbase(devnet_chain_id, h, miner_b.address, 1_000_000_000);
+            let b = make_hybrid_block(&state_b, GENESIS_TIMESTAMP + h * 120, vec![cb]);
+            state_b.apply_block(&b).unwrap();
+            blocks_b.push(b);
+        }
+
+        let config_a = NodeConfig {
+            network_name: "devnet".to_string(),
+            chain_id: devnet_chain_id,
+            listen_addr: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            data_dir: dir_a.path().to_path_buf(),
+            max_peers: 50,
+            bootstrap_peers: vec![],
+            mempool_config: Default::default(),
+        };
+
+        let (handle_a, _s_a) = NodeRuntime::spawn(config_a).unwrap();
+
+        // Node B is a controlled NetworkService instance so we can hold sync requests pending
+        let keypair_b = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id_b = ownchain::p2p::peer_id_from_keypair(&keypair_b);
+        let (network_service_b, network_handle_b, mut network_event_rx_b) = NetworkService::new(
+            keypair_b,
+            "devnet",
+            devnet_chain_id,
+            genesis.block_id(),
+            6,
+            blocks_b.last().unwrap().block_id(),
+            U256::from_u128(6),
+            "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            50,
+            500,
+            500,
+        )
+        .unwrap();
+        let b_task = tokio::spawn(network_service_b.run());
+
+        // Get listen address of Node B
+        let mut addr_b = None;
+        for _ in 0..50 {
+            let addrs = network_handle_b
+                .get_listen_addrs()
+                .await
+                .unwrap_or_default();
+            if let Some(a) = addrs.into_iter().next() {
+                addr_b = Some(a);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let addr_b = addr_b.expect("Node B failed to bind listen address");
+
+        // Node A dials Node B
+        handle_a.dial(addr_b).await.unwrap();
+        wait_for_peer_handshake(&handle_a, peer_id_b).await;
+
+        let handle_a_clone = handle_a.clone();
+
+        // 1. Start outbound synchronization from Node A to Node B
+        let sync_task =
+            tokio::spawn(async move { handle_a_clone.sync_with_peer(peer_id_b, 6).await });
+
+        // 2. Deliberately hold remote sync response pending on Node B
+        let (pending_req, pending_chan) = loop {
+            match network_event_rx_b.recv().await {
+                Some(NetworkEvent::SyncRequestReceived {
+                    peer_id,
+                    request,
+                    channel,
+                }) => {
+                    if peer_id == handle_a.peer_id() {
+                        break (request, channel);
+                    }
+                }
+                Some(_) => {}
+                None => panic!("Node B network event stream closed unexpectedly"),
+            }
+        };
+        assert!(
+            matches!(pending_req, SyncRequest::GetHeaders { .. }),
+            "First sync request must be GetHeaders, got {:?}",
+            pending_req
+        );
+
+        // 3. While the sync worker is still blocked waiting for Node B, verify local actor responds to GetStatus
+        let status_a = handle_a.status().await.unwrap();
+        assert_eq!(status_a.peer_id, handle_a.peer_id());
+
+        // 4. Issue an inbound sync request from Node B to Node A and verify it receives an immediate response
+        let inbound_resp = network_handle_b
+            .send_sync_request(handle_a.peer_id(), SyncRequest::GetStatus)
+            .await
+            .expect("Inbound GetStatus request to Node A must succeed");
+        match inbound_resp {
+            SyncResponse::Status { tip_height, .. } => {
+                assert_eq!(tip_height, 0);
+            }
+            other => panic!("Expected SyncResponse::Status, got {other:?}"),
+        }
+
+        // 5. Only then release the pending outbound headers response
+        let headers: Vec<Header> = blocks_b.iter().map(|b| b.header).collect();
+        network_handle_b
+            .send_sync_response(pending_chan, SyncResponse::Headers(headers))
+            .await
+            .unwrap();
+
+        // 6. Handle the subsequent GetBlocks request from Node A
+        loop {
+            match network_event_rx_b.recv().await {
+                Some(NetworkEvent::SyncRequestReceived {
+                    peer_id,
+                    request,
+                    channel,
+                }) => {
+                    if peer_id == handle_a.peer_id() {
+                        if let SyncRequest::GetBlocks { .. } = request {
+                            network_handle_b
+                                .send_sync_response(channel, SyncResponse::Blocks(blocks_b.clone()))
+                                .await
+                                .unwrap();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {}
+                None => panic!("Node B network event stream closed unexpectedly"),
+            }
+        }
+
+        // 7. Complete synchronization and verify final chain state
+        let sync_res = sync_task.await.unwrap();
+        assert!(sync_res.is_ok(), "Sync task failed: {:?}", sync_res);
+
+        let final_tip_b = blocks_b.last().unwrap().block_id();
+        let final_status = wait_for_tip(&handle_a, 6, final_tip_b).await;
+        assert_eq!(final_status.tip_height, 6);
+        assert_eq!(final_status.tip_block_id, final_tip_b);
+
+        handle_a.stop().await;
+        b_task.abort();
+    })
+    .await
+    .expect("test timed out");
+}
+
+// -----------------------------------------------------------------------------
+// Test 13: Non-Blocking Missing-Parent Recovery
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_real_p2p_nonblocking_missing_parent_recovery() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+
+        let devnet_chain_id = hash::chain_id(DEVNET);
+        let genesis = genesis_block(devnet_chain_id);
+        let mut state_a = ChainState::from_genesis(&genesis).unwrap();
+        let miner_a = TestKeypair::from_seed(4);
+
+        // Build block 1 and block 2
+        let cb1 = make_coinbase(devnet_chain_id, 1, miner_a.address, 1_000_000_000);
+        let b1 = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + 120, vec![cb1]);
+        state_a.apply_block(&b1).unwrap();
+
+        let cb2 = make_coinbase(devnet_chain_id, 2, miner_a.address, 1_000_000_000);
+        let b2 = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + 240, vec![cb2]);
+
+        let config_a = NodeConfig {
+            network_name: "devnet".to_string(),
+            chain_id: devnet_chain_id,
+            listen_addr: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            data_dir: dir_a.path().to_path_buf(),
+            max_peers: 50,
+            bootstrap_peers: vec![],
+            mempool_config: Default::default(),
+        };
+
+        let config_b = NodeConfig {
+            network_name: "devnet".to_string(),
+            chain_id: devnet_chain_id,
+            listen_addr: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            data_dir: dir_b.path().to_path_buf(),
+            max_peers: 50,
+            bootstrap_peers: vec![],
+            mempool_config: Default::default(),
+        };
+
+        let (handle_a, _s_a) = NodeRuntime::spawn(config_a).unwrap();
+        let (handle_b, _s_b) = NodeRuntime::spawn(config_b).unwrap();
+
+        // Node A gets block 1 only
+        handle_a.submit_block(b1.clone()).await.unwrap();
+        assert_eq!(handle_a.get_tip_height().await.unwrap(), 1);
+
+        // Connect Node A and Node B
+        let addr_b = wait_for_listen_addr(&handle_b).await;
+        handle_a.dial(addr_b).await.unwrap();
+        wait_for_peer_handshake(&handle_a, handle_b.peer_id()).await;
+        wait_for_peer_handshake(&handle_b, handle_a.peer_id()).await;
+
+        // Deliver block 2 (missing parent block 1) directly to Node B
+        handle_b.submit_block(b2.clone()).await.unwrap();
+
+        // While missing parent recovery is active, verify Node B remains immediately responsive
+        let start = Instant::now();
+        let status_b = handle_b.status().await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "Node B status took {:?}, exceeding 500ms bound",
+            elapsed
+        );
+        assert_eq!(status_b.peer_id, handle_b.peer_id());
+
+        // Node B should recover parent block 1 from Node A and process both block 1 and block 2
+        let final_status_b = wait_for_tip(&handle_b, 2, b2.block_id()).await;
+        assert_eq!(final_status_b.tip_height, 2);
+        assert_eq!(final_status_b.tip_block_id, b2.block_id());
+        assert_eq!(handle_b.get_orphan_count().await.unwrap(), 0);
+
+        handle_a.stop().await;
+        handle_b.stop().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+// -----------------------------------------------------------------------------
+// Test 14: Synchronization Cancellation and Peer Disconnection Handling
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_real_p2p_sync_cancellation_and_peer_disconnect() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir_a = TempDir::new().unwrap();
+
+        let devnet_chain_id = hash::chain_id(DEVNET);
+        let genesis = genesis_block(devnet_chain_id);
+        let mut state_b = ChainState::from_genesis(&genesis).unwrap();
+        let miner_b = TestKeypair::from_seed(5);
+
+        // Build 5 blocks for remote peer B
+        let mut blocks_b = Vec::new();
+        for h in 1..=5 {
+            let cb = make_coinbase(devnet_chain_id, h, miner_b.address, 1_000_000_000);
+            let b = make_hybrid_block(&state_b, GENESIS_TIMESTAMP + h * 120, vec![cb]);
+            state_b.apply_block(&b).unwrap();
+            blocks_b.push(b);
+        }
+
+        let config_a = NodeConfig {
+            network_name: "devnet".to_string(),
+            chain_id: devnet_chain_id,
+            listen_addr: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            data_dir: dir_a.path().to_path_buf(),
+            max_peers: 50,
+            bootstrap_peers: vec![],
+            mempool_config: Default::default(),
+        };
+
+        let (handle_a, _s_a) = NodeRuntime::spawn(config_a).unwrap();
+
+        // Node B is a controlled NetworkService instance so we can hold sync requests pending
+        let keypair_b = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id_b = ownchain::p2p::peer_id_from_keypair(&keypair_b);
+        let (network_service_b, network_handle_b, mut network_event_rx_b) = NetworkService::new(
+            keypair_b,
+            "devnet",
+            devnet_chain_id,
+            genesis.block_id(),
+            5,
+            blocks_b.last().unwrap().block_id(),
+            U256::from_u128(5),
+            "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            50,
+            500,
+            500,
+        )
+        .unwrap();
+        let b_task = tokio::spawn(network_service_b.run());
+
+        // Get listen address of Node B
+        let mut addr_b = None;
+        for _ in 0..50 {
+            let addrs = network_handle_b
+                .get_listen_addrs()
+                .await
+                .unwrap_or_default();
+            if let Some(a) = addrs.into_iter().next() {
+                addr_b = Some(a);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let addr_b = addr_b.expect("Node B failed to bind listen address");
+
+        // Node A dials Node B
+        handle_a.dial(addr_b).await.unwrap();
+        wait_for_peer_handshake(&handle_a, peer_id_b).await;
+
+        let handle_a_clone = handle_a.clone();
+
+        // 1. Spawn sync task on Node A
+        let sync_task =
+            tokio::spawn(async move { handle_a_clone.sync_with_peer(peer_id_b, 5).await });
+
+        // 2. Wait until Node B receives the initial GetHeaders sync request from Node A
+        let (_pending_req, _pending_chan) = loop {
+            match network_event_rx_b.recv().await {
+                Some(NetworkEvent::SyncRequestReceived {
+                    peer_id,
+                    request,
+                    channel,
+                }) => {
+                    if peer_id == handle_a.peer_id() {
+                        assert!(
+                            matches!(request, SyncRequest::GetHeaders { .. }),
+                            "First sync request must be GetHeaders, got {:?}",
+                            request
+                        );
+                        break (request, channel);
+                    }
+                }
+                Some(_) => {}
+                None => panic!("Node B network event stream closed unexpectedly"),
+            }
+        };
+
+        // 3. While the sync worker is actively waiting for Node B's response, disconnect Node B
+        handle_a.disconnect(peer_id_b).await.unwrap();
+
+        // 4. The waiting sync caller must terminate promptly and receive an Err
+        let sync_res = sync_task.await.unwrap();
+        assert!(
+            sync_res.is_err(),
+            "Sync task must receive error on peer disconnect, got {:?}",
+            sync_res
+        );
+
+        // 5. Node A runtime must remain responsive after disconnect
+        let status = handle_a.status().await.unwrap();
+        assert_eq!(status.peer_id, handle_a.peer_id());
+
+        // 6. Graceful shutdown must complete without hanging
+        handle_a.stop().await;
+        b_task.abort();
+    })
+    .await
+    .expect("test timed out");
+}
+
+// -----------------------------------------------------------------------------
+// Test 15: Consistent Chain View and Ancestor Discovery Invalidation on Mutation
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_real_p2p_sync_ancestor_discovery_chain_mutation_restart() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir_a = TempDir::new().unwrap();
+
+        let devnet_chain_id = hash::chain_id(DEVNET);
+        let genesis = genesis_block(devnet_chain_id);
+        let mut state_a = ChainState::from_genesis(&genesis).unwrap();
+        let miner_a = TestKeypair::from_seed(10);
+
+        // Build Block A1 and Block A2 for Node A
+        let cb_a1 = make_coinbase(devnet_chain_id, 1, miner_a.address, 1_000_000_000);
+        let b_a1 = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + 120, vec![cb_a1]);
+        state_a.apply_block(&b_a1).unwrap();
+
+        let cb_a2 = make_coinbase(devnet_chain_id, 2, miner_a.address, 1_000_000_000);
+        let b_a2 = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + 240, vec![cb_a2]);
+        state_a.apply_block(&b_a2).unwrap();
+
+        // Build Block A3 (to be submitted during pending ancestor discovery)
+        let cb_a3 = make_coinbase(devnet_chain_id, 3, miner_a.address, 1_000_000_000);
+        let b_a3 = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + 360, vec![cb_a3]);
+
+        // Build 4 blocks on Branch B for Node B
+        let mut state_b = ChainState::from_genesis(&genesis).unwrap();
+        let miner_b = TestKeypair::from_seed(20);
+        let mut blocks_b = Vec::new();
+        for h in 1..=4 {
+            let cb = make_coinbase(devnet_chain_id, h, miner_b.address, 1_000_000_000);
+            let b = make_hybrid_block(&state_b, GENESIS_TIMESTAMP + h * 120 + 1, vec![cb]);
+            state_b.apply_block(&b).unwrap();
+            blocks_b.push(b);
+        }
+
+        let config_a = NodeConfig {
+            network_name: "devnet".to_string(),
+            chain_id: devnet_chain_id,
+            listen_addr: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            data_dir: dir_a.path().to_path_buf(),
+            max_peers: 50,
+            bootstrap_peers: vec![],
+            mempool_config: Default::default(),
+        };
+
+        let (handle_a, _s_a) = NodeRuntime::spawn(config_a).unwrap();
+        handle_a.submit_block(b_a1).await.unwrap();
+        handle_a.submit_block(b_a2).await.unwrap();
+        assert_eq!(handle_a.get_tip_height().await.unwrap(), 2);
+
+        // Controlled Node B network service
+        let keypair_b = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id_b = ownchain::p2p::peer_id_from_keypair(&keypair_b);
+        let (network_service_b, network_handle_b, mut network_event_rx_b) = NetworkService::new(
+            keypair_b,
+            "devnet",
+            devnet_chain_id,
+            genesis.block_id(),
+            4,
+            blocks_b.last().unwrap().block_id(),
+            U256::from_u128(4),
+            "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            50,
+            500,
+            500,
+        )
+        .unwrap();
+        let b_task = tokio::spawn(network_service_b.run());
+
+        let mut addr_b = None;
+        for _ in 0..50 {
+            let addrs = network_handle_b
+                .get_listen_addrs()
+                .await
+                .unwrap_or_default();
+            if let Some(a) = addrs.into_iter().next() {
+                addr_b = Some(a);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let addr_b = addr_b.expect("Node B failed to bind listen address");
+
+        handle_a.dial(addr_b).await.unwrap();
+        wait_for_peer_handshake(&handle_a, peer_id_b).await;
+
+        let handle_a_clone = handle_a.clone();
+        // Start sync with Node B
+        let sync_task =
+            tokio::spawn(async move { handle_a_clone.sync_with_peer(peer_id_b, 4).await });
+
+        // Intercept initial GetHeaders request from Node A
+        let (first_req, first_channel) = loop {
+            match network_event_rx_b.recv().await {
+                Some(NetworkEvent::SyncRequestReceived {
+                    peer_id,
+                    request,
+                    channel,
+                }) if peer_id == handle_a.peer_id() => break (request, channel),
+                Some(_) => {}
+                None => panic!("Node B event stream closed"),
+            }
+        };
+        assert!(matches!(first_req, SyncRequest::GetHeaders { .. }));
+
+        // While ancestor discovery is pending on Node B, mutate Node A's local chain by submitting Block A3!
+        handle_a.submit_block(b_a3).await.unwrap();
+        assert_eq!(handle_a.get_tip_height().await.unwrap(), 3);
+
+        // Now respond to the first GetHeaders request
+        network_handle_b
+            .send_sync_response(
+                first_channel,
+                SyncResponse::Headers(vec![blocks_b[1].header]),
+            )
+            .await
+            .unwrap();
+
+        // Node A must detect the chain revision change and restart ancestor discovery!
+        // Loop through remaining sync requests from Node A, answering properly
+        let b_blocks_clone = blocks_b.clone();
+        let peer_id_a = handle_a.peer_id();
+        tokio::spawn(async move {
+            while let Some(ev) = network_event_rx_b.recv().await {
+                if let NetworkEvent::SyncRequestReceived {
+                    peer_id,
+                    request,
+                    channel,
+                } = ev
+                {
+                    if peer_id == peer_id_a {
+                        match request {
+                            SyncRequest::GetHeaders {
+                                start_height,
+                                max_count,
+                            } => {
+                                let mut hdrs = Vec::new();
+                                for h in start_height..(start_height + max_count as u64) {
+                                    if h >= 1 && h <= b_blocks_clone.len() as u64 {
+                                        hdrs.push(b_blocks_clone[(h - 1) as usize].header);
+                                    }
+                                }
+                                let _ = network_handle_b
+                                    .send_sync_response(channel, SyncResponse::Headers(hdrs))
+                                    .await;
+                            }
+                            SyncRequest::GetBlocks { block_ids } => {
+                                let mut blks = Vec::new();
+                                for id in block_ids {
+                                    if let Some(b) =
+                                        b_blocks_clone.iter().find(|b| b.block_id() == id)
+                                    {
+                                        blks.push(b.clone());
+                                    }
+                                }
+                                let _ = network_handle_b
+                                    .send_sync_response(channel, SyncResponse::Blocks(blks))
+                                    .await;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+
+        // Sync task must resolve cleanly against a coherent chain view
+        let sync_res = sync_task.await.unwrap();
+        assert!(sync_res.is_ok(), "Sync task failed: {:?}", sync_res);
+
+        let final_tip_b = blocks_b.last().unwrap().block_id();
+        let final_status = wait_for_tip(&handle_a, 4, final_tip_b).await;
+        assert_eq!(final_status.tip_height, 4);
+        assert_eq!(final_status.tip_block_id, final_tip_b);
+
+        handle_a.stop().await;
+        b_task.abort();
+    })
+    .await
+    .expect("test timed out");
+}
+
+// -----------------------------------------------------------------------------
+// Test 16: Recursive Missing Parent Recovery
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_real_p2p_missing_parent_recursive_cascade() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+
+        let devnet_chain_id = hash::chain_id(DEVNET);
+        let genesis = genesis_block(devnet_chain_id);
+        let mut state_a = ChainState::from_genesis(&genesis).unwrap();
+        let miner_a = TestKeypair::from_seed(30);
+
+        // Build Blocks 1, 2, and 3
+        let cb1 = make_coinbase(devnet_chain_id, 1, miner_a.address, 1_000_000_000);
+        let b1 = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + 120, vec![cb1]);
+        state_a.apply_block(&b1).unwrap();
+
+        let cb2 = make_coinbase(devnet_chain_id, 2, miner_a.address, 1_000_000_000);
+        let b2 = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + 240, vec![cb2]);
+        state_a.apply_block(&b2).unwrap();
+
+        let cb3 = make_coinbase(devnet_chain_id, 3, miner_a.address, 1_000_000_000);
+        let b3 = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + 360, vec![cb3]);
+        state_a.apply_block(&b3).unwrap();
+
+        let config_a = NodeConfig {
+            network_name: "devnet".to_string(),
+            chain_id: devnet_chain_id,
+            listen_addr: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            data_dir: dir_a.path().to_path_buf(),
+            max_peers: 50,
+            bootstrap_peers: vec![],
+            mempool_config: Default::default(),
+        };
+
+        let config_b = NodeConfig {
+            network_name: "devnet".to_string(),
+            chain_id: devnet_chain_id,
+            listen_addr: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            data_dir: dir_b.path().to_path_buf(),
+            max_peers: 50,
+            bootstrap_peers: vec![],
+            mempool_config: Default::default(),
+        };
+
+        let (handle_a, _s_a) = NodeRuntime::spawn(config_a).unwrap();
+        let (handle_b, _s_b) = NodeRuntime::spawn(config_b).unwrap();
+
+        // Node A has all 3 blocks
+        handle_a.submit_block(b1).await.unwrap();
+        handle_a.submit_block(b2).await.unwrap();
+        handle_a.submit_block(b3.clone()).await.unwrap();
+        assert_eq!(handle_a.get_tip_height().await.unwrap(), 3);
+
+        // Connect Node A and Node B
+        let addr_b = wait_for_listen_addr(&handle_b).await;
+        handle_a.dial(addr_b).await.unwrap();
+        wait_for_peer_handshake(&handle_a, handle_b.peer_id()).await;
+        wait_for_peer_handshake(&handle_b, handle_a.peer_id()).await;
+
+        // Submit Block 3 directly to Node B (missing Block 2 and Block 1)
+        handle_b.submit_block(b3.clone()).await.unwrap();
+
+        // Node B must recursively fetch Block 2 then Block 1 from Node A, and cascade-apply all 3 blocks
+        let final_status_b = wait_for_tip(&handle_b, 3, b3.block_id()).await;
+        assert_eq!(final_status_b.tip_height, 3);
+        assert_eq!(final_status_b.tip_block_id, b3.block_id());
+        assert_eq!(handle_b.get_orphan_count().await.unwrap(), 0);
+
+        handle_a.stop().await;
+        handle_b.stop().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+// -----------------------------------------------------------------------------
+// Test 17: Missing Parent Recovery Safe Retry After Initial Failure
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_real_p2p_missing_parent_retry_after_failure() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+
+        let devnet_chain_id = hash::chain_id(DEVNET);
+        let genesis = genesis_block(devnet_chain_id);
+        let mut state = ChainState::from_genesis(&genesis).unwrap();
+        let miner = TestKeypair::from_seed(40);
+
+        // Build Block 1 and Block 2
+        let cb1 = make_coinbase(devnet_chain_id, 1, miner.address, 1_000_000_000);
+        let b1 = make_hybrid_block(&state, GENESIS_TIMESTAMP + 120, vec![cb1]);
+        state.apply_block(&b1).unwrap();
+
+        let cb2 = make_coinbase(devnet_chain_id, 2, miner.address, 1_000_000_000);
+        let b2 = make_hybrid_block(&state, GENESIS_TIMESTAMP + 240, vec![cb2]);
+
+        let config_a = NodeConfig {
+            network_name: "devnet".to_string(),
+            chain_id: devnet_chain_id,
+            listen_addr: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            data_dir: dir_a.path().to_path_buf(),
+            max_peers: 50,
+            bootstrap_peers: vec![],
+            mempool_config: Default::default(),
+        };
+
+        let config_b = NodeConfig {
+            network_name: "devnet".to_string(),
+            chain_id: devnet_chain_id,
+            listen_addr: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            data_dir: dir_b.path().to_path_buf(),
+            max_peers: 50,
+            bootstrap_peers: vec![],
+            mempool_config: Default::default(),
+        };
+
+        let (handle_a, _s_a) = NodeRuntime::spawn(config_a).unwrap();
+        let (handle_b, _s_b) = NodeRuntime::spawn(config_b).unwrap();
+
+        let addr_b = wait_for_listen_addr(&handle_b).await;
+        handle_a.dial(addr_b).await.unwrap();
+        wait_for_peer_handshake(&handle_a, handle_b.peer_id()).await;
+        wait_for_peer_handshake(&handle_b, handle_a.peer_id()).await;
+
+        // Step 1: Submit Block 2 to Node B. Node A does NOT have Block 1 yet.
+        // Recovery attempt 1 fails and enters bounded exponential backoff.
+        handle_b.submit_block(b2.clone()).await.unwrap();
+
+        // Give Node B a moment to query Node A, fail, and enter backoff
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(handle_b.get_tip_height().await.unwrap(), 0);
+
+        // Step 2: Now supply Block 1 to Node A
+        handle_a.submit_block(b1).await.unwrap();
+        assert_eq!(handle_a.get_tip_height().await.unwrap(), 1);
+
+        // Step 3: Node B autonomously retries missing parent recovery via backoff without child block resubmission!
+        let final_status_b = wait_for_tip(&handle_b, 2, b2.block_id()).await;
+        assert_eq!(final_status_b.tip_height, 2);
+        assert_eq!(final_status_b.tip_block_id, b2.block_id());
+        assert_eq!(handle_b.get_orphan_count().await.unwrap(), 0);
+
+        handle_a.stop().await;
+        handle_b.stop().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+// -----------------------------------------------------------------------------
+// Test 18: Node Shutdown Aborts and Awaits Active Sync Workers
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_real_p2p_shutdown_aborts_and_joins_active_sync() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir_a = TempDir::new().unwrap();
+        let devnet_chain_id = hash::chain_id(DEVNET);
+        let genesis = genesis_block(devnet_chain_id);
+
+        let config_a = NodeConfig {
+            network_name: "devnet".to_string(),
+            chain_id: devnet_chain_id,
+            listen_addr: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            data_dir: dir_a.path().to_path_buf(),
+            max_peers: 50,
+            bootstrap_peers: vec![],
+            mempool_config: Default::default(),
+        };
+
+        let (handle_a, _s_a) = NodeRuntime::spawn(config_a).unwrap();
+
+        // Node B is a controlled NetworkService that deliberately never responds to sync requests
+        let keypair_b = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id_b = ownchain::p2p::peer_id_from_keypair(&keypair_b);
+        let (network_service_b, network_handle_b, mut network_event_rx_b) = NetworkService::new(
+            keypair_b,
+            "devnet",
+            devnet_chain_id,
+            genesis.block_id(),
+            10,
+            Hash::new([99u8; 32]),
+            U256::from_u128(10),
+            "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            50,
+            500,
+            500,
+        )
+        .unwrap();
+        let b_task = tokio::spawn(network_service_b.run());
+
+        let mut addr_b = None;
+        for _ in 0..50 {
+            let addrs = network_handle_b
+                .get_listen_addrs()
+                .await
+                .unwrap_or_default();
+            if let Some(a) = addrs.into_iter().next() {
+                addr_b = Some(a);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let addr_b = addr_b.expect("Node B failed to bind listen address");
+
+        handle_a.dial(addr_b).await.unwrap();
+        wait_for_peer_handshake(&handle_a, peer_id_b).await;
+
+        let handle_a_clone = handle_a.clone();
+        // Start sync with Node B
+        let sync_task =
+            tokio::spawn(async move { handle_a_clone.sync_with_peer(peer_id_b, 10).await });
+
+        // Wait until Node B receives the initial GetHeaders request
+        loop {
+            match network_event_rx_b.recv().await {
+                Some(NetworkEvent::SyncRequestReceived {
+                    peer_id,
+                    request: SyncRequest::GetHeaders { .. },
+                    ..
+                }) if peer_id == handle_a.peer_id() => break,
+                Some(_) => {}
+                None => panic!("Node B event stream closed"),
+            }
+        }
+
+        // Call stop on Node A while sync worker is active
+        let stop_start = Instant::now();
+        handle_a.stop().await;
+        let stop_duration = stop_start.elapsed();
+
+        // Node stop must finish promptly and join background workers
+        assert!(
+            stop_duration < Duration::from_secs(5),
+            "Shutdown took {:?}, exceeding 5s bound",
+            stop_duration
+        );
+
+        // Pending sync caller must receive error result
+        let sync_res = sync_task.await.unwrap();
+        assert!(
+            sync_res.is_err(),
+            "Pending sync task must receive error on shutdown, got {:?}",
+            sync_res
+        );
+
+        b_task.abort();
+    })
+    .await
+    .expect("test timed out");
 }

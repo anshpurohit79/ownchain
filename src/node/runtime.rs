@@ -7,10 +7,10 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::FutureExt;
 use libp2p::core::Multiaddr;
 use libp2p::identity::{Keypair, PeerId};
 use tokio::sync::{mpsc, oneshot};
@@ -89,26 +89,77 @@ struct OrphanEntry {
     serialized_size: usize,
 }
 
-/// RAII guard ensuring `is_syncing` flag is reset whenever synchronization terminates.
-struct SyncGuard(Arc<AtomicBool>);
+/// Point-in-time immutable snapshot of canonical active chain block IDs captured by `NodeRuntime`.
+/// Used by the synchronization worker for bounded, lock-free common ancestor discovery.
+#[derive(Clone, Debug)]
+pub struct ActiveChainSnapshot {
+    tip_height: u64,
+    tip_block_id: Hash,
+    block_ids: Arc<Vec<Hash>>,
+}
 
-impl SyncGuard {
-    fn try_acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
-        if flag
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            Some(Self(flag.clone()))
-        } else {
-            None
-        }
+impl ActiveChainSnapshot {
+    pub fn get_block_id(&self, height: u64) -> Option<Hash> {
+        self.block_ids.get(height as usize).copied()
+    }
+
+    pub fn tip_height(&self) -> u64 {
+        self.tip_height
+    }
+
+    pub fn tip_block_id(&self) -> Hash {
+        self.tip_block_id
     }
 }
 
-impl Drop for SyncGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
-    }
+/// Result delivered when a background synchronization task terminates.
+pub(crate) struct SyncTaskResult {
+    pub sync_id: u64,
+    pub peer_id: PeerId,
+    pub result: Result<(), String>,
+}
+
+struct ActiveSyncOperation {
+    sync_id: u64,
+    peer_id: PeerId,
+    task_id: tokio::task::Id,
+    abort_handle: tokio::task::AbortHandle,
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+    notifier: Option<oneshot::Sender<Result<(), String>>>,
+}
+
+/// Result delivered when a missing-parent recovery or retry task completes.
+pub(crate) enum RecoveryTaskResult {
+    Fetched {
+        recovery_id: u64,
+        parent_id: Hash,
+        source_peer: PeerId,
+        block: Box<Block>,
+    },
+    Failed {
+        recovery_id: u64,
+        parent_id: Hash,
+        source_peer: PeerId,
+    },
+    RetryTriggered {
+        recovery_id: u64,
+        parent_id: Hash,
+        child_block_id: Hash,
+        source_peer: PeerId,
+    },
+}
+
+#[derive(Debug)]
+struct MissingParentRecovery {
+    recovery_id: u64,
+    #[allow(dead_code)]
+    parent_id: Hash,
+    child_block_id: Hash,
+    source_peer: PeerId,
+    attempts: u32,
+    abort_handle: Option<tokio::task::AbortHandle>,
+    is_in_flight: bool,
+    is_capacity_waiting: bool,
 }
 
 /// Current consensus, chain, and runtime status of a running node.
@@ -121,6 +172,17 @@ pub struct NodeStatus {
     pub mempool_size: usize,
     pub orphan_pool_size: usize,
     pub peer_id: PeerId,
+}
+
+/// Internal messages dispatched from background sync workers to `NodeRuntime`.
+pub(crate) enum RuntimeSyncMessage {
+    /// Sync worker delivers a batch of fetched blocks to be applied by the runtime.
+    ApplyBlockBatch {
+        sync_id: u64,
+        peer_id: PeerId,
+        blocks: Vec<Block>,
+        respond_to: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// Internal actor commands dispatched to the `NodeRuntime` event loop.
@@ -153,7 +215,7 @@ pub enum NodeCommand {
     SyncWithPeer {
         peer_id: PeerId,
         peer_tip_height: u64,
-        respond_to: oneshot::Sender<()>,
+        respond_to: oneshot::Sender<Result<(), String>>,
     },
     Stop {
         respond_to: oneshot::Sender<()>,
@@ -295,8 +357,8 @@ impl NodeHandle {
             })
             .await
             .map_err(|_| "Node runtime has shut down".to_string())?;
-        let _ = rx.await;
-        Ok(())
+        rx.await
+            .map_err(|_| "Node runtime dropped response".to_string())?
     }
 
     pub async fn stop(&self) {
@@ -322,13 +384,25 @@ pub struct NodeRuntime {
     network_event_rx: mpsc::Receiver<NetworkEvent>,
     command_tx: mpsc::Sender<NodeCommand>,
     command_rx: mpsc::Receiver<NodeCommand>,
+    sync_msg_tx: mpsc::Sender<RuntimeSyncMessage>,
+    sync_msg_rx: mpsc::Receiver<RuntimeSyncMessage>,
+    network_task: Option<tokio::task::JoinHandle<()>>,
+    current_sync_id: u64,
+    active_sync: Option<ActiveSyncOperation>,
+    snapshot_tasks: tokio::task::JoinSet<()>,
+    sync_tasks: tokio::task::JoinSet<SyncTaskResult>,
+    sync_task_metadata: HashMap<tokio::task::Id, (u64, PeerId)>,
+    current_recovery_id: u64,
+    missing_parents: HashMap<Hash, MissingParentRecovery>,
+    waiting_recoveries: VecDeque<Hash>,
+    recovery_tasks: tokio::task::JoinSet<RecoveryTaskResult>,
+    recovery_task_metadata: HashMap<tokio::task::Id, (u64, Hash, PeerId)>,
     keypair: Keypair,
     peer_id: PeerId,
     orphan_blocks: HashMap<Hash, OrphanEntry>,
     orphan_parents: HashMap<Hash, Vec<Hash>>,
     orphan_order: VecDeque<Hash>,
     orphan_bytes: usize,
-    is_syncing: Arc<AtomicBool>,
 }
 
 impl NodeRuntime {
@@ -380,10 +454,11 @@ impl NodeRuntime {
         )
         .map_err(|e| RuntimeError::Network(e.to_string()))?;
 
-        // Spawn network service in background tokio task
-        tokio::spawn(network_service.run());
+        // Spawn network service in background tokio task with retained handle
+        let network_task = tokio::spawn(network_service.run());
 
         let (command_tx, command_rx) = mpsc::channel(64);
+        let (sync_msg_tx, sync_msg_rx) = mpsc::channel(64);
 
         Ok(Self {
             config,
@@ -394,13 +469,25 @@ impl NodeRuntime {
             network_event_rx,
             command_tx,
             command_rx,
+            sync_msg_tx,
+            sync_msg_rx,
+            network_task: Some(network_task),
+            current_sync_id: 0,
+            active_sync: None,
+            snapshot_tasks: tokio::task::JoinSet::new(),
+            sync_tasks: tokio::task::JoinSet::new(),
+            sync_task_metadata: HashMap::new(),
+            current_recovery_id: 0,
+            missing_parents: HashMap::new(),
+            waiting_recoveries: VecDeque::new(),
+            recovery_tasks: tokio::task::JoinSet::new(),
+            recovery_task_metadata: HashMap::new(),
             keypair,
             peer_id,
             orphan_blocks: HashMap::new(),
             orphan_parents: HashMap::new(),
             orphan_order: VecDeque::new(),
             orphan_bytes: 0,
-            is_syncing: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -502,10 +589,19 @@ impl NodeRuntime {
                 if let Some(entry) = self.orphan_blocks.remove(&oldest_id) {
                     self.orphan_bytes = self.orphan_bytes.saturating_sub(entry.serialized_size);
                     let p_id = entry.block.header.parent_block_id;
+                    let mut cleanup_parent = false;
                     if let Some(children) = self.orphan_parents.get_mut(&p_id) {
                         children.retain(|id| id != &oldest_id);
                         if children.is_empty() {
                             self.orphan_parents.remove(&p_id);
+                            cleanup_parent = true;
+                        }
+                    }
+                    if cleanup_parent {
+                        if let Some(recovery) = self.missing_parents.remove(&p_id) {
+                            if let Some(abort_handle) = recovery.abort_handle {
+                                abort_handle.abort();
+                            }
                         }
                     }
                 }
@@ -536,16 +632,375 @@ impl NodeRuntime {
             self.orphan_bytes = self.orphan_bytes.saturating_sub(entry.serialized_size);
             self.orphan_order.retain(|id| id != block_id);
             let parent_id = entry.block.header.parent_block_id;
+            let mut cleanup_parent = false;
             if let Some(children) = self.orphan_parents.get_mut(&parent_id) {
                 children.retain(|id| id != block_id);
                 if children.is_empty() {
                     self.orphan_parents.remove(&parent_id);
+                    cleanup_parent = true;
+                } else {
+                    // Update child_block_id to a surviving dependent child!
+                    if let Some(recovery) = self.missing_parents.get_mut(&parent_id) {
+                        if recovery.child_block_id == *block_id {
+                            recovery.child_block_id = children[0];
+                        }
+                    }
                 }
+            }
+            if cleanup_parent {
+                if let Some(recovery) = self.missing_parents.remove(&parent_id) {
+                    if let Some(abort_handle) = recovery.abort_handle {
+                        abort_handle.abort();
+                    }
+                }
+                self.waiting_recoveries.retain(|&pid| pid != parent_id);
             }
             Some(entry)
         } else {
             None
         }
+    }
+
+    fn in_flight_recovery_count(&self) -> usize {
+        self.missing_parents
+            .values()
+            .filter(|r| r.is_in_flight)
+            .count()
+    }
+
+    /// Triggers asynchronous non-blocking recovery for a missing parent block.
+    async fn fetch_parent_block(
+        network_handle: NetworkHandle,
+        local_peer_id: PeerId,
+        parent_id: Hash,
+        child_block_id: Hash,
+        source_peer: PeerId,
+    ) -> Option<(Block, PeerId)> {
+        let req = SyncRequest::GetBlocks {
+            block_ids: vec![parent_id],
+        };
+        if source_peer != local_peer_id {
+            if let Ok(Ok(SyncResponse::Blocks(parents))) = tokio::time::timeout(
+                Duration::from_secs(3),
+                network_handle.send_sync_request(source_peer, req.clone()),
+            )
+            .await
+            {
+                if let Some(p) = parents.into_iter().next() {
+                    if p.header.block_id() == parent_id {
+                        return Some((p, source_peer));
+                    }
+                }
+            }
+        }
+
+        if let Ok(peers) = network_handle.get_connected_peers().await {
+            for peer in peers {
+                if peer.peer_id != local_peer_id && peer.handshake.is_some() {
+                    if let Ok(Ok(SyncResponse::Blocks(parents))) = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        network_handle.send_sync_request(peer.peer_id, req.clone()),
+                    )
+                    .await
+                    {
+                        if let Some(p) = parents.into_iter().next() {
+                            if p.header.block_id() == parent_id {
+                                return Some((p, peer.peer_id));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let req_mp = SyncRequest::GetMissingParent { child_block_id };
+        if let Ok(peers) = network_handle.get_connected_peers().await {
+            for peer in peers {
+                if peer.peer_id != local_peer_id && peer.handshake.is_some() {
+                    if let Ok(Ok(SyncResponse::Blocks(parents))) = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        network_handle.send_sync_request(peer.peer_id, req_mp.clone()),
+                    )
+                    .await
+                    {
+                        if let Some(p) = parents.into_iter().next() {
+                            if p.header.block_id() == parent_id {
+                                return Some((p, peer.peer_id));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Triggers asynchronous non-blocking recovery for a missing parent block.
+    fn trigger_missing_parent_recovery(
+        &mut self,
+        parent_id: Hash,
+        child_block_id: Hash,
+        source_peer: PeerId,
+    ) {
+        const MAX_PARENT_RETRIES: u32 = 3;
+
+        // 1. Check if already active/in-flight, waiting, or retries exhausted
+        if let Some(recovery) = self.missing_parents.get_mut(&parent_id) {
+            if recovery.is_in_flight
+                || recovery.is_capacity_waiting
+                || recovery.abort_handle.is_some()
+            {
+                // Coalesced: request already in flight, waiting for capacity, or awaiting retry backoff
+                return;
+            }
+            if recovery.attempts >= MAX_PARENT_RETRIES {
+                tracing::debug!(
+                    "Missing parent {} reached maximum retry attempts ({}); skipping recovery",
+                    parent_id,
+                    MAX_PARENT_RETRIES
+                );
+                return;
+            }
+        }
+
+        // 2. Capacity limit (16) checked BEFORE consuming retries!
+        if self.in_flight_recovery_count() >= 16 {
+            tracing::warn!(
+                "Maximum concurrent missing parent recoveries (16) reached; queuing waiting recovery for {}",
+                parent_id
+            );
+            match self.missing_parents.get_mut(&parent_id) {
+                Some(rec) => {
+                    rec.is_capacity_waiting = true;
+                    rec.is_in_flight = false;
+                    rec.child_block_id = child_block_id;
+                    rec.source_peer = source_peer;
+                }
+                None => {
+                    self.missing_parents.insert(
+                        parent_id,
+                        MissingParentRecovery {
+                            recovery_id: 0,
+                            parent_id,
+                            child_block_id,
+                            source_peer,
+                            attempts: 0,
+                            abort_handle: None,
+                            is_in_flight: false,
+                            is_capacity_waiting: true,
+                        },
+                    );
+                }
+            }
+            if !self.waiting_recoveries.contains(&parent_id) {
+                self.waiting_recoveries.push_back(parent_id);
+            }
+            return;
+        }
+
+        // 3. Monotonic recovery generation ID
+        self.current_recovery_id = self.current_recovery_id.wrapping_add(1);
+        let recovery_id = self.current_recovery_id;
+
+        match self.missing_parents.get_mut(&parent_id) {
+            Some(recovery) => {
+                recovery.attempts += 1;
+                recovery.recovery_id = recovery_id;
+                recovery.child_block_id = child_block_id;
+                recovery.source_peer = source_peer;
+                recovery.is_in_flight = true;
+                recovery.is_capacity_waiting = false;
+            }
+            None => {
+                self.missing_parents.insert(
+                    parent_id,
+                    MissingParentRecovery {
+                        recovery_id,
+                        parent_id,
+                        child_block_id,
+                        source_peer,
+                        attempts: 1,
+                        abort_handle: None,
+                        is_in_flight: true,
+                        is_capacity_waiting: false,
+                    },
+                );
+            }
+        };
+
+        let network_handle = self.network_handle.clone();
+        let local_peer_id = self.peer_id;
+
+        let handle = self.recovery_tasks.spawn(async move {
+            match Self::fetch_parent_block(
+                network_handle,
+                local_peer_id,
+                parent_id,
+                child_block_id,
+                source_peer,
+            )
+            .await
+            {
+                Some((parent_block, responding_peer)) => RecoveryTaskResult::Fetched {
+                    recovery_id,
+                    parent_id,
+                    source_peer: responding_peer,
+                    block: Box::new(parent_block),
+                },
+                None => RecoveryTaskResult::Failed {
+                    recovery_id,
+                    parent_id,
+                    source_peer,
+                },
+            }
+        });
+
+        let task_id = handle.id();
+        self.recovery_task_metadata
+            .insert(task_id, (recovery_id, parent_id, source_peer));
+        if let Some(entry) = self.missing_parents.get_mut(&parent_id) {
+            entry.abort_handle = Some(handle);
+        }
+    }
+
+    /// Dispatches waiting missing-parent recoveries when capacity slots become available.
+    fn dispatch_waiting_recoveries(&mut self) {
+        const MAX_PARENT_RETRIES: u32 = 3;
+        while self.in_flight_recovery_count() < 16 {
+            let parent_id = match self.waiting_recoveries.pop_front() {
+                Some(pid) => pid,
+                None => break,
+            };
+
+            // Verify dependent orphans still exist for this parent
+            if !self.orphan_parents.contains_key(&parent_id) {
+                self.missing_parents.remove(&parent_id);
+                continue;
+            }
+
+            let recovery = match self.missing_parents.get_mut(&parent_id) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            if recovery.is_in_flight || recovery.abort_handle.is_some() {
+                continue;
+            }
+
+            if recovery.attempts >= MAX_PARENT_RETRIES {
+                continue;
+            }
+
+            recovery.attempts += 1;
+            self.current_recovery_id = self.current_recovery_id.wrapping_add(1);
+            let recovery_id = self.current_recovery_id;
+            recovery.recovery_id = recovery_id;
+            recovery.is_in_flight = true;
+            recovery.is_capacity_waiting = false;
+
+            // Use surviving child block ID if original was removed
+            let child_block_id = self
+                .orphan_parents
+                .get(&parent_id)
+                .and_then(|c| c.first().copied())
+                .unwrap_or(recovery.child_block_id);
+            recovery.child_block_id = child_block_id;
+            let source_peer = recovery.source_peer;
+
+            let network_handle = self.network_handle.clone();
+            let local_peer_id = self.peer_id;
+
+            let handle = self.recovery_tasks.spawn(async move {
+                match Self::fetch_parent_block(
+                    network_handle,
+                    local_peer_id,
+                    parent_id,
+                    child_block_id,
+                    source_peer,
+                )
+                .await
+                {
+                    Some((parent_block, responding_peer)) => RecoveryTaskResult::Fetched {
+                        recovery_id,
+                        parent_id,
+                        source_peer: responding_peer,
+                        block: Box::new(parent_block),
+                    },
+                    None => RecoveryTaskResult::Failed {
+                        recovery_id,
+                        parent_id,
+                        source_peer,
+                    },
+                }
+            });
+
+            let task_id = handle.id();
+            self.recovery_task_metadata
+                .insert(task_id, (recovery_id, parent_id, source_peer));
+            recovery.abort_handle = Some(handle);
+        }
+    }
+
+    /// Schedules an autonomous retry for a failed missing-parent recovery using bounded exponential backoff.
+    fn evict_stranded_orphans_for_parent(&mut self, parent_id: &Hash) {
+        if let Some(children) = self.orphan_parents.remove(parent_id) {
+            for child_id in children {
+                if let Some(entry) = self.orphan_blocks.remove(&child_id) {
+                    self.orphan_bytes = self.orphan_bytes.saturating_sub(entry.serialized_size);
+                    self.orphan_order.retain(|id| id != &child_id);
+                }
+            }
+        }
+    }
+
+    fn schedule_missing_parent_retry(&mut self, parent_id: Hash) {
+        const MAX_PARENT_RETRIES: u32 = 3;
+        let recovery = match self.missing_parents.get_mut(&parent_id) {
+            Some(r) => r,
+            None => return,
+        };
+
+        if recovery.attempts >= MAX_PARENT_RETRIES {
+            tracing::warn!(
+                "Missing parent {} reached retry limit ({}); exhausting retries and evicting stranded orphans",
+                parent_id,
+                MAX_PARENT_RETRIES
+            );
+            self.evict_stranded_orphans_for_parent(&parent_id);
+            self.missing_parents.remove(&parent_id);
+            return;
+        }
+
+        // Bounded exponential backoff: 200ms * 2^(attempts - 1), capped at 2000ms
+        let delay_millis = 200u64.saturating_mul(1u64 << (recovery.attempts.saturating_sub(1)));
+        let backoff_duration = Duration::from_millis(delay_millis.min(2000));
+
+        let recovery_id = recovery.recovery_id;
+        let child_block_id = self
+            .orphan_parents
+            .get(&parent_id)
+            .and_then(|c| c.first().copied())
+            .unwrap_or(recovery.child_block_id);
+        recovery.child_block_id = child_block_id;
+        let source_peer = recovery.source_peer;
+        recovery.is_in_flight = false;
+        recovery.is_capacity_waiting = false;
+
+        let handle = self.recovery_tasks.spawn(async move {
+            tokio::time::sleep(backoff_duration).await;
+            RecoveryTaskResult::RetryTriggered {
+                recovery_id,
+                parent_id,
+                child_block_id,
+                source_peer,
+            }
+        });
+
+        let task_id = handle.id();
+        self.recovery_task_metadata
+            .insert(task_id, (recovery_id, parent_id, source_peer));
+        recovery.abort_handle = Some(handle);
     }
 
     /// Submits a transaction locally (e.g. from RPC or CLI).
@@ -583,6 +1038,7 @@ impl NodeRuntime {
         }
 
         let mut sync_interval = tokio::time::interval(Duration::from_millis(500));
+        let mut stop_responder = None;
 
         loop {
             tokio::select! {
@@ -636,11 +1092,10 @@ impl NodeRuntime {
                             let _ = respond_to.send(res);
                         }
                         Some(NodeCommand::SyncWithPeer { peer_id, peer_tip_height, respond_to }) => {
-                            self.sync_with_peer(peer_id, peer_tip_height).await;
-                            let _ = respond_to.send(());
+                            self.start_sync(peer_id, peer_tip_height, Some(respond_to));
                         }
                         Some(NodeCommand::Stop { respond_to }) => {
-                            let _ = respond_to.send(());
+                            stop_responder = Some(respond_to);
                             break;
                         }
                         None => {}
@@ -649,6 +1104,44 @@ impl NodeRuntime {
 
                 _ = sync_interval.tick() => {
                     self.check_sync().await;
+                }
+
+                sync_msg = self.sync_msg_rx.recv() => {
+                    if let Some(msg) = sync_msg {
+                        self.handle_sync_message(msg).await;
+                    }
+                }
+
+                Some(res) = self.sync_tasks.join_next_with_id(), if !self.sync_tasks.is_empty() => {
+                    match res {
+                        Ok((task_id, sync_res)) => {
+                            let meta = self.sync_task_metadata.remove(&task_id);
+                            self.handle_sync_task_success(task_id, meta, sync_res);
+                        }
+                        Err(join_err) => {
+                            let task_id = join_err.id();
+                            let meta = self.sync_task_metadata.remove(&task_id);
+                            self.handle_sync_task_failure(task_id, meta, join_err);
+                        }
+                    }
+                }
+
+                Some(res) = self.recovery_tasks.join_next_with_id(), if !self.recovery_tasks.is_empty() => {
+                    match res {
+                        Ok((task_id, rec_res)) => {
+                            self.recovery_task_metadata.remove(&task_id);
+                            self.handle_recovery_task_result(rec_res).await;
+                        }
+                        Err(join_err) => {
+                            let task_id = join_err.id();
+                            let meta = self.recovery_task_metadata.remove(&task_id);
+                            self.handle_recovery_task_failure(task_id, meta, join_err).await;
+                        }
+                    }
+                }
+
+                Some(_) = self.snapshot_tasks.join_next(), if !self.snapshot_tasks.is_empty() => {
+                    // Reaped completed snapshot preparation task
                 }
 
                 event = self.network_event_rx.recv() => {
@@ -663,11 +1156,53 @@ impl NodeRuntime {
             }
         }
 
+        // Cleanup on shutdown: abort and join all active background tasks
+        if let Some(active) = self.active_sync.take() {
+            active
+                .cancel_flag
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            active.abort_handle.abort();
+            if let Some(notifier) = active.notifier {
+                let _ = notifier.send(Err("Node runtime stopped".into()));
+            }
+        }
+
+        for (_, mut recovery) in self.missing_parents.drain() {
+            if let Some(handle) = recovery.abort_handle.take() {
+                handle.abort();
+            }
+        }
+        self.waiting_recoveries.clear();
+
+        // Drain any pending sync messages to unblock workers that might be awaiting send or ack
+        self.sync_msg_rx.close();
+        while let Ok(msg) = self.sync_msg_rx.try_recv() {
+            match msg {
+                RuntimeSyncMessage::ApplyBlockBatch { respond_to, .. } => {
+                    let _ = respond_to.send(Err("Node runtime stopped".into()));
+                }
+            }
+        }
+
+        // Await completion of all spawned workers across all JoinSets
+        self.sync_tasks.shutdown().await;
+        self.recovery_tasks.shutdown().await;
+        self.snapshot_tasks.shutdown().await;
+
+        if let Some(net_task) = self.network_task.take() {
+            net_task.abort();
+            let _ = net_task.await;
+        }
+
+        if let Some(responder) = stop_responder {
+            let _ = responder.send(());
+        }
+
         tracing::info!("Node runtime cleanly shut down");
     }
 
     async fn check_sync(&mut self) {
-        if self.is_syncing.load(Ordering::SeqCst) {
+        if self.active_sync.is_some() {
             return;
         }
 
@@ -685,84 +1220,618 @@ impl NodeRuntime {
             }
 
             if let Some((peer_id, peer_height)) = best_peer {
-                self.sync_with_peer(peer_id, peer_height).await;
+                self.start_sync(peer_id, peer_height, None);
             }
         }
     }
 
-    /// Bounded fork-aware chain synchronization loop with a peer.
-    pub async fn sync_with_peer(&mut self, peer_id: PeerId, peer_tip_height: u64) {
-        let _guard = match SyncGuard::try_acquire(&self.is_syncing) {
-            Some(g) => g,
-            None => {
-                tracing::debug!("Sync already in progress; skipping duplicate sync request");
+    /// Captures a point-in-time immutable snapshot of canonical active chain block IDs up to `peer_tip_height`.
+    pub fn capture_active_chain_snapshot(
+        &self,
+        peer_tip_height: u64,
+    ) -> Result<ActiveChainSnapshot, String> {
+        let (tip_height, tip_block_id, block_ids) = self
+            .storage
+            .capture_canonical_chain_snapshot(peer_tip_height)
+            .map_err(|e| e.to_string())?;
+        Ok(ActiveChainSnapshot {
+            tip_height,
+            tip_block_id,
+            block_ids: Arc::new(block_ids),
+        })
+    }
+
+    /// Dispatches an asynchronous non-blocking chain synchronization worker.
+    fn start_sync(
+        &mut self,
+        peer_id: PeerId,
+        peer_tip_height: u64,
+        respond_to: Option<oneshot::Sender<Result<(), String>>>,
+    ) {
+        if let Some(ref mut active) = self.active_sync {
+            if active.peer_id == peer_id && active.notifier.is_none() {
+                tracing::debug!(
+                    "Sync with peer {} already in progress; attaching notifier to sync #{}",
+                    peer_id,
+                    active.sync_id
+                );
+                active.notifier = respond_to;
                 return;
             }
+            tracing::debug!(
+                "Sync already in progress; rejecting concurrent sync request with peer {}",
+                peer_id
+            );
+            if let Some(tx) = respond_to {
+                let _ = tx.send(Err("Sync already in progress".to_string()));
+            }
+            return;
+        }
+
+        self.current_sync_id = self.current_sync_id.wrapping_add(1);
+        let sync_id = self.current_sync_id;
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (snap_tx, snap_rx) = oneshot::channel();
+
+        let storage = self.storage.clone();
+        let flag_clone = cancel_flag.clone();
+        self.snapshot_tasks.spawn_blocking(move || {
+            let res = storage
+                .capture_canonical_chain_snapshot_cooperative(peer_tip_height, Some(&flag_clone));
+            let _ = snap_tx.send(res);
+        });
+
+        let network_handle = self.network_handle.clone();
+        let sync_tx = self.sync_msg_tx.clone();
+
+        let worker_handle = self.sync_tasks.spawn(async move {
+            let snap_res = match snap_rx.await {
+                Ok(res) => res,
+                Err(_) => Err(StorageError::InvalidOperation(
+                    "Snapshot task cancelled or terminated".into(),
+                )),
+            };
+
+            let (tip_height, tip_block_id, block_ids) = match snap_res {
+                Ok(tuple) => tuple,
+                Err(storage_err) => {
+                    return SyncTaskResult {
+                        sync_id,
+                        peer_id,
+                        result: Err(format!("Storage error capturing snapshot: {storage_err}")),
+                    };
+                }
+            };
+
+            let snapshot = ActiveChainSnapshot {
+                tip_height,
+                tip_block_id,
+                block_ids: Arc::new(block_ids),
+            };
+
+            let ctx = SyncWorkerContext {
+                sync_id,
+                peer_id,
+                peer_tip_height,
+                snapshot,
+                network_handle,
+                sync_tx,
+            };
+
+            let worker_res = std::panic::AssertUnwindSafe(Self::run_sync_worker(ctx))
+                .catch_unwind()
+                .await;
+
+            let result = match worker_res {
+                Ok(res) => res,
+                Err(panic_payload) => {
+                    let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "Worker panicked with unknown payload".to_string()
+                    };
+                    Err(format!("Sync worker panicked: {panic_msg}"))
+                }
+            };
+
+            SyncTaskResult {
+                sync_id,
+                peer_id,
+                result,
+            }
+        });
+
+        let task_id = worker_handle.id();
+        self.sync_task_metadata.insert(task_id, (sync_id, peer_id));
+        self.active_sync = Some(ActiveSyncOperation {
+            sync_id,
+            peer_id,
+            task_id,
+            abort_handle: worker_handle,
+            cancel_flag,
+            notifier: respond_to,
+        });
+    }
+
+    /// Handles internal synchronization messages on the runtime actor loop.
+    async fn handle_sync_message(&mut self, msg: RuntimeSyncMessage) {
+        match msg {
+            RuntimeSyncMessage::ApplyBlockBatch {
+                sync_id,
+                peer_id,
+                blocks,
+                respond_to,
+            } => {
+                let is_current = match &self.active_sync {
+                    Some(active) => active.sync_id == sync_id && active.peer_id == peer_id,
+                    None => false,
+                };
+
+                if !is_current {
+                    tracing::warn!(
+                        "Ignoring stale ApplyBlockBatch from sync_id {} (peer {})",
+                        sync_id,
+                        peer_id
+                    );
+                    let _ = respond_to.send(Err("stale sync generation".to_string()));
+                    return;
+                }
+
+                let mut result = Ok(());
+                for block in blocks {
+                    if let Err(e) = self.handle_inbound_block(peer_id, Box::new(block)).await {
+                        tracing::warn!("Sync block validation failed: {}", e);
+                        result = Err(e);
+                        break;
+                    }
+                }
+                let _ = respond_to.send(result);
+            }
+        }
+    }
+
+    fn handle_sync_task_success(
+        &mut self,
+        task_id: tokio::task::Id,
+        meta: Option<(u64, PeerId)>,
+        sync_res: SyncTaskResult,
+    ) {
+        let (sync_id, peer_id) = match meta {
+            Some(m) => m,
+            None => (sync_res.sync_id, sync_res.peer_id),
         };
 
-        // 1. Discover common ancestor between local chain and peer chain
-        let min_h = self.tip_height().min(peer_tip_height);
+        let is_current = match &self.active_sync {
+            Some(active) => active.task_id == task_id && active.sync_id == sync_id,
+            None => false,
+        };
+
+        if !is_current {
+            tracing::warn!(
+                "Ignoring stale SyncTaskResult from task {:?}, sync_id {} (peer {})",
+                task_id,
+                sync_id,
+                peer_id
+            );
+            return;
+        }
+
+        tracing::info!(
+            "Sync #{} with peer {} finished: {:?}",
+            sync_id,
+            peer_id,
+            sync_res.result
+        );
+
+        let active_op = self.active_sync.take().unwrap();
+        if let Some(notifier) = active_op.notifier {
+            let _ = notifier.send(sync_res.result);
+        }
+    }
+
+    fn handle_sync_task_failure(
+        &mut self,
+        task_id: tokio::task::Id,
+        meta: Option<(u64, PeerId)>,
+        join_err: tokio::task::JoinError,
+    ) {
+        let (sync_id, peer_id) = meta.unwrap_or((0, self.peer_id));
+
+        let is_current = match &self.active_sync {
+            Some(active) => active.task_id == task_id || (active.sync_id == sync_id && sync_id > 0),
+            None => false,
+        };
+
+        if !is_current {
+            tracing::warn!(
+                "Ignoring failure from non-active sync task {:?}, sync_id {} (peer {})",
+                task_id,
+                sync_id,
+                peer_id
+            );
+            return;
+        }
+
+        if join_err.is_cancelled() {
+            tracing::debug!("Active sync #{} task was cancelled", sync_id);
+            if let Some(active_op) = self.active_sync.take() {
+                if let Some(notifier) = active_op.notifier {
+                    let _ = notifier.send(Err("Sync cancelled".to_string()));
+                }
+            }
+        } else if join_err.is_panic() {
+            let panic_msg = if let Ok(panic_payload) = join_err.try_into_panic() {
+                if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "Worker panicked with unknown payload".to_string()
+                }
+            } else {
+                "Worker panicked".to_string()
+            };
+            tracing::error!("Sync worker #{} panicked: {}", sync_id, panic_msg);
+            if let Some(active_op) = self.active_sync.take() {
+                if let Some(notifier) = active_op.notifier {
+                    let _ = notifier.send(Err(format!("Sync worker panicked: {panic_msg}")));
+                }
+            }
+        } else {
+            tracing::error!("Sync task #{} failed: {}", sync_id, join_err);
+            if let Some(active_op) = self.active_sync.take() {
+                if let Some(notifier) = active_op.notifier {
+                    let _ = notifier.send(Err(format!("Sync task failed: {join_err}")));
+                }
+            }
+        }
+    }
+
+    async fn handle_recovery_task_result(&mut self, result: RecoveryTaskResult) {
+        match result {
+            RecoveryTaskResult::Fetched {
+                recovery_id,
+                parent_id,
+                source_peer,
+                block,
+            } => {
+                match self.missing_parents.get(&parent_id) {
+                    Some(recovery) if recovery.recovery_id == recovery_id => {}
+                    _ => {
+                        tracing::warn!(
+                            "Ignoring stale or unknown Fetched for parent {} (recovery_id {})",
+                            parent_id,
+                            recovery_id
+                        );
+                        self.dispatch_waiting_recoveries();
+                        return;
+                    }
+                }
+
+                let actual_block_id = block.header.block_id();
+                if actual_block_id != parent_id {
+                    tracing::warn!(
+                        "Missing parent block ID mismatch: expected {}, got {}",
+                        parent_id,
+                        actual_block_id
+                    );
+                    if let Some(recovery) = self.missing_parents.get_mut(&parent_id) {
+                        recovery.is_in_flight = false;
+                        recovery.abort_handle = None;
+                    }
+                    if self.orphan_parents.contains_key(&parent_id) {
+                        self.schedule_missing_parent_retry(parent_id);
+                    } else {
+                        self.missing_parents.remove(&parent_id);
+                    }
+                    self.dispatch_waiting_recoveries();
+                    return;
+                }
+
+                if let Some(recovery) = self.missing_parents.get_mut(&parent_id) {
+                    recovery.is_in_flight = false;
+                    recovery.abort_handle = None;
+                }
+
+                let apply_res = self.handle_inbound_block(source_peer, block).await;
+                let is_accepted = self.storage.has_block(&parent_id).unwrap_or(false);
+
+                if apply_res.is_ok() || is_accepted {
+                    self.missing_parents.remove(&parent_id);
+                } else {
+                    let err_msg = apply_res.err().unwrap_or_else(|| "unknown error".into());
+                    tracing::warn!(
+                        "Fetched parent block {} failed to apply: {}",
+                        parent_id,
+                        err_msg
+                    );
+
+                    if self.orphan_parents.contains_key(&parent_id) {
+                        const MAX_PARENT_RETRIES: u32 = 3;
+                        let attempts = self
+                            .missing_parents
+                            .get(&parent_id)
+                            .map(|r| r.attempts)
+                            .unwrap_or(0);
+                        if attempts < MAX_PARENT_RETRIES {
+                            self.schedule_missing_parent_retry(parent_id);
+                        } else {
+                            tracing::error!(
+                                "Missing parent {} reached terminal failure after validation error; evicting stranded orphans",
+                                parent_id
+                            );
+                            self.evict_stranded_orphans_for_parent(&parent_id);
+                            self.missing_parents.remove(&parent_id);
+                        }
+                    } else {
+                        self.missing_parents.remove(&parent_id);
+                    }
+                }
+
+                self.dispatch_waiting_recoveries();
+            }
+
+            RecoveryTaskResult::Failed {
+                recovery_id,
+                parent_id,
+                source_peer,
+            } => {
+                match self.missing_parents.get_mut(&parent_id) {
+                    Some(recovery) if recovery.recovery_id == recovery_id => {
+                        recovery.is_in_flight = false;
+                        recovery.abort_handle = None;
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "Ignoring stale or unknown Failed for parent {} (recovery_id {})",
+                            parent_id,
+                            recovery_id
+                        );
+                        self.dispatch_waiting_recoveries();
+                        return;
+                    }
+                }
+
+                tracing::debug!(
+                    "Missing parent {} recovery from peer {} failed or timed out",
+                    parent_id,
+                    source_peer
+                );
+
+                if self.orphan_parents.contains_key(&parent_id) {
+                    self.schedule_missing_parent_retry(parent_id);
+                } else {
+                    self.missing_parents.remove(&parent_id);
+                }
+
+                self.dispatch_waiting_recoveries();
+            }
+
+            RecoveryTaskResult::RetryTriggered {
+                recovery_id,
+                parent_id,
+                child_block_id,
+                source_peer,
+            } => {
+                match self.missing_parents.get_mut(&parent_id) {
+                    Some(recovery) if recovery.recovery_id == recovery_id => {
+                        recovery.abort_handle = None;
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "Ignoring stale or unknown RetryTriggered for parent {} (recovery_id {})",
+                            parent_id,
+                            recovery_id
+                        );
+                        return;
+                    }
+                }
+
+                if !self.orphan_parents.contains_key(&parent_id) {
+                    self.missing_parents.remove(&parent_id);
+                    return;
+                }
+
+                if self.in_flight_recovery_count() >= 16 {
+                    tracing::warn!(
+                        "Concurrency limit (16) reached while retrying missing parent {}; queuing in waiting state",
+                        parent_id
+                    );
+                    if let Some(recovery) = self.missing_parents.get_mut(&parent_id) {
+                        recovery.is_in_flight = false;
+                        recovery.is_capacity_waiting = true;
+                    }
+                    if !self.waiting_recoveries.contains(&parent_id) {
+                        self.waiting_recoveries.push_back(parent_id);
+                    }
+                    return;
+                }
+
+                self.current_recovery_id = self.current_recovery_id.wrapping_add(1);
+                let next_recovery_id = self.current_recovery_id;
+
+                if let Some(recovery) = self.missing_parents.get_mut(&parent_id) {
+                    recovery.attempts += 1;
+                    recovery.recovery_id = next_recovery_id;
+                    recovery.is_in_flight = true;
+                    recovery.is_capacity_waiting = false;
+                }
+
+                let effective_child_id = self
+                    .orphan_parents
+                    .get(&parent_id)
+                    .and_then(|c| c.first().copied())
+                    .unwrap_or(child_block_id);
+
+                let network_handle = self.network_handle.clone();
+                let local_peer_id = self.peer_id;
+
+                let handle = self.recovery_tasks.spawn(async move {
+                    match Self::fetch_parent_block(
+                        network_handle,
+                        local_peer_id,
+                        parent_id,
+                        effective_child_id,
+                        source_peer,
+                    )
+                    .await
+                    {
+                        Some((parent_block, responding_peer)) => RecoveryTaskResult::Fetched {
+                            recovery_id: next_recovery_id,
+                            parent_id,
+                            source_peer: responding_peer,
+                            block: Box::new(parent_block),
+                        },
+                        None => RecoveryTaskResult::Failed {
+                            recovery_id: next_recovery_id,
+                            parent_id,
+                            source_peer,
+                        },
+                    }
+                });
+
+                let task_id = handle.id();
+                self.recovery_task_metadata
+                    .insert(task_id, (next_recovery_id, parent_id, source_peer));
+                if let Some(recovery) = self.missing_parents.get_mut(&parent_id) {
+                    recovery.abort_handle = Some(handle);
+                }
+            }
+        }
+    }
+
+    async fn handle_recovery_task_failure(
+        &mut self,
+        task_id: tokio::task::Id,
+        meta: Option<(u64, Hash, PeerId)>,
+        join_err: tokio::task::JoinError,
+    ) {
+        let (recovery_id, parent_id, _source_peer) = match meta {
+            Some(m) => m,
+            None => return,
+        };
+
+        match self.missing_parents.get_mut(&parent_id) {
+            Some(recovery) if recovery.recovery_id == recovery_id => {
+                recovery.is_in_flight = false;
+                recovery.abort_handle = None;
+            }
+            _ => {
+                tracing::warn!(
+                    "Ignoring failure from stale or unknown recovery task {:?}, parent {} (recovery_id {})",
+                    task_id,
+                    parent_id,
+                    recovery_id
+                );
+                return;
+            }
+        }
+
+        if join_err.is_panic() {
+            tracing::error!("Missing parent recovery worker for {} panicked", parent_id);
+        } else if join_err.is_cancelled() {
+            tracing::debug!(
+                "Missing parent recovery task for {} was cancelled",
+                parent_id
+            );
+        }
+
+        if self.orphan_parents.contains_key(&parent_id) {
+            self.schedule_missing_parent_retry(parent_id);
+        } else {
+            self.missing_parents.remove(&parent_id);
+        }
+
+        self.dispatch_waiting_recoveries();
+    }
+
+    /// Synchronizes chain state with a peer asynchronously.
+    ///
+    /// Deprecated: Direct invocation on `NodeRuntime` without running `run()` will not process
+    /// background worker messages. Use `NodeHandle::sync_with_peer` or poll the returned receiver.
+    #[deprecated(
+        note = "Direct invocation on NodeRuntime deadlocks actor loop; use NodeHandle::sync_with_peer or start_sync receiver"
+    )]
+    pub fn sync_with_peer(
+        &mut self,
+        peer_id: PeerId,
+        peer_tip_height: u64,
+    ) -> oneshot::Receiver<Result<(), String>> {
+        let (tx, rx) = oneshot::channel();
+        self.start_sync(peer_id, peer_tip_height, Some(tx));
+        rx
+    }
+}
+
+struct SyncWorkerContext {
+    sync_id: u64,
+    peer_id: PeerId,
+    peer_tip_height: u64,
+    snapshot: ActiveChainSnapshot,
+    network_handle: NetworkHandle,
+    sync_tx: mpsc::Sender<RuntimeSyncMessage>,
+}
+
+impl NodeRuntime {
+    /// Outbound synchronization worker performing ancestor discovery and batched block fetches.
+    async fn run_sync_worker(ctx: SyncWorkerContext) -> Result<(), String> {
+        let SyncWorkerContext {
+            sync_id,
+            peer_id,
+            peer_tip_height,
+            snapshot,
+            network_handle,
+            sync_tx,
+        } = ctx;
+
+        // 1. Discover common ancestor between local snapshot and peer chain
+        let min_h = snapshot.tip_height().min(peer_tip_height);
         let common_ancestor_height = if min_h == 0 {
             0
         } else {
-            // Fast path: check if peer matches our local active chain at min_h
+            // Fast path: check if peer matches our snapshot at min_h
             let fast_req = SyncRequest::GetHeaders {
                 start_height: min_h,
                 max_count: 1,
             };
-            let is_match = match self
-                .network_handle
-                .send_sync_request(peer_id, fast_req)
-                .await
-            {
+            let fast_match = match network_handle.send_sync_request(peer_id, fast_req).await {
                 Ok(SyncResponse::Headers(headers)) if headers.len() == 1 => {
-                    let local_id = self
-                        .storage
-                        .get_block_by_height(min_h)
-                        .ok()
-                        .flatten()
-                        .map(|b| b.block_id());
-                    Some(headers[0].block_id()) == local_id
+                    Some(headers[0].block_id()) == snapshot.get_block_id(min_h)
                 }
                 _ => false,
             };
 
-            if is_match {
+            if fast_match {
                 min_h
             } else {
                 // Binary search for common ancestor in [0, min_h - 1]
                 let mut low = 0u64;
                 let mut high = min_h - 1;
+
                 while low < high {
                     let mid = (low + high).div_ceil(2);
                     let req = SyncRequest::GetHeaders {
                         start_height: mid,
                         max_count: 1,
                     };
-                    match self.network_handle.send_sync_request(peer_id, req).await {
+                    match network_handle.send_sync_request(peer_id, req).await {
                         Ok(SyncResponse::Headers(headers)) if headers.len() == 1 => {
-                            let local_id = self
-                                .storage
-                                .get_block_by_height(mid)
-                                .ok()
-                                .flatten()
-                                .map(|b| b.block_id());
-                            if Some(headers[0].block_id()) == local_id {
+                            if Some(headers[0].block_id()) == snapshot.get_block_id(mid) {
                                 low = mid;
                             } else {
                                 high = mid - 1;
                             }
                         }
                         _ => {
-                            tracing::warn!(
-                                "Failed to query header at height {} during ancestor discovery with {}",
-                                mid,
-                                peer_id
-                            );
-                            return;
+                            return Err(format!(
+                                "Failed to query header at height {mid} during ancestor discovery with {peer_id}"
+                            ));
                         }
                     }
                 }
+
                 low
             }
         };
@@ -784,7 +1853,7 @@ impl NodeRuntime {
                 max_count: count,
             };
 
-            match self.network_handle.send_sync_request(peer_id, req).await {
+            match network_handle.send_sync_request(peer_id, req).await {
                 Ok(SyncResponse::Headers(headers)) => {
                     if headers.is_empty() {
                         break;
@@ -796,38 +1865,42 @@ impl NodeRuntime {
                     let block_req = SyncRequest::GetBlocks {
                         block_ids: block_ids.clone(),
                     };
-                    match self
-                        .network_handle
-                        .send_sync_request(peer_id, block_req)
-                        .await
-                    {
+                    match network_handle.send_sync_request(peer_id, block_req).await {
                         Ok(SyncResponse::Blocks(blocks)) => {
                             if blocks.is_empty() {
                                 break;
                             }
                             let num_blocks = blocks.len() as u64;
-                            for block in blocks {
-                                if let Err(e) =
-                                    self.handle_inbound_block(peer_id, Box::new(block)).await
-                                {
-                                    tracing::warn!("Sync block validation failed: {}", e);
-                                    return;
-                                }
-                            }
+
+                            let (ack_tx, ack_rx) = oneshot::channel();
+                            sync_tx
+                                .send(RuntimeSyncMessage::ApplyBlockBatch {
+                                    sync_id,
+                                    peer_id,
+                                    blocks,
+                                    respond_to: ack_tx,
+                                })
+                                .await
+                                .map_err(|_| "Node runtime shut down during sync".to_string())?;
+
+                            ack_rx.await.map_err(|_| {
+                                "Node runtime dropped block batch response".to_string()
+                            })??;
+
                             current_h += num_blocks;
                         }
                         other => {
-                            tracing::warn!("Unexpected sync blocks response: {:?}", other);
-                            return;
+                            return Err(format!("Unexpected sync blocks response: {other:?}"));
                         }
                     }
                 }
                 other => {
-                    tracing::warn!("Unexpected sync headers response: {:?}", other);
-                    return;
+                    return Err(format!("Unexpected sync headers response: {other:?}"));
                 }
             }
         }
+
+        Ok(())
     }
 
     async fn handle_network_event(&mut self, event: NetworkEvent) {
@@ -841,12 +1914,54 @@ impl NodeRuntime {
                     handshake.cumulative_work
                 );
                 if handshake.cumulative_work > self.cumulative_work() {
-                    self.sync_with_peer(peer_id, handshake.tip_height).await;
+                    self.start_sync(peer_id, handshake.tip_height, None);
                 }
             }
 
             NetworkEvent::PeerDisconnected { peer_id } => {
                 tracing::info!("Peer {} disconnected", peer_id);
+                if let Some(active) = self.active_sync.take() {
+                    if active.peer_id == peer_id {
+                        tracing::warn!(
+                            "Syncing peer {} disconnected; aborting sync #{}",
+                            peer_id,
+                            active.sync_id
+                        );
+                        active
+                            .cancel_flag
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        active.abort_handle.abort();
+                        if let Some(notifier) = active.notifier {
+                            let _ = notifier.send(Err(format!(
+                                "Peer {peer_id} disconnected during synchronization"
+                            )));
+                        }
+                    } else {
+                        self.active_sync = Some(active);
+                    }
+                }
+
+                let disconnected_parents: Vec<Hash> = self
+                    .missing_parents
+                    .iter()
+                    .filter(|(_, r)| r.source_peer == peer_id)
+                    .map(|(p, _)| *p)
+                    .collect();
+
+                for parent_id in disconnected_parents {
+                    if let Some(mut recovery) = self.missing_parents.remove(&parent_id) {
+                        if let Some(handle) = recovery.abort_handle.take() {
+                            handle.abort();
+                        }
+                        if self.orphan_parents.contains_key(&parent_id) {
+                            recovery.is_in_flight = false;
+                            recovery.is_capacity_waiting = false;
+                            self.missing_parents.insert(parent_id, recovery);
+                            self.schedule_missing_parent_retry(parent_id);
+                        }
+                    }
+                }
+                self.dispatch_waiting_recoveries();
             }
 
             NetworkEvent::BlockReceived { peer_id, block } => {
@@ -998,63 +2113,8 @@ impl NodeRuntime {
             );
 
             self.add_orphan(block_id, *block, source_peer);
-
-            // Request missing parent block
-            let req = SyncRequest::GetBlocks {
-                block_ids: vec![parent_id],
-            };
-            let mut retrieved_parents = Vec::new();
-            if source_peer != self.peer_id {
-                if let Ok(SyncResponse::Blocks(parents)) = self
-                    .network_handle
-                    .send_sync_request(source_peer, req.clone())
-                    .await
-                {
-                    retrieved_parents = parents;
-                }
-            }
-            if retrieved_parents.is_empty() {
-                // If source_peer was local or didn't return parent, query connected peers
-                if let Ok(peers) = self.network_handle.get_connected_peers().await {
-                    for peer in peers {
-                        if peer.peer_id != self.peer_id && peer.handshake.is_some() {
-                            if let Ok(SyncResponse::Blocks(parents)) = self
-                                .network_handle
-                                .send_sync_request(peer.peer_id, req.clone())
-                                .await
-                            {
-                                if !parents.is_empty() {
-                                    retrieved_parents = parents;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if retrieved_parents.is_empty() {
-                // Also try GetMissingParent request
-                let req_mp = SyncRequest::GetMissingParent {
-                    child_block_id: block_id,
-                };
-                if let Ok(peers) = self.network_handle.get_connected_peers().await {
-                    for peer in peers {
-                        if peer.peer_id != self.peer_id && peer.handshake.is_some() {
-                            if let Ok(SyncResponse::Blocks(parents)) = self
-                                .network_handle
-                                .send_sync_request(peer.peer_id, req_mp.clone())
-                                .await
-                            {
-                                if !parents.is_empty() {
-                                    retrieved_parents = parents;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            return Ok((None, retrieved_parents));
+            self.trigger_missing_parent_recovery(parent_id, block_id, source_peer);
+            return Ok((None, Vec::new()));
         }
 
         // 3. Case A: Block directly extends current active tip
@@ -1229,5 +2289,570 @@ impl NodeRuntime {
             );
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::genesis::DEVNET;
+    use crate::hash::chain_id;
+    use tempfile::TempDir;
+
+    fn make_test_config(dir: &TempDir) -> NodeConfig {
+        NodeConfig {
+            network_name: "devnet".to_string(),
+            chain_id: crate::hash::chain_id("devnet"),
+            listen_addr: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            max_peers: 50,
+            bootstrap_peers: vec![],
+            mempool_config: Default::default(),
+        }
+    }
+
+    fn make_test_coinbase(chain_id: Hash, height: u64) -> Vec<u8> {
+        use crate::account::scheduled_subsidy;
+        let mut tx = Vec::with_capacity(83);
+        tx.push(0); // Type 0: Coinbase
+        tx.extend_from_slice(&1u16.to_le_bytes());
+        tx.extend_from_slice(chain_id.as_bytes());
+        tx.extend_from_slice(&height.to_le_bytes());
+        tx.extend_from_slice(&[1u8; 32]); // miner address
+        let payout = scheduled_subsidy(height) as u64;
+        tx.extend_from_slice(&payout.to_le_bytes());
+        tx
+    }
+
+    fn make_test_valid_child_block(state: &ChainState, timestamp: u64) -> Block {
+        use crate::hash::transaction_id;
+        use crate::header::Header;
+        use crate::merkle;
+        use crate::orchard_root::empty_commitment_root;
+        let parent = state.tip().unwrap();
+        let height = parent.header.height + 1;
+        let tx = make_test_coinbase(state.chain_id(), height);
+        let tx_id = transaction_id(&tx);
+        let mut blk = Block {
+            header: Header {
+                version: 1,
+                chain_id: state.chain_id(),
+                height,
+                parent_block_id: parent.block_id(),
+                transaction_root: merkle::tx_root(&[tx_id]),
+                orchard_commitment_root: empty_commitment_root(),
+                timestamp,
+                difficulty: state.expected_difficulty_for_next_block().unwrap_or(1),
+                nonce: 0,
+            },
+            transactions: vec![tx],
+        };
+        let root = state
+            .simulate_candidate_state_root(&blk)
+            .expect("simulated state root");
+        blk.header.orchard_commitment_root = root;
+        blk
+    }
+
+    #[tokio::test]
+    async fn test_sync_worker_supervision_real_panic_cancel_and_stale() {
+        let dir = TempDir::new().unwrap();
+        let mut runtime = NodeRuntime::init(make_test_config(&dir)).unwrap();
+
+        // 1. Normal completion with real spawned task
+        let peer_normal = PeerId::random();
+        let (tx_normal, rx_normal) = oneshot::channel();
+        let sync_id_1 = 101;
+        let handle_normal = runtime.sync_tasks.spawn(async move {
+            SyncTaskResult {
+                sync_id: sync_id_1,
+                peer_id: peer_normal,
+                result: Ok(()),
+            }
+        });
+        let task_id_normal = handle_normal.id();
+        runtime
+            .sync_task_metadata
+            .insert(task_id_normal, (sync_id_1, peer_normal));
+        runtime.active_sync = Some(ActiveSyncOperation {
+            sync_id: sync_id_1,
+            peer_id: peer_normal,
+            task_id: task_id_normal,
+            abort_handle: handle_normal,
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            notifier: Some(tx_normal),
+        });
+
+        let join_res = runtime.sync_tasks.join_next_with_id().await.unwrap();
+        match join_res {
+            Ok((t_id, s_res)) => {
+                let meta = runtime.sync_task_metadata.remove(&t_id);
+                runtime.handle_sync_task_success(t_id, meta, s_res);
+            }
+            Err(_) => panic!("Expected normal task success"),
+        }
+        assert!(runtime.active_sync.is_none());
+        assert!(rx_normal.await.unwrap().is_ok());
+
+        // 2. Real spawned task panic
+        let peer_panic = PeerId::random();
+        let (tx_panic, rx_panic) = oneshot::channel();
+        let sync_id_2 = 102;
+        let handle_panic = runtime.sync_tasks.spawn(async move {
+            panic!("real panic in sync worker task");
+        });
+        let task_id_panic = handle_panic.id();
+        runtime
+            .sync_task_metadata
+            .insert(task_id_panic, (sync_id_2, peer_panic));
+        runtime.active_sync = Some(ActiveSyncOperation {
+            sync_id: sync_id_2,
+            peer_id: peer_panic,
+            task_id: task_id_panic,
+            abort_handle: handle_panic,
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            notifier: Some(tx_panic),
+        });
+
+        let join_res = runtime.sync_tasks.join_next_with_id().await.unwrap();
+        match join_res {
+            Ok(_) => panic!("Expected task panic JoinError"),
+            Err(join_err) => {
+                assert!(join_err.is_panic());
+                let t_id = join_err.id();
+                let meta = runtime.sync_task_metadata.remove(&t_id);
+                runtime.handle_sync_task_failure(t_id, meta, join_err);
+            }
+        }
+        assert!(runtime.active_sync.is_none());
+        let panic_err = rx_panic.await.unwrap().unwrap_err();
+        assert!(
+            panic_err.contains("panicked"),
+            "Expected panic error, got: {}",
+            panic_err
+        );
+
+        // 3. Real spawned task cancellation
+        let peer_cancel = PeerId::random();
+        let (tx_cancel, rx_cancel) = oneshot::channel();
+        let sync_id_3 = 103;
+        let handle_cancel = runtime.sync_tasks.spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            SyncTaskResult {
+                sync_id: sync_id_3,
+                peer_id: peer_cancel,
+                result: Ok(()),
+            }
+        });
+        let task_id_cancel = handle_cancel.id();
+        runtime
+            .sync_task_metadata
+            .insert(task_id_cancel, (sync_id_3, peer_cancel));
+        runtime.active_sync = Some(ActiveSyncOperation {
+            sync_id: sync_id_3,
+            peer_id: peer_cancel,
+            task_id: task_id_cancel,
+            abort_handle: handle_cancel,
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            notifier: Some(tx_cancel),
+        });
+
+        // Cancel the active sync
+        runtime.active_sync.as_ref().unwrap().abort_handle.abort();
+
+        let join_res = runtime.sync_tasks.join_next_with_id().await.unwrap();
+        match join_res {
+            Ok(_) => panic!("Expected task cancellation JoinError"),
+            Err(join_err) => {
+                assert!(join_err.is_cancelled());
+                let t_id = join_err.id();
+                let meta = runtime.sync_task_metadata.remove(&t_id);
+                runtime.handle_sync_task_failure(t_id, meta, join_err);
+            }
+        }
+        assert!(runtime.active_sync.is_none());
+        let cancel_err = rx_cancel.await.unwrap().unwrap_err();
+        assert!(
+            cancel_err.contains("cancelled"),
+            "Expected cancelled error, got: {}",
+            cancel_err
+        );
+
+        // 4. Stale task failure arriving after newer sync started
+        let old_handle = runtime.sync_tasks.spawn(async {
+            panic!("delayed old task panic");
+        });
+        let old_task_id = old_handle.id();
+        runtime
+            .sync_task_metadata
+            .insert(old_task_id, (999, PeerId::random()));
+
+        // Newer active sync
+        let peer_new = PeerId::random();
+        let new_handle = runtime.sync_tasks.spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            SyncTaskResult {
+                sync_id: 1000,
+                peer_id: peer_new,
+                result: Ok(()),
+            }
+        });
+        let new_task_id = new_handle.id();
+        let (tx_new, _rx_new) = oneshot::channel();
+        runtime
+            .sync_task_metadata
+            .insert(new_task_id, (1000, peer_new));
+        runtime.active_sync = Some(ActiveSyncOperation {
+            sync_id: 1000,
+            peer_id: peer_new,
+            task_id: new_task_id,
+            abort_handle: new_handle,
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            notifier: Some(tx_new),
+        });
+
+        // Old task failure resolves
+        let old_join_res = runtime.sync_tasks.join_next_with_id().await.unwrap();
+        if let Err(join_err) = old_join_res {
+            let t_id = join_err.id();
+            let meta = runtime.sync_task_metadata.remove(&t_id);
+            runtime.handle_sync_task_failure(t_id, meta, join_err);
+        }
+
+        // Newer active sync must remain intact and NOT cleared!
+        assert!(runtime.active_sync.is_some());
+        assert_eq!(runtime.active_sync.as_ref().unwrap().sync_id, 1000);
+        assert_eq!(runtime.active_sync.as_ref().unwrap().task_id, new_task_id);
+
+        // Clean up the newer task
+        runtime.active_sync.take().unwrap().abort_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_supervision_and_shutdown() {
+        let dir = TempDir::new().unwrap();
+        let mut runtime = NodeRuntime::init(make_test_config(&dir)).unwrap();
+
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let started_clone = started.clone();
+        let finished_clone = finished.clone();
+
+        // Spawn controlled blocking task into snapshot_tasks
+        runtime.snapshot_tasks.spawn_blocking(move || {
+            started_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(50));
+            finished_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        for _ in 0..50 {
+            if started.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Shutdown snapshot_tasks explicitly as runtime shutdown does
+        runtime.snapshot_tasks.shutdown().await;
+
+        // Verify blocking task is observed to terminate before shutdown returns
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "Blocking snapshot task must be observed to finish before shutdown completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_missing_parent_capacity_full_and_auto_dispatch() {
+        let dir = TempDir::new().unwrap();
+        let mut runtime = NodeRuntime::init(make_test_config(&dir)).unwrap();
+        let peer = PeerId::random();
+
+        // Fill missing_parents to capacity (16) with in-flight recoveries
+        for i in 0..16 {
+            let p_id = Hash::new([i as u8; 32]);
+            runtime.missing_parents.insert(
+                p_id,
+                MissingParentRecovery {
+                    recovery_id: i,
+                    parent_id: p_id,
+                    child_block_id: Hash::new([(i + 100) as u8; 32]),
+                    source_peer: peer,
+                    attempts: 1,
+                    abort_handle: None,
+                    is_in_flight: true,
+                    is_capacity_waiting: false,
+                },
+            );
+        }
+        assert_eq!(runtime.in_flight_recovery_count(), 16);
+
+        // Attempt 17th recovery: capacity full
+        let waiting_parent = Hash::new([99u8; 32]);
+        let waiting_child = Hash::new([100u8; 32]);
+
+        // Add dependent orphan
+        let genesis = crate::genesis::genesis_block(crate::hash::chain_id("devnet"));
+        let mut orphan = genesis.clone();
+        orphan.header.parent_block_id = waiting_parent;
+        runtime.add_orphan(waiting_child, orphan, peer);
+
+        runtime.trigger_missing_parent_recovery(waiting_parent, waiting_child, peer);
+
+        // 1. Prove capacity exhaustion does NOT consume an attempt!
+        let waiting_rec = runtime.missing_parents.get(&waiting_parent).unwrap();
+        assert_eq!(
+            waiting_rec.attempts, 0,
+            "Capacity full must not consume an attempt"
+        );
+        assert!(waiting_rec.is_capacity_waiting);
+        assert!(!waiting_rec.is_in_flight);
+        assert!(runtime.waiting_recoveries.contains(&waiting_parent));
+
+        // 2. Free up a slot by completing in-flight recovery #0
+        let finished_parent = Hash::new([0u8; 32]);
+        let genesis_block = genesis.clone();
+        runtime
+            .handle_recovery_task_result(RecoveryTaskResult::Fetched {
+                recovery_id: 0,
+                parent_id: finished_parent,
+                source_peer: peer,
+                block: Box::new(genesis_block),
+            })
+            .await;
+
+        // 3. Prove waiting recovery is automatically dispatched!
+        let dispatched_rec = runtime.missing_parents.get(&waiting_parent).unwrap();
+        assert_eq!(
+            dispatched_rec.attempts, 1,
+            "Dispatched recovery must consume attempt 1"
+        );
+        assert!(dispatched_rec.is_in_flight);
+        assert!(!dispatched_rec.is_capacity_waiting);
+        assert!(!runtime.waiting_recoveries.contains(&waiting_parent));
+    }
+
+    #[tokio::test]
+    async fn test_missing_parent_real_worker_panic_and_retry() {
+        let dir = TempDir::new().unwrap();
+        let mut runtime = NodeRuntime::init(make_test_config(&dir)).unwrap();
+        let peer = PeerId::random();
+
+        let parent_id = Hash::new([77u8; 32]);
+        let child_id = Hash::new([88u8; 32]);
+        let genesis = crate::genesis::genesis_block(crate::hash::chain_id("devnet"));
+        let mut orphan = genesis.clone();
+        orphan.header.parent_block_id = parent_id;
+        runtime.add_orphan(child_id, orphan, peer);
+
+        // Trigger recovery
+        runtime.trigger_missing_parent_recovery(parent_id, child_id, peer);
+        let rec_id = runtime.current_recovery_id;
+        assert!(
+            runtime
+                .missing_parents
+                .get(&parent_id)
+                .unwrap()
+                .is_in_flight
+        );
+
+        // Spawn a real panicking task into recovery_tasks
+        let panic_handle = runtime.recovery_tasks.spawn(async {
+            panic!("real panic in recovery worker");
+        });
+        let panic_task_id = panic_handle.id();
+        runtime
+            .recovery_task_metadata
+            .insert(panic_task_id, (rec_id, parent_id, peer));
+        if let Some(r) = runtime.missing_parents.get_mut(&parent_id) {
+            r.abort_handle = Some(panic_handle);
+        }
+
+        // Join the panicking task
+        let join_res = runtime.recovery_tasks.join_next_with_id().await.unwrap();
+        match join_res {
+            Ok(_) => panic!("Expected worker panic JoinError"),
+            Err(join_err) => {
+                assert!(join_err.is_panic());
+                let t_id = join_err.id();
+                let meta = runtime.recovery_task_metadata.remove(&t_id);
+                runtime
+                    .handle_recovery_task_failure(t_id, meta, join_err)
+                    .await;
+            }
+        }
+
+        // Recovery must NOT be stuck in_flight!
+        let recovery = runtime.missing_parents.get(&parent_id).unwrap();
+        assert!(
+            !recovery.is_in_flight,
+            "Panic must not leave recovery marked is_in_flight"
+        );
+        assert!(
+            recovery.abort_handle.is_some(),
+            "Panic must schedule backoff retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetched_parent_validation_failure_and_terminal_exhaustion() {
+        let dir = TempDir::new().unwrap();
+        let mut runtime = NodeRuntime::init(make_test_config(&dir)).unwrap();
+        let peer = PeerId::random();
+
+        let parent_id = Hash::new([33u8; 32]);
+        let child_id = Hash::new([44u8; 32]);
+        let genesis = crate::genesis::genesis_block(crate::hash::chain_id("devnet"));
+        let mut orphan = genesis.clone();
+        orphan.header.parent_block_id = parent_id;
+        runtime.add_orphan(child_id, orphan, peer);
+
+        runtime.trigger_missing_parent_recovery(parent_id, child_id, peer);
+        let rec_id = runtime.current_recovery_id;
+
+        // Construct block with mismatched block ID
+        let mut wrong_block = genesis.clone();
+        wrong_block.header.height = 999;
+        assert_ne!(wrong_block.header.block_id(), parent_id);
+
+        // Deliver mismatched block
+        runtime
+            .handle_recovery_task_result(RecoveryTaskResult::Fetched {
+                recovery_id: rec_id,
+                parent_id,
+                source_peer: peer,
+                block: Box::new(wrong_block),
+            })
+            .await;
+
+        // Must NOT be accepted; must transition to backoff retry
+        let rec_id_3 = {
+            let rec = runtime.missing_parents.get(&parent_id).unwrap();
+            assert!(!rec.is_in_flight);
+            assert!(rec.abort_handle.is_some(), "Mismatch must schedule retry");
+            rec.recovery_id
+        };
+
+        // Advance attempts to 3 (terminal limit)
+        if let Some(r) = runtime.missing_parents.get_mut(&parent_id) {
+            r.attempts = 3;
+            r.abort_handle = None;
+        }
+
+        // Deliver failure on attempt 3 -> triggers terminal failure
+        runtime
+            .handle_recovery_task_result(RecoveryTaskResult::Failed {
+                recovery_id: rec_id_3,
+                parent_id,
+                source_peer: peer,
+            })
+            .await;
+
+        // Terminal failure: missing_parents entry removed AND stranded orphan children evicted!
+        assert!(!runtime.missing_parents.contains_key(&parent_id));
+        assert!(!runtime.orphan_parents.contains_key(&parent_id));
+        assert!(!runtime.orphan_blocks.contains_key(&child_id));
+    }
+
+    #[tokio::test]
+    async fn test_shared_parent_child_removal_fallback() {
+        let dir = TempDir::new().unwrap();
+        let mut runtime = NodeRuntime::init(make_test_config(&dir)).unwrap();
+        let peer = PeerId::random();
+
+        let shared_parent = Hash::new([55u8; 32]);
+        let genesis = crate::genesis::genesis_block(crate::hash::chain_id("devnet"));
+
+        let mut orphan1 = genesis.clone();
+        orphan1.header.height = 1;
+        orphan1.header.parent_block_id = shared_parent;
+        orphan1.header.timestamp = 1000;
+        let id_1 = orphan1.header.block_id();
+
+        let mut orphan2 = genesis.clone();
+        orphan2.header.height = 1;
+        orphan2.header.parent_block_id = shared_parent;
+        orphan2.header.timestamp = 2000;
+        let id_2 = orphan2.header.block_id();
+
+        runtime.add_orphan(id_1, orphan1, peer);
+        runtime.trigger_missing_parent_recovery(shared_parent, id_1, peer);
+        runtime.add_orphan(id_2, orphan2, peer);
+
+        assert_eq!(
+            runtime
+                .missing_parents
+                .get(&shared_parent)
+                .unwrap()
+                .child_block_id,
+            id_1
+        );
+
+        // Remove orphan 1
+        runtime.remove_orphan(&id_1);
+
+        // Child block ID must fall back to surviving orphan 2!
+        assert!(runtime.missing_parents.contains_key(&shared_parent));
+        assert_eq!(
+            runtime
+                .missing_parents
+                .get(&shared_parent)
+                .unwrap()
+                .child_block_id,
+            id_2
+        );
+
+        // Remove orphan 2 (last dependent child)
+        runtime.remove_orphan(&id_2);
+
+        // Entire recovery entry and waiting entries must be cleaned up
+        assert!(!runtime.missing_parents.contains_key(&shared_parent));
+        assert!(!runtime.orphan_parents.contains_key(&shared_parent));
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_acquisition_beyond_genesis() {
+        let dir = TempDir::new().unwrap();
+        let cid = chain_id(DEVNET);
+        let db_path = dir.path().join("blockchain.redb");
+        let store = BlockStore::open(&db_path, cid).unwrap();
+
+        let genesis = crate::genesis::genesis_block(cid);
+        let mut state = ChainState::from_genesis(&genesis).unwrap();
+
+        let mut last_id = genesis.block_id();
+        for h in 1..=5 {
+            let b = make_test_valid_child_block(&state, genesis.header.timestamp + h * 120);
+            state.apply_block(&b).unwrap();
+            store
+                .commit_active_block(&b, state.cumulative_work())
+                .unwrap();
+            last_id = b.block_id();
+        }
+
+        let (tip_h, tip_id, ids) = store.capture_canonical_chain_snapshot(5).unwrap();
+        assert_eq!(tip_h, 5);
+        assert_eq!(tip_id, last_id);
+        assert_eq!(ids.len(), 6);
+
+        // Bounded scan
+        let (tip_h_bounded, _, ids_bounded) = store.capture_canonical_chain_snapshot(3).unwrap();
+        assert_eq!(tip_h_bounded, 5);
+        assert_eq!(ids_bounded.len(), 4); // heights 0, 1, 2, 3
+    }
+
+    #[tokio::test]
+    async fn test_runtime_sync_with_peer_public_api_nonblocking() {
+        let dir = TempDir::new().unwrap();
+        let mut runtime = NodeRuntime::init(make_test_config(&dir)).unwrap();
+        let peer = PeerId::random();
+
+        #[allow(deprecated)]
+        let rx = runtime.sync_with_peer(peer, 10);
+        assert!(runtime.active_sync.is_some());
+
+        drop(rx);
     }
 }
