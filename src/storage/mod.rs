@@ -641,6 +641,69 @@ impl BlockStore {
 
         Ok((height, Hash::new(id), U256::from_le_bytes(w)))
     }
+
+    /// Atomically captures a consistent point-in-time snapshot of the canonical chain
+    /// block IDs up to `target_max_height` inside a single read transaction.
+    ///
+    /// The returned tuple contains: `(tip_height, tip_block_id, canonical_block_ids_0_to_scan_limit)`.
+    pub fn capture_canonical_chain_snapshot(
+        &self,
+        target_max_height: u64,
+    ) -> Result<(u64, Hash, Vec<Hash>), StorageError> {
+        self.capture_canonical_chain_snapshot_cooperative(target_max_height, None)
+    }
+
+    /// Captures a point-in-time immutable snapshot with support for cooperative cancellation.
+    pub fn capture_canonical_chain_snapshot_cooperative(
+        &self,
+        target_max_height: u64,
+        cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<(u64, Hash, Vec<Hash>), StorageError> {
+        let read_tx = self.db.begin_read()?;
+        let chain_meta = read_tx.open_table(TABLE_CHAIN_METADATA)?;
+        let height_idx = read_tx.open_table(TABLE_HEIGHT_INDEX)?;
+
+        let tip_height = {
+            let h_bytes = chain_meta
+                .get(KEY_TIP_HEIGHT)?
+                .ok_or_else(|| StorageError::Db("missing tip height".into()))?;
+            u64::from_le_bytes(
+                h_bytes
+                    .value()
+                    .try_into()
+                    .map_err(|_| StorageError::Db("invalid tip height bytes".into()))?,
+            )
+        };
+
+        let tip_block_id = {
+            let id_bytes = chain_meta
+                .get(KEY_TIP_BLOCK_ID)?
+                .ok_or_else(|| StorageError::Db("missing tip block ID".into()))?;
+            let mut id = [0u8; 32];
+            id.copy_from_slice(id_bytes.value());
+            Hash::new(id)
+        };
+
+        let scan_limit = tip_height.min(target_max_height);
+        let mut block_ids = Vec::with_capacity((scan_limit + 1) as usize);
+
+        for h in 0..=scan_limit {
+            if let Some(flag) = cancel_flag {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(StorageError::InvalidOperation(
+                        "Snapshot acquisition cancelled".into(),
+                    ));
+                }
+            }
+            let id_val = height_idx
+                .get(h)?
+                .ok_or(StorageError::MissingBlockAtHeight { height: h })?;
+            let id = Hash::new(*id_val.value());
+            block_ids.push(id);
+        }
+
+        Ok((tip_height, tip_block_id, block_ids))
+    }
 }
 
 #[cfg(test)]
@@ -1016,5 +1079,56 @@ mod tests {
         assert_eq!(reconstructed.tip_height(), Some(4));
         assert_eq!(reconstructed.tip_block_id(), Some(b4a_id));
         assert_eq!(reconstructed.cumulative_work(), state_a.cumulative_work());
+    }
+
+    #[test]
+    fn test_capture_canonical_chain_snapshot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cid = chain_id(DEVNET);
+        let db_path = dir.path().join("blockchain.redb");
+        let store = BlockStore::open(&db_path, cid).unwrap();
+
+        // 1. Snapshot on fresh genesis store
+        let (tip_h, tip_id, ids) = store.capture_canonical_chain_snapshot(10).unwrap();
+        assert_eq!(tip_h, 0);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], tip_id);
+
+        // 2. Commit two blocks
+        let genesis = genesis_block(cid);
+        let genesis_time = genesis.header.timestamp;
+        let mut state = ChainState::from_genesis(&genesis).unwrap();
+        let b1 = make_valid_child_block(&state, genesis_time + 120);
+        state.apply_block(&b1).unwrap();
+        store
+            .commit_active_block(&b1, state.cumulative_work())
+            .unwrap();
+
+        let b2 = make_valid_child_block(&state, genesis_time + 240);
+        state.apply_block(&b2).unwrap();
+        store
+            .commit_active_block(&b2, state.cumulative_work())
+            .unwrap();
+
+        // 3. Snapshot up to height 2
+        let (tip_h2, tip_id2, ids2) = store.capture_canonical_chain_snapshot(2).unwrap();
+        assert_eq!(tip_h2, 2);
+        assert_eq!(tip_id2, b2.block_id());
+        assert_eq!(ids2.len(), 3);
+        assert_eq!(ids2[0], genesis.block_id());
+        assert_eq!(ids2[1], b1.block_id());
+        assert_eq!(ids2[2], b2.block_id());
+
+        // 4. Snapshot with bounded target (target_max_height = 1)
+        let (tip_h_bounded, _, ids_bounded) = store.capture_canonical_chain_snapshot(1).unwrap();
+        assert_eq!(tip_h_bounded, 2); // tip_height is still 2
+        assert_eq!(ids_bounded.len(), 2); // only scanned up to 1
+        assert_eq!(ids_bounded[0], genesis.block_id());
+        assert_eq!(ids_bounded[1], b1.block_id());
+
+        // 5. Cooperative cancellation test
+        let flag = std::sync::atomic::AtomicBool::new(true);
+        let cancel_res = store.capture_canonical_chain_snapshot_cooperative(2, Some(&flag));
+        assert!(cancel_res.is_err(), "Must abort when cancel_flag is true");
     }
 }
