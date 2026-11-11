@@ -379,15 +379,13 @@ impl ChainState {
                 ChainError::State("reorg fork block not found on current chain".into())
             })? as u64;
 
-        let backup_tip = self.tip_height().unwrap_or(0);
-        self.rollback_to(fork_height)?;
+        let mut candidate = self.clone();
+        candidate.rollback_to(fork_height)?;
 
         for b in new_branch {
-            if let Err(e) = self.apply_block(b) {
-                let _ = self.rollback_to(backup_tip);
-                return Err(e);
-            }
+            candidate.apply_block(b)?;
         }
+        *self = candidate;
         Ok(())
     }
 

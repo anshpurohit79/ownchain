@@ -22,6 +22,7 @@ use crate::genesis::genesis_block;
 use crate::hash::Hash;
 use crate::mempool::{Mempool, MempoolError};
 use crate::node::config::NodeConfig;
+use crate::p2p::handshake::HandshakeMessage;
 use crate::p2p::identity::{load_or_generate_identity, peer_id_from_keypair};
 use crate::p2p::network::{NetworkEvent, NetworkHandle, NetworkService, PeerInfo};
 use crate::p2p::protocol::{
@@ -34,6 +35,60 @@ use crate::validation::ValidationError;
 pub const MAX_ORPHAN_BLOCKS: usize = 100;
 /// Maximum cumulative bytes of serialized orphan blocks held in memory (5 MB).
 pub const MAX_ORPHAN_BYTES: usize = 5 * 1024 * 1024;
+
+/// Outcome of processing an inbound block in the runtime actor loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockProcessingOutcome {
+    /// The block extended or reorganized the active chain, advancing or changing the canonical tip.
+    ActiveChainAccepted(Hash),
+    /// The block is consensus-valid and stored as a side-branch block (active tip unchanged).
+    SideBranchPersisted(Hash),
+    /// The block was ignored (e.g. already known) or placed in the orphan pool without storage.
+    Ignored,
+}
+
+impl BlockProcessingOutcome {
+    /// Returns the persisted block ID if the block was durably stored (either as the active tip
+    /// or on a valid side branch), signaling that waiting orphan children may be retried.
+    pub fn persisted_block_id(&self) -> Option<Hash> {
+        match self {
+            BlockProcessingOutcome::ActiveChainAccepted(id)
+            | BlockProcessingOutcome::SideBranchPersisted(id) => Some(*id),
+            BlockProcessingOutcome::Ignored => None,
+        }
+    }
+}
+
+/// Evaluates whether a candidate branch wins fork choice against the active chain according to
+/// `docs/protocol-v1.md` Section 4:
+/// 1. Candidate cumulative work > active cumulative work -> candidate wins.
+/// 2. Candidate cumulative work < active cumulative work -> active chain retained.
+/// 3. Equal cumulative work -> compare the complete ordered block-ID sequences from genesis.
+///    At the first differing height, candidate wins if its block ID is lexicographically smaller.
+pub fn candidate_wins_fork_choice(
+    candidate_work: U256,
+    candidate_blocks: &[Block],
+    active_work: U256,
+    active_blocks: &[Block],
+) -> bool {
+    if candidate_work > active_work {
+        return true;
+    }
+    if candidate_work < active_work {
+        return false;
+    }
+
+    let min_len = candidate_blocks.len().min(active_blocks.len());
+    for i in 0..min_len {
+        let cand_id = candidate_blocks[i].block_id();
+        let act_id = active_blocks[i].block_id();
+        if cand_id != act_id {
+            return cand_id < act_id;
+        }
+    }
+
+    false
+}
 
 /// Runtime errors encountered during node lifecycle operations.
 #[derive(Debug)]
@@ -217,6 +272,10 @@ pub enum NodeCommand {
         peer_tip_height: u64,
         respond_to: oneshot::Sender<Result<(), String>>,
     },
+    ReevaluateStoredBranch {
+        tip_block_id: Hash,
+        respond_to: oneshot::Sender<Result<BlockProcessingOutcome, String>>,
+    },
     Stop {
         respond_to: oneshot::Sender<()>,
     },
@@ -361,6 +420,22 @@ impl NodeHandle {
             .map_err(|_| "Node runtime dropped response".to_string())?
     }
 
+    pub async fn reevaluate_stored_branch(
+        &self,
+        tip_block_id: Hash,
+    ) -> Result<BlockProcessingOutcome, String> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(NodeCommand::ReevaluateStoredBranch {
+                tip_block_id,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|_| "Node runtime has shut down".to_string())?;
+        rx.await
+            .map_err(|_| "Node runtime dropped response".to_string())?
+    }
+
     pub async fn stop(&self) {
         let (tx, rx) = oneshot::channel();
         if self
@@ -403,6 +478,7 @@ pub struct NodeRuntime {
     orphan_parents: HashMap<Hash, Vec<Hash>>,
     orphan_order: VecDeque<Hash>,
     orphan_bytes: usize,
+    evaluated_side_branches: HashMap<Hash, Hash>,
 }
 
 impl NodeRuntime {
@@ -488,6 +564,7 @@ impl NodeRuntime {
             orphan_parents: HashMap::new(),
             orphan_order: VecDeque::new(),
             orphan_bytes: 0,
+            evaluated_side_branches: HashMap::new(),
         })
     }
 
@@ -558,6 +635,14 @@ impl NodeRuntime {
 
     pub fn orphan_bytes(&self) -> usize {
         self.orphan_bytes
+    }
+
+    pub fn evaluated_side_branch_count(&self) -> usize {
+        self.evaluated_side_branches.len()
+    }
+
+    pub fn is_side_branch_evaluated(&self, side_tip: &Hash) -> bool {
+        self.evaluated_side_branches.contains_key(side_tip)
     }
 
     fn add_orphan(&mut self, block_id: Hash, block: Block, source_peer: PeerId) {
@@ -1094,6 +1179,10 @@ impl NodeRuntime {
                         Some(NodeCommand::SyncWithPeer { peer_id, peer_tip_height, respond_to }) => {
                             self.start_sync(peer_id, peer_tip_height, Some(respond_to));
                         }
+                        Some(NodeCommand::ReevaluateStoredBranch { tip_block_id, respond_to }) => {
+                            let res = self.reevaluate_stored_branch(tip_block_id).await;
+                            let _ = respond_to.send(res);
+                        }
                         Some(NodeCommand::Stop { respond_to }) => {
                             stop_responder = Some(respond_to);
                             break;
@@ -1201,25 +1290,197 @@ impl NodeRuntime {
         tracing::info!("Node runtime cleanly shut down");
     }
 
+    /// Determines whether an advertised handshake corresponds to an already-stored
+    /// side-branch block that is eligible for local re-evaluation against the active chain.
+    ///
+    /// Does not gate on peer-advertised cumulative work; the local node re-evaluates
+    /// any locally stored inactive block against the active chain using authoritative
+    /// local block validation and cumulative work calculation.
+    pub fn should_reevaluate_stored_side_branch(&self, handshake: &HandshakeMessage) -> bool {
+        // Advertised tip is our active tip -> already active, no reevaluation needed
+        if handshake.tip_block_id == self.tip_block_id() {
+            return false;
+        }
+
+        // Avoid repeated re-evaluations: check if this tip was already evaluated against our current active tip
+        if self.evaluated_side_branches.get(&handshake.tip_block_id) == Some(&self.tip_block_id()) {
+            return false;
+        }
+
+        // Check if the block is stored in our database as an inactive side-branch block
+        match self.storage.get_block_metadata(&handshake.tip_block_id) {
+            Ok(Some(meta)) => !meta.is_active,
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(
+                    "Storage error checking metadata for {}: {}",
+                    handshake.tip_block_id,
+                    e
+                );
+                false
+            }
+        }
+    }
+
+    /// Re-evaluates an already-stored side branch identified by `tip_block_id` against the active chain.
+    pub async fn reevaluate_stored_branch(
+        &mut self,
+        tip_block_id: Hash,
+    ) -> Result<BlockProcessingOutcome, String> {
+        let peer_id = self.peer_id;
+        self.reevaluate_stored_side_branch(peer_id, tip_block_id)
+            .await
+    }
+
+    /// Re-evaluates an already-stored side branch against the current active chain.
+    ///
+    /// Reconstructs the complete candidate branch from its common ancestor using locally stored blocks,
+    /// validates every block, recalculates cumulative work, and applies protocol Section 4 fork choice.
+    /// If the stored branch wins, reorganizes the active chain.
+    /// If it loses, preserves the active chain and caches the decision.
+    pub async fn reevaluate_stored_side_branch(
+        &mut self,
+        source_peer: PeerId,
+        tip_block_id: Hash,
+    ) -> Result<BlockProcessingOutcome, String> {
+        let current_active_tip = self.tip_block_id();
+        if tip_block_id == current_active_tip {
+            return Ok(BlockProcessingOutcome::Ignored);
+        }
+
+        let meta = self
+            .storage
+            .get_block_metadata(&tip_block_id)
+            .map_err(|e| format!("storage error retrieving metadata for {tip_block_id}: {e}"))?
+            .ok_or_else(|| format!("block {tip_block_id} not found in storage"))?;
+
+        if meta.is_active {
+            return Ok(BlockProcessingOutcome::Ignored);
+        }
+
+        if self.evaluated_side_branches.get(&tip_block_id) == Some(&current_active_tip) {
+            return Ok(BlockProcessingOutcome::SideBranchPersisted(tip_block_id));
+        }
+
+        let tip_block = self
+            .storage
+            .get_block(&tip_block_id)
+            .map_err(|e| format!("storage error retrieving block {tip_block_id}: {e}"))?
+            .ok_or_else(|| format!("block {tip_block_id} not found in storage"))?;
+
+        let outcome = self
+            .evaluate_competing_branch(source_peer, tip_block)
+            .await?;
+
+        // Wake any orphan children that were waiting for this side-branch block
+        if let Some(new_id) = outcome.persisted_block_id() {
+            if let Some(orphan_ids) = self.orphan_parents.remove(&new_id) {
+                for child_id in orphan_ids {
+                    if let Some(child_entry) = self.remove_orphan(&child_id) {
+                        if let Err(e) = self
+                            .handle_inbound_block(
+                                child_entry.source_peer,
+                                Box::new(child_entry.block),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                child_block_id = %child_id,
+                                parent_block_id = %new_id,
+                                source_peer = %child_entry.source_peer,
+                                error = %e,
+                                "Failed to process unrolled orphan child block after stored branch reevaluation"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(outcome)
+    }
+
+    /// Checks whether a peer is eligible for network synchronization (downloading blocks) under protocol rules:
+    /// - Higher work peers with tips not already stored locally are eligible.
+    /// - Equal work peers with unknown tips (not in storage) are eligible.
+    /// - Peers advertising the active tip or a stored block (active or side-branch) are NOT eligible for network sync
+    ///   (stored side branches are reevaluated locally via `should_reevaluate_stored_side_branch`).
+    /// - Lower work peers are not eligible.
+    /// - Storage errors are handled deliberately and return false.
+    pub fn is_peer_sync_eligible(&self, handshake: &HandshakeMessage) -> bool {
+        let local_work = self.cumulative_work();
+        if handshake.cumulative_work < local_work {
+            return false;
+        }
+
+        if handshake.tip_block_id == self.tip_block_id() {
+            return false;
+        }
+
+        // For both higher and equal work: if the tip is already stored locally,
+        // we do NOT initiate network synchronization to re-download blocks we already possess.
+        match self.storage.get_block_metadata(&handshake.tip_block_id) {
+            Ok(None) => true,
+            Ok(Some(_)) => false,
+            Err(e) => {
+                tracing::warn!(
+                    "Storage error checking candidate tip {}: {}",
+                    handshake.tip_block_id,
+                    e
+                );
+                false
+            }
+        }
+    }
+
     async fn check_sync(&mut self) {
         if self.active_sync.is_some() {
             return;
         }
 
         if let Ok(peers) = self.network_handle.get_connected_peers().await {
-            let mut best_peer = None;
-            let mut best_work = self.cumulative_work();
-
-            for p in peers {
+            // First check if any connected peer advertises a stored side branch that should be reevaluated
+            for p in &peers {
                 if let Some(ref hs) = p.handshake {
-                    if hs.cumulative_work > best_work {
-                        best_work = hs.cumulative_work;
-                        best_peer = Some((p.peer_id, hs.tip_height));
+                    if self.should_reevaluate_stored_side_branch(hs) {
+                        if let Err(e) = self
+                            .reevaluate_stored_side_branch(p.peer_id, hs.tip_block_id)
+                            .await
+                        {
+                            tracing::warn!(
+                                "Re-evaluation of stored side branch {} failed: {}",
+                                hs.tip_block_id,
+                                e
+                            );
+                        }
                     }
                 }
             }
 
-            if let Some((peer_id, peer_height)) = best_peer {
+            let local_work = self.cumulative_work();
+            let mut best_peer = None;
+            let mut best_work = local_work;
+            let mut equal_work_peer = None;
+
+            for p in peers {
+                if let Some(ref hs) = p.handshake {
+                    if !self.is_peer_sync_eligible(hs) {
+                        continue;
+                    }
+                    if hs.cumulative_work > best_work {
+                        best_work = hs.cumulative_work;
+                        best_peer = Some((p.peer_id, hs.tip_height));
+                    } else if hs.cumulative_work == local_work
+                        && best_peer.is_none()
+                        && equal_work_peer.is_none()
+                    {
+                        equal_work_peer = Some((p.peer_id, hs.tip_height));
+                    }
+                }
+            }
+
+            let target_peer = best_peer.or(equal_work_peer);
+            if let Some((peer_id, peer_height)) = target_peer {
                 self.start_sync(peer_id, peer_height, None);
             }
         }
@@ -1913,7 +2174,18 @@ impl NodeRuntime {
                     handshake.tip_block_id,
                     handshake.cumulative_work
                 );
-                if handshake.cumulative_work > self.cumulative_work() {
+                if self.should_reevaluate_stored_side_branch(&handshake) {
+                    if let Err(e) = self
+                        .reevaluate_stored_side_branch(peer_id, handshake.tip_block_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            "Re-evaluation of stored side branch {} failed: {}",
+                            handshake.tip_block_id,
+                            e
+                        );
+                    }
+                } else if self.is_peer_sync_eligible(&handshake) {
                     self.start_sync(peer_id, handshake.tip_height, None);
                 }
             }
@@ -2065,14 +2337,13 @@ impl NodeRuntime {
         queue.push_back((source_peer, block));
 
         while let Some((peer, curr_block)) = queue.pop_front() {
-            let (accepted_id, missing_parents) =
-                self.process_single_block(peer, curr_block).await?;
+            let (outcome, missing_parents) = self.process_single_block(peer, curr_block).await?;
 
             for parent_block in missing_parents {
                 queue.push_back((peer, Box::new(parent_block)));
             }
 
-            if let Some(new_id) = accepted_id {
+            if let Some(new_id) = outcome.persisted_block_id() {
                 if let Some(orphan_ids) = self.orphan_parents.remove(&new_id) {
                     for child_id in orphan_ids {
                         if let Some(child_entry) = self.remove_orphan(&child_id) {
@@ -2090,19 +2361,43 @@ impl NodeRuntime {
         &mut self,
         source_peer: PeerId,
         block: Box<Block>,
-    ) -> Result<(Option<Hash>, Vec<Block>), String> {
+    ) -> Result<(BlockProcessingOutcome, Vec<Block>), String> {
         let block_id = block.header.block_id();
         let height = block.header.height;
         let parent_id = block.header.parent_block_id;
 
-        // 1. Ignore if block is already known in storage
-        if self.storage.has_block(&block_id).unwrap_or(false) {
-            return Ok((None, Vec::new()));
+        // 1. Check if block is already known in storage
+        let meta_opt = self
+            .storage
+            .get_block_metadata(&block_id)
+            .map_err(|e| format!("storage error checking block metadata {block_id}: {e}"))?;
+
+        if let Some(meta) = meta_opt {
+            if meta.is_active {
+                // Block is already on the active canonical chain
+                return Ok((BlockProcessingOutcome::Ignored, Vec::new()));
+            }
+
+            // Block is in storage as an inactive side branch.
+            // If it was already evaluated against our current active tip and lost, ignore it.
+            if self.evaluated_side_branches.get(&block_id) == Some(&self.tip_block_id()) {
+                return Ok((
+                    BlockProcessingOutcome::SideBranchPersisted(block_id),
+                    Vec::new(),
+                ));
+            }
+
+            // Otherwise, evaluate this stored side branch against the current active chain.
+            let outcome = self.evaluate_competing_branch(source_peer, *block).await?;
+            return Ok((outcome, Vec::new()));
         }
 
         // 2. Missing parent check: if parent is unknown and not genesis, treat as orphan
-        let parent_exists =
-            parent_id.is_zero() || self.storage.has_block(&parent_id).unwrap_or(false);
+        let parent_exists = parent_id.is_zero()
+            || self
+                .storage
+                .has_block(&parent_id)
+                .map_err(|e| format!("storage error checking parent {parent_id}: {e}"))?;
         if !parent_exists {
             tracing::debug!(
                 "Received orphan block #{} ({}), parent {} unknown. Requesting parent from {}",
@@ -2114,7 +2409,7 @@ impl NodeRuntime {
 
             self.add_orphan(block_id, *block, source_peer);
             self.trigger_missing_parent_recovery(parent_id, block_id, source_peer);
-            return Ok((None, Vec::new()));
+            return Ok((BlockProcessingOutcome::Ignored, Vec::new()));
         }
 
         // 3. Case A: Block directly extends current active tip
@@ -2133,6 +2428,9 @@ impl NodeRuntime {
 
             // Replace in-memory active state ONLY after durable persistence succeeds
             self.chain_state = candidate_state;
+
+            // Invalidate evaluated side-branches cache because the active canonical tip has changed
+            self.evaluated_side_branches.clear();
 
             // Update mempool: remove included transactions and revalidate pending
             self.mempool.on_block_accepted(&block, &self.chain_state);
@@ -2153,21 +2451,25 @@ impl NodeRuntime {
                 new_work
             );
 
-            return Ok((Some(block_id), Vec::new()));
+            return Ok((
+                BlockProcessingOutcome::ActiveChainAccepted(block_id),
+                Vec::new(),
+            ));
         }
 
         // 4. Case B: Competing branch / reorganization evaluation
-        let res = self.evaluate_competing_branch(source_peer, *block).await?;
-        Ok((res, Vec::new()))
+        let outcome = self.evaluate_competing_branch(source_peer, *block).await?;
+        Ok((outcome, Vec::new()))
     }
 
     /// Evaluates a competing branch block, checking whether it leads to a reorganization
-    /// based on strictly higher cumulative proof-of-work.
+    /// according to protocol Section 4 fork choice (greater cumulative work, or equal work with lexicographically
+    /// smaller block-ID sequence from genesis at the first differing height).
     async fn evaluate_competing_branch(
         &mut self,
         _source_peer: PeerId,
         block: Block,
-    ) -> Result<Option<Hash>, String> {
+    ) -> Result<BlockProcessingOutcome, String> {
         let block_id = block.header.block_id();
 
         // Trace backward from `block` to find the common ancestor with the active chain
@@ -2176,23 +2478,30 @@ impl NodeRuntime {
 
         while !curr_parent.is_zero() {
             // Check if curr_parent is on the active chain
-            if let Ok(Some(meta)) = self.storage.get_block_metadata(&curr_parent) {
+            let meta_opt = self
+                .storage
+                .get_block_metadata(&curr_parent)
+                .map_err(|e| format!("storage error retrieving metadata for {curr_parent}: {e}"))?;
+            if let Some(meta) = meta_opt {
                 if meta.is_active {
                     // Found common ancestor!
                     break;
                 }
                 // Fetch next ancestor on branch
-                if let Ok(Some(ancestor_block)) = self.storage.get_block(&curr_parent) {
+                if let Some(ancestor_block) = self.storage.get_block(&curr_parent).map_err(|e| {
+                    format!("storage error retrieving ancestor block {curr_parent}: {e}")
+                })? {
                     curr_parent = ancestor_block.header.parent_block_id;
                     branch_blocks.push(ancestor_block);
                 } else {
-                    // Missing middle block on branch
-                    let _ = self.storage.store_branch_block(&block, U256::zero());
-                    return Ok(None);
+                    return Err(format!(
+                        "missing intermediate branch block {curr_parent} in storage"
+                    ));
                 }
             } else {
-                let _ = self.storage.store_branch_block(&block, U256::zero());
-                return Ok(None);
+                return Err(format!(
+                    "missing ancestor metadata for {curr_parent} in storage"
+                ));
             }
         }
 
@@ -2233,7 +2542,10 @@ impl NodeRuntime {
                     e
                 );
                 // Do not persist invalid branch block
-                return Ok(None);
+                return Err(format!(
+                    "branch block #{} validation failed: {e}",
+                    branch_b.header.height
+                ));
             }
             branch_works.push(branch_state.cumulative_work());
         }
@@ -2241,11 +2553,16 @@ impl NodeRuntime {
         let branch_work = branch_state.cumulative_work();
         let active_work = self.chain_state.cumulative_work();
 
-        // Protocol rule: Reorganize ONLY if competing branch cumulative proof-of-work is STRICTLY greater.
-        // Equal-work branches must not trigger reorganization (first-seen incumbent rule).
-        if branch_work > active_work {
+        let candidate_wins = candidate_wins_fork_choice(
+            branch_work,
+            branch_state.blocks(),
+            active_work,
+            self.chain_state.blocks(),
+        );
+
+        if candidate_wins {
             tracing::warn!(
-                "Reorganizing active chain! New branch tip: #{} ({}) with work {:?}, surpassing active work {:?}",
+                "Reorganizing active chain! New branch tip: #{} ({}) with work {:?}, defeating active work {:?}",
                 branch_state.tip_height().unwrap_or(0),
                 branch_state.tip_block_id().unwrap_or(Hash::ZERO),
                 branch_work,
@@ -2261,6 +2578,7 @@ impl NodeRuntime {
 
             // Replace active chain state in memory
             self.chain_state = branch_state;
+            self.evaluated_side_branches.clear();
 
             // Revalidate mempool after reorganization
             self.mempool.on_reorganization(&self.chain_state);
@@ -2276,18 +2594,22 @@ impl NodeRuntime {
             // Broadcast new tip
             let _ = self.network_handle.broadcast_block(block.clone()).await;
 
-            Ok(Some(block_id))
+            Ok(BlockProcessingOutcome::ActiveChainAccepted(block_id))
         } else {
-            // Equal or less work: retain current active chain, record branch block
-            let _ = self.storage.store_branch_block(&block, branch_work);
+            // Retain current active chain, record branch block
+            self.storage
+                .store_branch_block(&block, branch_work)
+                .map_err(|e| format!("failed to store branch block {block_id}: {e}"))?;
+            let active_tip = self.chain_state.tip_block_id().unwrap_or(Hash::ZERO);
+            self.evaluated_side_branches.insert(block_id, active_tip);
             tracing::debug!(
-                "Stored side-branch block #{} ({}). Branch work {:?} <= active work {:?}",
+                "Stored side-branch block #{} ({}). Branch work {:?}, active work {:?}",
                 block.header.height,
                 block_id,
                 branch_work,
                 active_work
             );
-            Ok(None)
+            Ok(BlockProcessingOutcome::SideBranchPersisted(block_id))
         }
     }
 }

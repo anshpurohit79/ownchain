@@ -22,6 +22,8 @@
 //! 19. Successful subsequent reorganization after synchronization.
 //! 20. Bounded orphan block pool and FIFO eviction.
 //! 21. Rejection of oversized frames (>2,100,000 bytes) before allocating memory.
+//! 22. Equal-work peer convergence over the real network (Section 4 tie-break).
+//! 23. Side-branch orphan recovery (retrying waiting orphans when parent is persisted as side branch).
 
 use std::time::{Duration, Instant};
 
@@ -38,10 +40,16 @@ use ownchain::genesis::{genesis_block, DEVNET, GENESIS_TIMESTAMP};
 use ownchain::hash::{self, Hash};
 use ownchain::header::Header;
 use ownchain::merkle;
-use ownchain::node::{NodeConfig, NodeHandle, NodeRuntime, NodeStatus};
+use ownchain::node::{
+    candidate_wins_fork_choice, BlockProcessingOutcome, NodeConfig, NodeHandle, NodeRuntime,
+    NodeStatus,
+};
 use ownchain::orchard_root::empty_commitment_root;
 use ownchain::p2p::framing::{decode_frame_slice, FramingError, MAX_FRAME_LENGTH};
-use ownchain::p2p::{NetworkEvent, NetworkService, SyncRequest, SyncResponse};
+use ownchain::p2p::{
+    HandshakeMessage, NetworkEvent, NetworkService, SyncRequest, SyncResponse,
+    HANDSHAKE_PROTOCOL_VERSION,
+};
 
 #[derive(Clone)]
 struct TestKeypair {
@@ -739,9 +747,20 @@ async fn test_competing_branch_reorganization_and_invalid_ancestor() {
     let b_b2 = make_hybrid_block(&branch_state, GENESIS_TIMESTAMP + 240, vec![cb_b2]);
     branch_state.apply_block(&b_b2).unwrap();
 
-    // Equal-work competing block (b_b1) is stored as side branch; active chain retained
+    // Section 4 fork choice: this submission has cumulative work 1 == 1 (equal work).
+    // The tie-break compares the block-ID sequences from genesis at the first
+    // differing height (height 1: b_a1 vs b_b1) and elects the lexicographically
+    // smaller block ID, regardless of submission order.
+    let b_a1_id = b_a1.header.block_id();
+    let b_b1_id = b_b1.header.block_id();
+    let equal_work_winner_id = if b_b1_id < b_a1_id { b_b1_id } else { b_a1_id };
     runtime.submit_block(b_b1.clone()).await.unwrap();
-    assert_eq!(runtime.tip_block_id(), b_a1.header.block_id());
+    assert_eq!(
+        runtime.tip_block_id(),
+        equal_work_winner_id,
+        "Section 4: equal cumulative work must select the lexicographically smaller block-ID sequence \
+         from genesis, not the first-seen branch"
+    );
 
     // Second block makes Branch B strictly heavier -> triggers reorganization
     runtime.submit_block(b_b2.clone()).await.unwrap();
@@ -932,13 +951,29 @@ async fn test_lower_height_and_same_height_higher_work_reorganization() {
 
     assert_eq!(state_a_extend.cumulative_work(), U256::from_u128(20));
 
-    // Submit block 19: work is 19 == 19 (equal work does NOT reorg due to incumbent rule)
+    // Submit block 19: work is 19 == 19 (equal work). Protocol Section 4 breaks the
+    // tie by comparing the block-ID sequences from genesis at the first
+    // differing height — here height 1, Branch B's first block vs Branch A's
+    // first block. The lexicographically smaller sequence wins regardless of
+    // submission order; height alone never decides an equal-work tie.
+    let branch_b_smaller =
+        branch_b_blocks[0].header.block_id() < branch_a_blocks[0].header.block_id();
     runtime.submit_block(b19).await.unwrap();
-    assert_eq!(
-        runtime.tip_height(),
-        17,
-        "Incumbent branch B must be retained on equal work"
-    );
+    if branch_b_smaller {
+        assert_eq!(
+            runtime.tip_height(),
+            17,
+            "Branch B wins the Section 4 tie-break at the first differing height and is retained \
+             until strictly heavier work arrives"
+        );
+    } else {
+        assert_eq!(
+            runtime.tip_height(),
+            19,
+            "Section 4: Branch A extension wins the equal-work tie-break at the first differing height \
+             (its height-1 block ID is lexicographically smaller)"
+        );
+    }
 
     // Submit block 20: work is 20 > 19 -> triggers reorganization back to Branch A!
     runtime.submit_block(b20.clone()).await.unwrap();
@@ -2052,4 +2087,1184 @@ async fn test_real_p2p_shutdown_aborts_and_joins_active_sync() {
     })
     .await
     .expect("test timed out");
+}
+
+// -----------------------------------------------------------------------------
+// Test 19: Equal-Work P2P Convergence (Section 4 tie-break across the network)
+// -----------------------------------------------------------------------------
+
+/// Returns a nonce variant of `base` whose block ID satisfies `want_smaller`
+/// against `bound` (smaller than `bound` when `true`, larger when `false`).
+///
+/// At difficulty 1 every proof-of-work hash is accepted and the simulated
+/// composite state root is nonce-independent, so every variant is a fully
+/// valid block.
+fn nonce_variant_block(base: &Block, bound: Hash, want_smaller: bool) -> Block {
+    for nonce in 0u64..1024 {
+        let mut candidate = base.clone();
+        candidate.header.nonce = nonce;
+        let id = candidate.block_id();
+        let satisfies = if want_smaller { id < bound } else { id > bound };
+        if satisfies {
+            return candidate;
+        }
+    }
+    panic!(
+        "no nonce in 0..1024 produced a block ID {} than {bound:?}",
+        if want_smaller { "smaller" } else { "larger" }
+    );
+}
+
+#[tokio::test]
+async fn test_real_p2p_equal_work_convergence() {
+    tokio::time::timeout(Duration::from_secs(45), async {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+
+        let config_a = create_node_config(&dir_a);
+        let config_b = create_node_config(&dir_b);
+        let devnet_chain_id = config_a.chain_id;
+
+        let miner_a = TestKeypair::from_seed(1);
+        let miner_b = TestKeypair::from_seed(2);
+        let genesis = genesis_block(devnet_chain_id);
+
+        // Two equal-work branches fork at genesis: 2 difficulty-1 blocks each,
+        // so cumulative work is 2 on both sides. The height-1 IDs decide the
+        // Section 4 tie-break (a1 < b1). The height-2 tip IDs are deliberately ordered
+        // the opposite way (a2 > b2), so a fork choice that compared only final
+        // tip IDs would elect the wrong branch.
+        let mut state_a = ChainState::from_genesis(&genesis).unwrap();
+        let cb_a1 = make_coinbase(devnet_chain_id, 1, miner_a.address, 1_000_000_000);
+        let a1_base = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + 120, vec![cb_a1]);
+
+        let mut state_b = ChainState::from_genesis(&genesis).unwrap();
+        let cb_b1 = make_coinbase(devnet_chain_id, 1, miner_b.address, 1_000_000_000);
+        let b1 = make_hybrid_block(&state_b, GENESIS_TIMESTAMP + 120, vec![cb_b1]);
+
+        let a1 = nonce_variant_block(&a1_base, b1.block_id(), true);
+        assert!(
+            a1.block_id() < b1.block_id(),
+            "test construction: branch A must own the lexicographically smaller height-1 block ID"
+        );
+        state_a.apply_block(&a1).unwrap();
+        state_b.apply_block(&b1).unwrap();
+
+        let cb_a2 = make_coinbase(devnet_chain_id, 2, miner_a.address, 1_000_000_000);
+        let a2_base = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + 240, vec![cb_a2]);
+        let cb_b2 = make_coinbase(devnet_chain_id, 2, miner_b.address, 1_000_000_000);
+        let b2 = make_hybrid_block(&state_b, GENESIS_TIMESTAMP + 240, vec![cb_b2]);
+
+        let a2 = nonce_variant_block(&a2_base, b2.block_id(), false);
+        assert!(
+            a2.block_id() > b2.block_id(),
+            "test construction: tip IDs must oppose the deciding height-1 ordering"
+        );
+        state_a.apply_block(&a2).unwrap();
+        state_b.apply_block(&b2).unwrap();
+
+        // Equal cumulative work, distinct chains: this is a pure Section 4 tie-break.
+        assert_eq!(state_a.cumulative_work(), state_b.cumulative_work());
+        assert_eq!(state_a.cumulative_work(), U256::from_u128(2));
+        assert_ne!(
+            state_a.composite_state_root(),
+            state_b.composite_state_root()
+        );
+
+        let winner_tip_id = a2.block_id();
+        let winner_state_root = state_a.composite_state_root();
+
+        // Node A starts on the Section 4-winning branch; Node B starts on the
+        // equal-work loser.
+        let mut runtime_a = NodeRuntime::init(config_a).unwrap();
+        runtime_a.submit_block(a1.clone()).await.unwrap();
+        runtime_a.submit_block(a2.clone()).await.unwrap();
+
+        let mut runtime_b = NodeRuntime::init(config_b).unwrap();
+        runtime_b.submit_block(b1.clone()).await.unwrap();
+        runtime_b.submit_block(b2.clone()).await.unwrap();
+
+        assert_eq!(runtime_a.tip_block_id(), winner_tip_id);
+        assert_eq!(runtime_a.cumulative_work(), runtime_b.cumulative_work());
+        assert_eq!(runtime_b.tip_block_id(), b2.block_id());
+
+        // Start both node actors.
+        let (handle_a, _task_a) = runtime_a.spawn_actor();
+        let (handle_b, _task_b) = runtime_b.spawn_actor();
+
+        // Connect through the real libp2p transport and wait for the
+        // handshake on both sides.
+        let addr_a = wait_for_listen_addr(&handle_a).await;
+        handle_b.dial_peer(addr_a).await.unwrap();
+        wait_for_peer_handshake(&handle_b, handle_a.peer_id()).await;
+        wait_for_peer_handshake(&handle_a, handle_b.peer_id()).await;
+
+        // Both peers advertised equal work over the handshake. This is exactly
+        // the network-level condition under which synchronization must still
+        // run: neither the handshake handler (runtime.rs:1916) nor periodic
+        // peer selection (runtime.rs:1211-1218) starts a sync on equal work,
+        // because both compare with a strict `>`.
+        let peers_a = handle_a.get_connected_peers().await.unwrap();
+        let remote_b = peers_a
+            .iter()
+            .find(|p| p.peer_id == handle_b.peer_id())
+            .and_then(|p| p.handshake.as_ref())
+            .expect("node A must have verified node B's handshake");
+        assert_eq!(remote_b.cumulative_work, U256::from_u128(2));
+        assert_eq!(remote_b.tip_block_id, b2.block_id());
+
+        let peers_b = handle_b.get_connected_peers().await.unwrap();
+        let remote_a = peers_b
+            .iter()
+            .find(|p| p.peer_id == handle_a.peer_id())
+            .and_then(|p| p.handshake.as_ref())
+            .expect("node B must have verified node A's handshake");
+        assert_eq!(remote_a.cumulative_work, U256::from_u128(2));
+        assert_eq!(remote_a.tip_block_id, winner_tip_id);
+
+        // Wait for Section 4 convergence. The periodic 500 ms peer-selection pass runs
+        // many times inside this window.
+        let timeout = Duration::from_secs(12);
+        let start = Instant::now();
+        loop {
+            let status_a = handle_a.status().await.unwrap();
+            let status_b = handle_b.status().await.unwrap();
+            if status_a.tip_block_id == winner_tip_id
+                && status_b.tip_block_id == winner_tip_id
+                && status_a.tip_height == 2
+                && status_b.tip_height == 2
+                && status_a.cumulative_work == U256::from_u128(2)
+                && status_b.cumulative_work == U256::from_u128(2)
+                && status_a.composite_state_root == winner_state_root
+                && status_b.composite_state_root == winner_state_root
+            {
+                break;
+            }
+            if start.elapsed() > timeout {
+                panic!(
+                    "Timed out waiting for equal-work P2P convergence (Section 4): peers never \
+                     exchanged their equal-work branches.\n\
+                     node A: tip #{} {} work {:?} root {}\n\
+                     node B: tip #{} {} work {:?} root {}\n\
+                     expected Section 4 winner: tip #2 {} work {:?} root {}\n\
+                     A->B handshake work: {:?}; B->A handshake work: {:?}",
+                    status_a.tip_height,
+                    status_a.tip_block_id,
+                    status_a.cumulative_work,
+                    status_a.composite_state_root,
+                    status_b.tip_height,
+                    status_b.tip_block_id,
+                    status_b.cumulative_work,
+                    status_b.composite_state_root,
+                    winner_tip_id,
+                    U256::from_u128(2),
+                    winner_state_root,
+                    remote_b.cumulative_work,
+                    remote_a.cumulative_work,
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Both nodes must converge on the same tip block ID, height,
+        // cumulative work, and composite state root.
+        let final_a = handle_a.status().await.unwrap();
+        let final_b = handle_b.status().await.unwrap();
+        assert_eq!(final_a.tip_block_id, final_b.tip_block_id);
+        assert_eq!(final_a.tip_height, final_b.tip_height);
+        assert_eq!(final_a.tip_height, 2);
+        assert_eq!(final_a.cumulative_work, final_b.cumulative_work);
+        assert_eq!(final_a.cumulative_work, U256::from_u128(2));
+        assert_eq!(final_a.composite_state_root, final_b.composite_state_root);
+        assert_eq!(final_a.tip_block_id, winner_tip_id);
+        assert_eq!(final_a.composite_state_root, winner_state_root);
+
+        handle_a.stop().await;
+        handle_b.stop().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+// -----------------------------------------------------------------------------
+// Test 20: Side-Branch Orphan Recovery
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_side_branch_orphan_recovery() {
+    let dir = TempDir::new().unwrap();
+    let mut runtime = NodeRuntime::init(create_node_config(&dir)).unwrap();
+    let devnet_chain_id = runtime.chain_state().chain_id();
+    let miner_a = TestKeypair::from_seed(10);
+    let miner_b = TestKeypair::from_seed(20);
+
+    // 1. Establish an active chain with 3 blocks (tip height 3, work 3).
+    let cb_a1 = make_coinbase(devnet_chain_id, 1, miner_a.address, 1_000_000_000);
+    let b_a1 = make_hybrid_block(runtime.chain_state(), GENESIS_TIMESTAMP + 120, vec![cb_a1]);
+    runtime.submit_block(b_a1.clone()).await.unwrap();
+
+    let cb_a2 = make_coinbase(devnet_chain_id, 2, miner_a.address, 1_000_000_000);
+    let b_a2 = make_hybrid_block(runtime.chain_state(), GENESIS_TIMESTAMP + 240, vec![cb_a2]);
+    runtime.submit_block(b_a2.clone()).await.unwrap();
+
+    let cb_a3 = make_coinbase(devnet_chain_id, 3, miner_a.address, 1_000_000_000);
+    let b_a3 = make_hybrid_block(runtime.chain_state(), GENESIS_TIMESTAMP + 360, vec![cb_a3]);
+    runtime.submit_block(b_a3.clone()).await.unwrap();
+
+    assert_eq!(runtime.tip_height(), 3);
+    assert_eq!(runtime.tip_block_id(), b_a3.block_id());
+    assert_eq!(runtime.cumulative_work(), U256::from_u128(3));
+
+    // 2. Construct valid competing side branch: b_b1 (height 1) and b_b2 (height 2).
+    // Ensure b_b1 has a block ID deterministically lexicographically larger than b_a1.
+    let genesis = genesis_block(devnet_chain_id);
+    let mut branch_b_state = ChainState::from_genesis(&genesis).unwrap();
+
+    let cb_b1 = make_coinbase(devnet_chain_id, 1, miner_b.address, 1_000_000_000);
+    let b_b1_base = make_hybrid_block(&branch_b_state, GENESIS_TIMESTAMP + 120, vec![cb_b1]);
+    let b_b1 = nonce_variant_block(&b_b1_base, b_a1.block_id(), false);
+    assert!(
+        b_b1.block_id() > b_a1.block_id(),
+        "b_b1 must be lexicographically larger than b_a1"
+    );
+    branch_b_state.apply_block(&b_b1).unwrap();
+
+    let cb_b2 = make_coinbase(devnet_chain_id, 2, miner_b.address, 1_000_000_000);
+    let b_b2 = make_hybrid_block(&branch_b_state, GENESIS_TIMESTAMP + 240, vec![cb_b2]);
+    branch_b_state.apply_block(&b_b2).unwrap();
+
+    // 3. Deliver child (b_b2) BEFORE parent (b_b1).
+    runtime.submit_block(b_b2.clone()).await.unwrap();
+
+    // 4. Confirm child is registered as an orphan and not yet in storage.
+    assert_eq!(runtime.orphan_count(), 1);
+    assert!(!runtime.storage().has_block(&b_b2.block_id()).unwrap());
+
+    // 5. Deliver side-branch parent (b_b1).
+    runtime.submit_block(b_b1.clone()).await.unwrap();
+
+    // 6. Confirm side-branch parent is persisted.
+    assert!(runtime.storage().has_block(&b_b1.block_id()).unwrap());
+
+    // 7. Confirm waiting orphan child (b_b2) is automatically retried and unrolled from orphan pool.
+    assert_eq!(runtime.orphan_count(), 0);
+
+    // 8. Confirm child is now persisted in storage.
+    assert!(runtime.storage().has_block(&b_b2.block_id()).unwrap());
+
+    // 9. Confirm active tip did NOT change because Branch B work (2) < active chain work (3).
+    assert_eq!(runtime.tip_height(), 3);
+    assert_eq!(runtime.tip_block_id(), b_a3.block_id());
+
+    // 10. Construct competing branch's height-3 block (b_b3).
+    let cb_b3 = make_coinbase(devnet_chain_id, 3, miner_b.address, 1_000_000_000);
+    let b_b3 = make_hybrid_block(&branch_b_state, GENESIS_TIMESTAMP + 360, vec![cb_b3]);
+    branch_b_state.apply_block(&b_b3).unwrap();
+
+    // 11. Assert that it loses the equal-work tie-break.
+    let active_blocks = vec![genesis.clone(), b_a1.clone(), b_a2.clone(), b_a3.clone()];
+    let candidate_blocks = vec![genesis.clone(), b_b1.clone(), b_b2.clone(), b_b3.clone()];
+    assert!(
+        !candidate_wins_fork_choice(
+            branch_b_state.cumulative_work(),
+            &candidate_blocks,
+            runtime.cumulative_work(),
+            &active_blocks,
+        ),
+        "Branch B must lose equal-work tie-break because b_b1 > b_a1 at first differing height"
+    );
+
+    // 12. Submit the competing branch's height-3 block.
+    runtime.submit_block(b_b3.clone()).await.unwrap();
+
+    // 13. Verify that it is persisted as a side branch and the active tip remains unchanged.
+    assert!(runtime.storage().has_block(&b_b3.block_id()).unwrap());
+    assert!(
+        !runtime
+            .storage()
+            .get_block_metadata(&b_b3.block_id())
+            .unwrap()
+            .unwrap()
+            .is_active
+    );
+    assert_eq!(runtime.tip_height(), 3);
+    assert_eq!(runtime.tip_block_id(), b_a3.block_id());
+    assert_eq!(runtime.cumulative_work(), U256::from_u128(3));
+
+    // 14. Construct the height-4 block on branch B, making Branch B heavier (work 4 > 3).
+    let cb_b4 = make_coinbase(devnet_chain_id, 4, miner_b.address, 1_000_000_000);
+    let b_b4 = make_hybrid_block(&branch_b_state, GENESIS_TIMESTAMP + 480, vec![cb_b4]);
+    branch_b_state.apply_block(&b_b4).unwrap();
+
+    // 15. Submit the height-4 block.
+    runtime.submit_block(b_b4.clone()).await.unwrap();
+
+    // 16. Verify that the branch reorganization completes and the heavier branch reorganizes the active chain.
+    assert_eq!(runtime.orphan_count(), 0);
+    assert!(
+        runtime
+            .storage()
+            .get_block_metadata(&b_b4.block_id())
+            .unwrap()
+            .unwrap()
+            .is_active
+    );
+
+    // 17. Assert the final tip, cumulative work, and composite state root.
+    assert_eq!(runtime.tip_height(), 4);
+    assert_eq!(runtime.tip_block_id(), b_b4.block_id());
+    assert_eq!(runtime.cumulative_work(), U256::from_u128(4));
+    assert_eq!(
+        runtime.chain_state().composite_state_root(),
+        branch_b_state.composite_state_root()
+    );
+}
+
+#[tokio::test]
+async fn test_side_branch_orphan_unroll_triggers_heavier_reorg() {
+    let dir = TempDir::new().unwrap();
+    let mut runtime = NodeRuntime::init(create_node_config(&dir)).unwrap();
+    let devnet_chain_id = runtime.chain_state().chain_id();
+    let miner_a = TestKeypair::from_seed(11);
+    let miner_b = TestKeypair::from_seed(22);
+
+    // 1. Establish an active chain with 3 blocks.
+    let cb_a1 = make_coinbase(devnet_chain_id, 1, miner_a.address, 1_000_000_000);
+    let b_a1 = make_hybrid_block(runtime.chain_state(), GENESIS_TIMESTAMP + 120, vec![cb_a1]);
+    runtime.submit_block(b_a1.clone()).await.unwrap();
+
+    let cb_a2 = make_coinbase(devnet_chain_id, 2, miner_a.address, 1_000_000_000);
+    let b_a2 = make_hybrid_block(runtime.chain_state(), GENESIS_TIMESTAMP + 240, vec![cb_a2]);
+    runtime.submit_block(b_a2.clone()).await.unwrap();
+
+    let cb_a3 = make_coinbase(devnet_chain_id, 3, miner_a.address, 1_000_000_000);
+    let b_a3 = make_hybrid_block(runtime.chain_state(), GENESIS_TIMESTAMP + 360, vec![cb_a3]);
+    runtime.submit_block(b_a3.clone()).await.unwrap();
+
+    // 2. Construct Branch B up to height 4, with b_b1 > b_a1 (loses tie-break at height 3).
+    let genesis = genesis_block(devnet_chain_id);
+    let mut branch_b_state = ChainState::from_genesis(&genesis).unwrap();
+
+    let cb_b1 = make_coinbase(devnet_chain_id, 1, miner_b.address, 1_000_000_000);
+    let b_b1_base = make_hybrid_block(&branch_b_state, GENESIS_TIMESTAMP + 120, vec![cb_b1]);
+    let b_b1 = nonce_variant_block(&b_b1_base, b_a1.block_id(), false);
+    assert!(b_b1.block_id() > b_a1.block_id());
+    branch_b_state.apply_block(&b_b1).unwrap();
+
+    let cb_b2 = make_coinbase(devnet_chain_id, 2, miner_b.address, 1_000_000_000);
+    let b_b2 = make_hybrid_block(&branch_b_state, GENESIS_TIMESTAMP + 240, vec![cb_b2]);
+    branch_b_state.apply_block(&b_b2).unwrap();
+
+    let cb_b3 = make_coinbase(devnet_chain_id, 3, miner_b.address, 1_000_000_000);
+    let b_b3 = make_hybrid_block(&branch_b_state, GENESIS_TIMESTAMP + 360, vec![cb_b3]);
+    branch_b_state.apply_block(&b_b3).unwrap();
+
+    let cb_b4 = make_coinbase(devnet_chain_id, 4, miner_b.address, 1_000_000_000);
+    let b_b4 = make_hybrid_block(&branch_b_state, GENESIS_TIMESTAMP + 480, vec![cb_b4]);
+    branch_b_state.apply_block(&b_b4).unwrap();
+
+    // Submit b_b1 and b_b2 as side-branch blocks
+    runtime.submit_block(b_b1.clone()).await.unwrap();
+    runtime.submit_block(b_b2.clone()).await.unwrap();
+    assert_eq!(runtime.tip_height(), 3);
+    assert_eq!(runtime.tip_block_id(), b_a3.block_id());
+
+    // Submit orphan child b_b4 BEFORE its parent b_b3
+    runtime.submit_block(b_b4.clone()).await.unwrap();
+    assert_eq!(runtime.orphan_count(), 1);
+    assert!(!runtime.storage().has_block(&b_b4.block_id()).unwrap());
+
+    // Submit parent b_b3: it loses the equal-work tie-break, persists as a side branch,
+    // and waking orphan child b_b4 completes recovery and reorganizes the chain!
+    runtime.submit_block(b_b3.clone()).await.unwrap();
+    assert_eq!(runtime.orphan_count(), 0);
+    assert_eq!(runtime.tip_height(), 4);
+    assert_eq!(runtime.tip_block_id(), b_b4.block_id());
+    assert_eq!(runtime.cumulative_work(), U256::from_u128(4));
+    assert_eq!(
+        runtime.chain_state().composite_state_root(),
+        branch_b_state.composite_state_root()
+    );
+}
+
+#[tokio::test]
+async fn test_stored_side_branch_reevaluation_wins_fork_choice() {
+    let dir = TempDir::new().unwrap();
+    let mut runtime = NodeRuntime::init(create_node_config(&dir)).unwrap();
+    let devnet_chain_id = runtime.chain_state().chain_id();
+    let miner_a = TestKeypair::from_seed(31);
+    let miner_b = TestKeypair::from_seed(32);
+
+    // 1. Establish Active Chain A with 2 blocks
+    let cb_a1 = make_coinbase(devnet_chain_id, 1, miner_a.address, 1_000_000_000);
+    let b_a1 = make_hybrid_block(runtime.chain_state(), GENESIS_TIMESTAMP + 120, vec![cb_a1]);
+    runtime.submit_block(b_a1.clone()).await.unwrap();
+
+    let cb_a2 = make_coinbase(devnet_chain_id, 2, miner_a.address, 1_000_000_000);
+    let b_a2 = make_hybrid_block(runtime.chain_state(), GENESIS_TIMESTAMP + 240, vec![cb_a2]);
+    runtime.submit_block(b_a2.clone()).await.unwrap();
+
+    assert_eq!(runtime.tip_height(), 2);
+    assert_eq!(runtime.tip_block_id(), b_a2.block_id());
+
+    // 2. Build Branch B where b_b1 < b_a1 (Branch B wins equal-work tie-break)
+    let genesis = genesis_block(devnet_chain_id);
+    let mut branch_b_state = ChainState::from_genesis(&genesis).unwrap();
+
+    let cb_b1 = make_coinbase(devnet_chain_id, 1, miner_b.address, 1_000_000_000);
+    let b_b1_base = make_hybrid_block(&branch_b_state, GENESIS_TIMESTAMP + 120, vec![cb_b1]);
+    let b_b1 = nonce_variant_block(&b_b1_base, b_a1.block_id(), true);
+    assert!(
+        b_b1.block_id() < b_a1.block_id(),
+        "b_b1 must be smaller to win tie-break"
+    );
+    branch_b_state.apply_block(&b_b1).unwrap();
+
+    let cb_b2 = make_coinbase(devnet_chain_id, 2, miner_b.address, 1_000_000_000);
+    let b_b2 = make_hybrid_block(&branch_b_state, GENESIS_TIMESTAMP + 240, vec![cb_b2]);
+    branch_b_state.apply_block(&b_b2).unwrap();
+
+    // 3. Store Branch B directly into storage as an inactive side branch
+    runtime
+        .storage()
+        .store_branch_block(&b_b1, U256::from_u128(1))
+        .unwrap();
+    runtime
+        .storage()
+        .store_branch_block(&b_b2, U256::from_u128(2))
+        .unwrap();
+
+    // Verify blocks are stored as inactive
+    let meta_b1 = runtime
+        .storage()
+        .get_block_metadata(&b_b1.block_id())
+        .unwrap()
+        .unwrap();
+    let meta_b2 = runtime
+        .storage()
+        .get_block_metadata(&b_b2.block_id())
+        .unwrap()
+        .unwrap();
+    assert!(!meta_b1.is_active);
+    assert!(!meta_b2.is_active);
+    assert_eq!(runtime.tip_block_id(), b_a2.block_id());
+
+    // 4. Peer advertises Branch B tip
+    let remote_peer = PeerId::random();
+    let handshake = HandshakeMessage {
+        protocol_version: HANDSHAKE_PROTOCOL_VERSION,
+        chain_id: devnet_chain_id,
+        genesis_hash: genesis.block_id(),
+        tip_height: 2,
+        tip_block_id: b_b2.block_id(),
+        cumulative_work: U256::from_u128(2),
+        capabilities: 0,
+        software_version: "test/1.0".to_string(),
+    };
+
+    // Stored side branch should be re-evaluated, not re-downloaded via network sync
+    assert!(runtime.should_reevaluate_stored_side_branch(&handshake));
+    assert!(!runtime.is_peer_sync_eligible(&handshake));
+
+    // 5. Re-evaluate stored side branch
+    let outcome = runtime
+        .reevaluate_stored_side_branch(remote_peer, b_b2.block_id())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        BlockProcessingOutcome::ActiveChainAccepted(b_b2.block_id())
+    );
+
+    // Active chain is now Branch B
+    assert_eq!(runtime.tip_height(), 2);
+    assert_eq!(runtime.tip_block_id(), b_b2.block_id());
+    assert_eq!(runtime.cumulative_work(), U256::from_u128(2));
+    assert_eq!(
+        runtime.chain_state().composite_state_root(),
+        branch_b_state.composite_state_root()
+    );
+
+    // Metadata in storage is updated: Branch B is active, Branch A is inactive
+    let meta_b2_now = runtime
+        .storage()
+        .get_block_metadata(&b_b2.block_id())
+        .unwrap()
+        .unwrap();
+    let meta_a2_now = runtime
+        .storage()
+        .get_block_metadata(&b_a2.block_id())
+        .unwrap()
+        .unwrap();
+    assert!(meta_b2_now.is_active);
+    assert!(!meta_a2_now.is_active);
+}
+
+#[tokio::test]
+async fn test_stored_side_branch_reevaluation_loses_and_prevents_loops() {
+    let dir = TempDir::new().unwrap();
+    let mut runtime = NodeRuntime::init(create_node_config(&dir)).unwrap();
+    let devnet_chain_id = runtime.chain_state().chain_id();
+    let miner_a = TestKeypair::from_seed(41);
+    let miner_b = TestKeypair::from_seed(42);
+
+    // 1. Establish Active Chain A with 2 blocks
+    let cb_a1 = make_coinbase(devnet_chain_id, 1, miner_a.address, 1_000_000_000);
+    let b_a1 = make_hybrid_block(runtime.chain_state(), GENESIS_TIMESTAMP + 120, vec![cb_a1]);
+    runtime.submit_block(b_a1.clone()).await.unwrap();
+
+    let cb_a2 = make_coinbase(devnet_chain_id, 2, miner_a.address, 1_000_000_000);
+    let b_a2 = make_hybrid_block(runtime.chain_state(), GENESIS_TIMESTAMP + 240, vec![cb_a2]);
+    runtime.submit_block(b_a2.clone()).await.unwrap();
+
+    // 2. Build Branch B where b_b1 > b_a1 (Branch B loses equal-work tie-break)
+    let genesis = genesis_block(devnet_chain_id);
+    let mut branch_b_state = ChainState::from_genesis(&genesis).unwrap();
+
+    let cb_b1 = make_coinbase(devnet_chain_id, 1, miner_b.address, 1_000_000_000);
+    let b_b1_base = make_hybrid_block(&branch_b_state, GENESIS_TIMESTAMP + 120, vec![cb_b1]);
+    let b_b1 = nonce_variant_block(&b_b1_base, b_a1.block_id(), false);
+    assert!(
+        b_b1.block_id() > b_a1.block_id(),
+        "b_b1 must be larger to lose tie-break"
+    );
+    branch_b_state.apply_block(&b_b1).unwrap();
+
+    let cb_b2 = make_coinbase(devnet_chain_id, 2, miner_b.address, 1_000_000_000);
+    let b_b2 = make_hybrid_block(&branch_b_state, GENESIS_TIMESTAMP + 240, vec![cb_b2]);
+    branch_b_state.apply_block(&b_b2).unwrap();
+
+    // Store Branch B in storage as inactive side branch
+    runtime
+        .storage()
+        .store_branch_block(&b_b1, U256::from_u128(1))
+        .unwrap();
+    runtime
+        .storage()
+        .store_branch_block(&b_b2, U256::from_u128(2))
+        .unwrap();
+
+    let remote_peer = PeerId::random();
+    let handshake = HandshakeMessage {
+        protocol_version: HANDSHAKE_PROTOCOL_VERSION,
+        chain_id: devnet_chain_id,
+        genesis_hash: genesis.block_id(),
+        tip_height: 2,
+        tip_block_id: b_b2.block_id(),
+        cumulative_work: U256::from_u128(2),
+        capabilities: 0,
+        software_version: "test/1.0".to_string(),
+    };
+
+    // First time: eligible for local re-evaluation, not network sync
+    assert!(runtime.should_reevaluate_stored_side_branch(&handshake));
+    assert!(!runtime.is_peer_sync_eligible(&handshake));
+
+    // Re-evaluate: loses tie-break, active chain preserved
+    let outcome = runtime
+        .reevaluate_stored_side_branch(remote_peer, b_b2.block_id())
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        BlockProcessingOutcome::SideBranchPersisted(b_b2.block_id())
+    );
+    assert_eq!(runtime.tip_block_id(), b_a2.block_id());
+
+    // Subsequent check with the same handshake must NOT re-evaluate again (loop prevention)
+    assert!(
+        !runtime.should_reevaluate_stored_side_branch(&handshake),
+        "Subsequent handshake must be suppressed by evaluated_side_branches cache"
+    );
+    assert!(
+        !runtime.is_peer_sync_eligible(&handshake),
+        "Equal-work stored block must not initiate network sync"
+    );
+}
+
+#[tokio::test]
+async fn test_stored_side_branch_resubmitted_via_single_block_reevaluates() {
+    let dir = TempDir::new().unwrap();
+    let mut runtime = NodeRuntime::init(create_node_config(&dir)).unwrap();
+    let devnet_chain_id = runtime.chain_state().chain_id();
+    let miner_a = TestKeypair::from_seed(51);
+    let miner_b = TestKeypair::from_seed(52);
+
+    // 1. Establish Active Chain A with 2 blocks
+    let cb_a1 = make_coinbase(devnet_chain_id, 1, miner_a.address, 1_000_000_000);
+    let b_a1 = make_hybrid_block(runtime.chain_state(), GENESIS_TIMESTAMP + 120, vec![cb_a1]);
+    runtime.submit_block(b_a1.clone()).await.unwrap();
+
+    let cb_a2 = make_coinbase(devnet_chain_id, 2, miner_a.address, 1_000_000_000);
+    let b_a2 = make_hybrid_block(runtime.chain_state(), GENESIS_TIMESTAMP + 240, vec![cb_a2]);
+    runtime.submit_block(b_a2.clone()).await.unwrap();
+
+    // 2. Build Branch B where b_b1 < b_a1 (Branch B wins equal-work tie-break)
+    let genesis = genesis_block(devnet_chain_id);
+    let mut branch_b_state = ChainState::from_genesis(&genesis).unwrap();
+
+    let cb_b1 = make_coinbase(devnet_chain_id, 1, miner_b.address, 1_000_000_000);
+    let b_b1_base = make_hybrid_block(&branch_b_state, GENESIS_TIMESTAMP + 120, vec![cb_b1]);
+    let b_b1 = nonce_variant_block(&b_b1_base, b_a1.block_id(), true);
+    assert!(b_b1.block_id() < b_a1.block_id());
+    branch_b_state.apply_block(&b_b1).unwrap();
+
+    let cb_b2 = make_coinbase(devnet_chain_id, 2, miner_b.address, 1_000_000_000);
+    let b_b2 = make_hybrid_block(&branch_b_state, GENESIS_TIMESTAMP + 240, vec![cb_b2]);
+    branch_b_state.apply_block(&b_b2).unwrap();
+
+    // Store Branch B in storage as inactive side branch
+    runtime
+        .storage()
+        .store_branch_block(&b_b1, U256::from_u128(1))
+        .unwrap();
+    runtime
+        .storage()
+        .store_branch_block(&b_b2, U256::from_u128(2))
+        .unwrap();
+    assert_eq!(runtime.tip_block_id(), b_a2.block_id());
+
+    // 3. Resubmit b_b2 through submit_block (exercises process_single_block reevaluation)
+    runtime.submit_block(b_b2.clone()).await.unwrap();
+    assert_eq!(runtime.tip_block_id(), b_b2.block_id());
+    assert_eq!(
+        runtime.chain_state().composite_state_root(),
+        branch_b_state.composite_state_root()
+    );
+}
+
+#[tokio::test]
+async fn test_warm_storage_upgrade_p2p_handshake_reevaluation() {
+    tokio::time::timeout(Duration::from_secs(45), async {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+
+        let config_a = create_node_config(&dir_a);
+        let config_b = create_node_config(&dir_b);
+        let devnet_chain_id = config_a.chain_id;
+
+        let miner_a = TestKeypair::from_seed(101);
+        let miner_b = TestKeypair::from_seed(102);
+        let genesis = genesis_block(devnet_chain_id);
+
+        // 1. Construct Branch A and Branch B
+        // b1 < a1 so Branch B wins the Section 4 tie-break
+        let mut state_a = ChainState::from_genesis(&genesis).unwrap();
+        let cb_a1 = make_coinbase(devnet_chain_id, 1, miner_a.address, 1_000_000_000);
+        let a1_base = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + 120, vec![cb_a1]);
+
+        let mut state_b = ChainState::from_genesis(&genesis).unwrap();
+        let cb_b1 = make_coinbase(devnet_chain_id, 1, miner_b.address, 1_000_000_000);
+        let b1 = make_hybrid_block(&state_b, GENESIS_TIMESTAMP + 120, vec![cb_b1]);
+
+        let a1 = nonce_variant_block(&a1_base, b1.block_id(), false);
+        assert!(
+            b1.block_id() < a1.block_id(),
+            "Branch B must have smaller block ID at height 1 to win tie-break"
+        );
+        state_a.apply_block(&a1).unwrap();
+        state_b.apply_block(&b1).unwrap();
+
+        let cb_a2 = make_coinbase(devnet_chain_id, 2, miner_a.address, 1_000_000_000);
+        let a2_base = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + 240, vec![cb_a2]);
+        let cb_b2 = make_coinbase(devnet_chain_id, 2, miner_b.address, 1_000_000_000);
+        let b2 = make_hybrid_block(&state_b, GENESIS_TIMESTAMP + 240, vec![cb_b2]);
+
+        // b2 > a2 so final tip alone would oppose height-1 tie break
+        let a2 = nonce_variant_block(&a2_base, b2.block_id(), true);
+        assert!(
+            b2.block_id() > a2.block_id(),
+            "Branch B tip must be larger to prove tie-break uses first differing height"
+        );
+        state_a.apply_block(&a2).unwrap();
+        state_b.apply_block(&b2).unwrap();
+
+        assert_eq!(state_a.cumulative_work(), state_b.cumulative_work());
+        assert_eq!(state_a.cumulative_work(), U256::from_u128(2));
+
+        // 2. Initialize Node A with temporary persistent database and establish active Branch A
+        let mut runtime_a = NodeRuntime::init(config_a.clone()).unwrap();
+        runtime_a.submit_block(a1.clone()).await.unwrap();
+        runtime_a.submit_block(a2.clone()).await.unwrap();
+        assert_eq!(runtime_a.tip_height(), 2);
+        assert_eq!(runtime_a.tip_block_id(), a2.block_id());
+
+        // 3. Persist equal-work Branch B as an inactive side branch in storage
+        // (simulating data left by an older first-seen fork-choice implementation)
+        runtime_a
+            .storage()
+            .store_branch_block(&b1, U256::from_u128(1))
+            .unwrap();
+        runtime_a
+            .storage()
+            .store_branch_block(&b2, U256::from_u128(2))
+            .unwrap();
+
+        let meta_b2_before = runtime_a
+            .storage()
+            .get_block_metadata(&b2.block_id())
+            .unwrap()
+            .unwrap();
+        assert!(!meta_b2_before.is_active);
+
+        // 4. Shut down and drop runtime_a
+        drop(runtime_a);
+
+        // 5. Reopen the same database using a fresh runtime
+        let runtime_a_fresh = NodeRuntime::init(config_a.clone()).unwrap();
+        assert_eq!(runtime_a_fresh.tip_height(), 2);
+        assert_eq!(runtime_a_fresh.tip_block_id(), a2.block_id());
+        assert_eq!(runtime_a_fresh.cumulative_work(), U256::from_u128(2));
+
+        // Prepare Node B with active Branch B
+        let mut runtime_b = NodeRuntime::init(config_b).unwrap();
+        runtime_b.submit_block(b1.clone()).await.unwrap();
+        runtime_b.submit_block(b2.clone()).await.unwrap();
+        assert_eq!(runtime_b.tip_height(), 2);
+        assert_eq!(runtime_b.tip_block_id(), b2.block_id());
+
+        // Spawn both actors
+        let (handle_a, task_a) = runtime_a_fresh.spawn_actor();
+        let (handle_b, task_b) = runtime_b.spawn_actor();
+
+        // 6. Connect through normal P2P handshake path
+        let addr_a = wait_for_listen_addr(&handle_a).await;
+        handle_b.dial_peer(addr_a).await.unwrap();
+        wait_for_peer_handshake(&handle_b, handle_a.peer_id()).await;
+        wait_for_peer_handshake(&handle_a, handle_b.peer_id()).await;
+
+        // 7 & 8. Verify that runtime automatically recognizes and reevaluates stored branch B,
+        // and that Branch B becomes active when it wins protocol tie-break.
+        let timeout = Duration::from_secs(12);
+        let start = Instant::now();
+        loop {
+            let status_a = handle_a.status().await.unwrap();
+            if status_a.tip_block_id == b2.block_id() {
+                // 9. Verify final tip, cumulative work, and composite state root
+                assert_eq!(status_a.tip_height, 2);
+                assert_eq!(status_a.cumulative_work, U256::from_u128(2));
+                assert_eq!(status_a.composite_state_root, state_b.composite_state_root());
+                break;
+            }
+            if start.elapsed() > timeout {
+                panic!(
+                    "Timed out waiting for Node A to reevaluate and activate stored Branch B via P2P handshake. Current tip: #{} ({})",
+                    status_a.tip_height, status_a.tip_block_id
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Stop actors and verify persistent on-disk metadata
+        handle_a.stop().await;
+        handle_b.stop().await;
+        let _ = task_a.await;
+        let _ = task_b.await;
+
+        let runtime_a_reopened = NodeRuntime::init(config_a).unwrap();
+        let meta_b2 = runtime_a_reopened.storage().get_block_metadata(&b2.block_id()).unwrap().unwrap();
+        let meta_a2 = runtime_a_reopened.storage().get_block_metadata(&a2.block_id()).unwrap().unwrap();
+        assert!(meta_b2.is_active, "Branch B tip must be marked active on disk");
+        assert!(!meta_a2.is_active, "Branch A tip must be marked inactive on disk");
+        let (disk_h, disk_tip, disk_work) = runtime_a_reopened.storage().get_tip().unwrap();
+        assert_eq!(disk_h, 2);
+        assert_eq!(disk_tip, b2.block_id());
+        assert_eq!(disk_work, U256::from_u128(2));
+        assert_eq!(runtime_a_reopened.tip_height(), 2);
+        assert_eq!(runtime_a_reopened.tip_block_id(), b2.block_id());
+        assert_eq!(runtime_a_reopened.cumulative_work(), U256::from_u128(2));
+        assert_eq!(runtime_a_reopened.chain_state().composite_state_root(), state_b.composite_state_root());
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn test_warm_storage_upgrade_p2p_handshake_losing_branch_no_loop() {
+    tokio::time::timeout(Duration::from_secs(45), async {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+
+        let config_a = create_node_config(&dir_a);
+        let config_b = create_node_config(&dir_b);
+        let devnet_chain_id = config_a.chain_id;
+
+        let miner_a = TestKeypair::from_seed(103);
+        let miner_b = TestKeypair::from_seed(104);
+        let genesis = genesis_block(devnet_chain_id);
+
+        // Construct Branch A and Branch B: b1 > a1 so Branch B LOSES the Section 4 tie-break
+        let mut state_a = ChainState::from_genesis(&genesis).unwrap();
+        let cb_a1 = make_coinbase(devnet_chain_id, 1, miner_a.address, 1_000_000_000);
+        let a1_base = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + 120, vec![cb_a1]);
+
+        let mut state_b = ChainState::from_genesis(&genesis).unwrap();
+        let cb_b1 = make_coinbase(devnet_chain_id, 1, miner_b.address, 1_000_000_000);
+        let b1 = make_hybrid_block(&state_b, GENESIS_TIMESTAMP + 120, vec![cb_b1]);
+
+        let a1 = nonce_variant_block(&a1_base, b1.block_id(), true);
+        assert!(
+            a1.block_id() < b1.block_id(),
+            "Branch A must have smaller block ID at height 1 so Branch B loses tie-break"
+        );
+        state_a.apply_block(&a1).unwrap();
+        state_b.apply_block(&b1).unwrap();
+
+        let cb_a2 = make_coinbase(devnet_chain_id, 2, miner_a.address, 1_000_000_000);
+        let a2 = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + 240, vec![cb_a2]);
+        let cb_b2 = make_coinbase(devnet_chain_id, 2, miner_b.address, 1_000_000_000);
+        let b2 = make_hybrid_block(&state_b, GENESIS_TIMESTAMP + 240, vec![cb_b2]);
+
+        state_a.apply_block(&a2).unwrap();
+        state_b.apply_block(&b2).unwrap();
+
+        // 1. Establish active Branch A in runtime A
+        let mut runtime_a = NodeRuntime::init(config_a.clone()).unwrap();
+        runtime_a.submit_block(a1.clone()).await.unwrap();
+        runtime_a.submit_block(a2.clone()).await.unwrap();
+        assert_eq!(runtime_a.tip_block_id(), a2.block_id());
+
+        // 2. Persist losing Branch B as inactive side branch
+        runtime_a
+            .storage()
+            .store_branch_block(&b1, U256::from_u128(1))
+            .unwrap();
+        runtime_a
+            .storage()
+            .store_branch_block(&b2, U256::from_u128(2))
+            .unwrap();
+
+        // 3. Drop runtime A and reopen
+        drop(runtime_a);
+
+        let runtime_a_fresh = NodeRuntime::init(config_a.clone()).unwrap();
+        assert_eq!(runtime_a_fresh.tip_block_id(), a2.block_id());
+
+        // Node B has active Branch B
+        let mut runtime_b = NodeRuntime::init(config_b).unwrap();
+        runtime_b.submit_block(b1.clone()).await.unwrap();
+        runtime_b.submit_block(b2.clone()).await.unwrap();
+        assert_eq!(runtime_b.tip_block_id(), b2.block_id());
+
+        // Spawn actors
+        let (handle_a, task_a) = runtime_a_fresh.spawn_actor();
+        let (handle_b, task_b) = runtime_b.spawn_actor();
+
+        // Connect via normal P2P handshake
+        let addr_a = wait_for_listen_addr(&handle_a).await;
+        handle_b.dial_peer(addr_a).await.unwrap();
+        wait_for_peer_handshake(&handle_b, handle_a.peer_id()).await;
+        wait_for_peer_handshake(&handle_a, handle_b.peer_id()).await;
+
+        // Allow multiple sync ticks (500ms interval) to fire to ensure no repeated reeval or sync loops occur
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // Verify Node A retained Branch A
+        let status_a = handle_a.status().await.unwrap();
+        assert_eq!(status_a.tip_height, 2);
+        assert_eq!(status_a.tip_block_id, a2.block_id());
+        assert_eq!(status_a.cumulative_work, U256::from_u128(2));
+        assert_eq!(
+            status_a.composite_state_root,
+            state_a.composite_state_root()
+        );
+
+        handle_a.stop().await;
+        handle_b.stop().await;
+        let _ = task_a.await;
+        let _ = task_b.await;
+
+        let runtime_a_reopened = NodeRuntime::init(config_a).unwrap();
+        let meta_a2 = runtime_a_reopened
+            .storage()
+            .get_block_metadata(&a2.block_id())
+            .unwrap()
+            .unwrap();
+        let meta_b2 = runtime_a_reopened
+            .storage()
+            .get_block_metadata(&b2.block_id())
+            .unwrap()
+            .unwrap();
+        assert!(meta_a2.is_active, "Branch A must remain active on disk");
+        assert!(
+            !meta_b2.is_active,
+            "Losing Branch B must remain inactive on disk"
+        );
+        assert_eq!(runtime_a_reopened.tip_height(), 2);
+        assert_eq!(runtime_a_reopened.tip_block_id(), a2.block_id());
+        assert_eq!(runtime_a_reopened.cumulative_work(), U256::from_u128(2));
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn test_peer_advertised_lower_work_does_not_gate_stored_branch_reevaluation() {
+    let dir = TempDir::new().unwrap();
+    let config = create_node_config(&dir);
+    let devnet_chain_id = config.chain_id;
+    let genesis = genesis_block(devnet_chain_id);
+    let miner_a = TestKeypair::from_seed(105);
+    let miner_b = TestKeypair::from_seed(106);
+
+    let mut state_a = ChainState::from_genesis(&genesis).unwrap();
+    let cb_a1 = make_coinbase(devnet_chain_id, 1, miner_a.address, 1_000_000_000);
+    let a1_base = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + 120, vec![cb_a1]);
+
+    let mut state_b = ChainState::from_genesis(&genesis).unwrap();
+    let cb_b1 = make_coinbase(devnet_chain_id, 1, miner_b.address, 1_000_000_000);
+    let b1 = make_hybrid_block(&state_b, GENESIS_TIMESTAMP + 120, vec![cb_b1]);
+
+    let a1 = nonce_variant_block(&a1_base, b1.block_id(), false);
+    assert!(b1.block_id() < a1.block_id());
+    state_a.apply_block(&a1).unwrap();
+    state_b.apply_block(&b1).unwrap();
+
+    let cb_a2 = make_coinbase(devnet_chain_id, 2, miner_a.address, 1_000_000_000);
+    let a2 = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + 240, vec![cb_a2]);
+    let cb_b2 = make_coinbase(devnet_chain_id, 2, miner_b.address, 1_000_000_000);
+    let b2 = make_hybrid_block(&state_b, GENESIS_TIMESTAMP + 240, vec![cb_b2]);
+    state_a.apply_block(&a2).unwrap();
+    state_b.apply_block(&b2).unwrap();
+
+    let mut runtime = NodeRuntime::init(config).unwrap();
+    runtime.submit_block(a1.clone()).await.unwrap();
+    runtime.submit_block(a2.clone()).await.unwrap();
+    assert_eq!(runtime.tip_block_id(), a2.block_id());
+
+    // Store Branch B as inactive side branch
+    runtime
+        .storage()
+        .store_branch_block(&b1, U256::from_u128(1))
+        .unwrap();
+    runtime
+        .storage()
+        .store_branch_block(&b2, U256::from_u128(2))
+        .unwrap();
+
+    // Handshake advertises tip b2, but untrusted peer claims cumulative_work: 1 (less than local work 2)
+    let handshake = HandshakeMessage {
+        protocol_version: HANDSHAKE_PROTOCOL_VERSION,
+        chain_id: devnet_chain_id,
+        genesis_hash: genesis.block_id(),
+        tip_height: 2,
+        tip_block_id: b2.block_id(),
+        cumulative_work: U256::from_u128(1), // Less than local work 2!
+        capabilities: 0,
+        software_version: "untrusted-peer/1.0".to_string(),
+    };
+
+    // Even though peer advertises work 1 < 2, local reevaluation is NOT gated by peer-advertised work!
+    assert!(
+        runtime.should_reevaluate_stored_side_branch(&handshake),
+        "should_reevaluate_stored_side_branch must not gate on untrusted remote work"
+    );
+
+    // Reevaluate using authoritative local consensus state
+    let outcome = runtime
+        .reevaluate_stored_side_branch(PeerId::random(), b2.block_id())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        BlockProcessingOutcome::ActiveChainAccepted(b2.block_id())
+    );
+    assert_eq!(runtime.tip_block_id(), b2.block_id());
+    assert_eq!(runtime.cumulative_work(), U256::from_u128(2));
+}
+
+#[tokio::test]
+async fn test_stored_branch_reevaluation_orphan_child_error_handling() {
+    let dir = TempDir::new().unwrap();
+    let config = create_node_config(&dir);
+    let devnet_chain_id = config.chain_id;
+    let genesis = genesis_block(devnet_chain_id);
+    let miner_a = TestKeypair::from_seed(107);
+    let miner_b = TestKeypair::from_seed(108);
+
+    // 1. Establish Active Chain A with 2 blocks
+    let mut state_a = ChainState::from_genesis(&genesis).unwrap();
+    let cb_a1 = make_coinbase(devnet_chain_id, 1, miner_a.address, 1_000_000_000);
+    let a1 = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + 120, vec![cb_a1]);
+    state_a.apply_block(&a1).unwrap();
+
+    let cb_a2 = make_coinbase(devnet_chain_id, 2, miner_a.address, 1_000_000_000);
+    let a2 = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + 240, vec![cb_a2]);
+    state_a.apply_block(&a2).unwrap();
+
+    let mut runtime = NodeRuntime::init(config).unwrap();
+    runtime.submit_block(a1.clone()).await.unwrap();
+    runtime.submit_block(a2.clone()).await.unwrap();
+    assert_eq!(runtime.tip_block_id(), a2.block_id());
+
+    // 2. Build Branch B parent b1 (height 1)
+    let mut state_b = ChainState::from_genesis(&genesis).unwrap();
+    let cb_b1 = make_coinbase(devnet_chain_id, 1, miner_b.address, 1_000_000_000);
+    let b1 = make_hybrid_block(&state_b, GENESIS_TIMESTAMP + 120, vec![cb_b1]);
+    state_b.apply_block(&b1).unwrap();
+
+    // 3. Construct an invalid orphan child b2 whose parent is b1:
+    // It has height 2 and parent b1, but carries a corrupted state root
+    let mut invalid_child = make_candidate_block(
+        &state_b,
+        GENESIS_TIMESTAMP + 240,
+        vec![make_coinbase(
+            devnet_chain_id,
+            2,
+            miner_b.address,
+            1_000_000_000,
+        )],
+    );
+    invalid_child.header.orchard_commitment_root = Hash::new([0xff; 32]); // Corrupted root
+
+    // 4. Submit invalid child BEFORE parent b1 is in storage:
+    // Since b1 is unknown, invalid_child is queued as an orphan
+    runtime.submit_block(invalid_child.clone()).await.unwrap();
+    assert_eq!(runtime.orphan_count(), 1);
+    assert!(!runtime
+        .storage()
+        .has_block(&invalid_child.block_id())
+        .unwrap());
+
+    // 5. Now store parent b1 as an inactive side branch
+    runtime
+        .storage()
+        .store_branch_block(&b1, U256::from_u128(1))
+        .unwrap();
+    assert!(
+        !runtime
+            .storage()
+            .get_block_metadata(&b1.block_id())
+            .unwrap()
+            .unwrap()
+            .is_active
+    );
+
+    // 6. Reevaluate stored parent branch b1:
+    // Parent b1 has work 1 < 2, so it evaluates cleanly and persists as a side branch.
+    // Unrolling its waiting orphan children wakes invalid_child.
+    // invalid_child fails validation in handle_inbound_block, which is logged as a warning.
+    // The parent operation succeeds (Ok) and is preserved, while the orphan is drained.
+    let outcome = runtime
+        .reevaluate_stored_side_branch(PeerId::random(), b1.block_id())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        BlockProcessingOutcome::SideBranchPersisted(b1.block_id()),
+        "Parent branch reevaluation must succeed and persist as side branch"
+    );
+
+    // 7. Verify orphan queue is clean and invalid child was not stored
+    assert_eq!(runtime.orphan_count(), 0);
+    assert_eq!(runtime.tip_block_id(), a2.block_id());
+    assert!(runtime.storage().has_block(&b1.block_id()).unwrap());
+    assert!(!runtime
+        .storage()
+        .has_block(&invalid_child.block_id())
+        .unwrap());
+}
+
+#[tokio::test]
+async fn test_evaluated_side_branches_cache_invalidated_on_active_chain_extension() {
+    let dir = TempDir::new().unwrap();
+    let config = create_node_config(&dir);
+    let devnet_chain_id = config.chain_id;
+    let genesis = genesis_block(devnet_chain_id);
+    let miner_a = TestKeypair::from_seed(201);
+    let miner_b = TestKeypair::from_seed(202);
+
+    // 1. Establish Active Chain A with 2 blocks (tip height 2)
+    let mut state_a = ChainState::from_genesis(&genesis).unwrap();
+    let cb_a1 = make_coinbase(devnet_chain_id, 1, miner_a.address, 1_000_000_000);
+    let a1_base = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + 120, vec![cb_a1]);
+
+    let mut state_b = ChainState::from_genesis(&genesis).unwrap();
+    let cb_b1 = make_coinbase(devnet_chain_id, 1, miner_b.address, 1_000_000_000);
+    let b1 = make_hybrid_block(&state_b, GENESIS_TIMESTAMP + 120, vec![cb_b1]);
+
+    // b1 > a1 so Branch B loses the tie-break against Branch A
+    let a1 = nonce_variant_block(&a1_base, b1.block_id(), true);
+    assert!(a1.block_id() < b1.block_id());
+    state_a.apply_block(&a1).unwrap();
+    state_b.apply_block(&b1).unwrap();
+
+    let cb_a2 = make_coinbase(devnet_chain_id, 2, miner_a.address, 1_000_000_000);
+    let a2 = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + 240, vec![cb_a2]);
+    let cb_b2 = make_coinbase(devnet_chain_id, 2, miner_b.address, 1_000_000_000);
+    let b2 = make_hybrid_block(&state_b, GENESIS_TIMESTAMP + 240, vec![cb_b2]);
+    state_a.apply_block(&a2).unwrap();
+    state_b.apply_block(&b2).unwrap();
+
+    let mut runtime = NodeRuntime::init(config).unwrap();
+    runtime.submit_block(a1.clone()).await.unwrap();
+    runtime.submit_block(a2.clone()).await.unwrap();
+    assert_eq!(runtime.tip_height(), 2);
+    assert_eq!(runtime.tip_block_id(), a2.block_id());
+    assert_eq!(runtime.evaluated_side_branch_count(), 0);
+
+    // 2. Persist equal-work Branch B as inactive side branch
+    runtime
+        .storage()
+        .store_branch_block(&b1, U256::from_u128(1))
+        .unwrap();
+    runtime
+        .storage()
+        .store_branch_block(&b2, U256::from_u128(2))
+        .unwrap();
+
+    // 3. Re-evaluate Branch B against tip a2: Branch B loses tie-break
+    let peer_id = PeerId::random();
+    let handshake = HandshakeMessage {
+        protocol_version: HANDSHAKE_PROTOCOL_VERSION,
+        chain_id: devnet_chain_id,
+        genesis_hash: genesis.block_id(),
+        tip_height: 2,
+        tip_block_id: b2.block_id(),
+        cumulative_work: U256::from_u128(2),
+        capabilities: 0,
+        software_version: "test/1.0".to_string(),
+    };
+
+    assert!(runtime.should_reevaluate_stored_side_branch(&handshake));
+    let outcome = runtime
+        .reevaluate_stored_side_branch(peer_id, b2.block_id())
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        BlockProcessingOutcome::SideBranchPersisted(b2.block_id())
+    );
+    assert_eq!(runtime.tip_block_id(), a2.block_id());
+
+    // 4. Verify that the cache prevents repeated evaluation against unchanged active tip a2
+    assert_eq!(runtime.evaluated_side_branch_count(), 1);
+    assert!(runtime.is_side_branch_evaluated(&b2.block_id()));
+    assert!(
+        !runtime.should_reevaluate_stored_side_branch(&handshake),
+        "Repeated evaluation against unchanged tip a2 must be suppressed"
+    );
+
+    // 5. Active chain extends via ordinary block acceptance (a3)
+    let cb_a3 = make_coinbase(devnet_chain_id, 3, miner_a.address, 1_000_000_000);
+    let a3 = make_hybrid_block(&state_a, GENESIS_TIMESTAMP + 360, vec![cb_a3]);
+    state_a.apply_block(&a3).unwrap();
+
+    runtime.submit_block(a3.clone()).await.unwrap();
+
+    // 6. Verify that active tip advanced to a3 AND the evaluated_side_branches cache was cleared
+    assert_eq!(runtime.tip_height(), 3);
+    assert_eq!(runtime.tip_block_id(), a3.block_id());
+    assert_eq!(
+        runtime.evaluated_side_branch_count(),
+        0,
+        "evaluated_side_branches cache must be invalidated when active chain extends"
+    );
+    assert!(
+        !runtime.is_side_branch_evaluated(&b2.block_id()),
+        "b2 must no longer be present in evaluated_side_branches after active-chain extension"
+    );
 }
