@@ -21,6 +21,7 @@ use ownchain::chain::{ChainError, ChainState};
 use ownchain::genesis;
 use ownchain::hash::{self, Hash};
 use ownchain::header::Header;
+use ownchain::mempool::{Mempool, MempoolError};
 use ownchain::merkle;
 use ownchain::orchard_root::empty_commitment_root;
 use ownchain::validation::ValidationError;
@@ -2210,4 +2211,183 @@ fn test_released_pending_transfer_spendable_in_same_block() {
         100_000_000 - 50_000_000 - 20_000
     );
     assert_eq!(state.account(&charlie.address).unwrap().balance, 50_000_000);
+}
+
+// ---------------------------------------------------------------------------
+// 19. PR2 Batch 1: Allowance Arithmetic Safety (F-07 Regression Tests)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_f07_allowance_overflow_candidate_block_execution() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, mut ts) = setup_funded_state();
+    let bob = TestKeypair::from_seed(3);
+    let recovery = TestKeypair::from_seed(99);
+    let g_keys: Vec<TestKeypair> = (10..17).map(TestKeypair::from_seed).collect();
+    let mut guardians = [[0u8; 32]; 7];
+    for (i, k) in g_keys.iter().enumerate() {
+        guardians[i] = k.pubkey;
+    }
+
+    ts += 120;
+    // Configure Alice with allowance_window_len = u64::MAX and allowance_limit = 10_000_000
+    let config = make_configure_guardians(
+        id,
+        &alice,
+        0,
+        50_000,
+        &guardians,
+        10,
+        100,
+        10_000_000,
+        u64::MAX,
+        &recovery.pubkey,
+        &[],
+    );
+    let b102 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 102, miner.address, 50_000), config],
+    );
+    state.apply_block(&b102).unwrap();
+
+    let alice_acc = state.account(&alice.address).unwrap();
+    assert_eq!(alice_acc.allowance_window_len, u64::MAX);
+
+    // Block 103: Alice spends 1_000_000 + 20_000 fee (cost 1_020_000)
+    // Previously, 102 + u64::MAX caused "allowance window overflow" ChainError.
+    // With safe arithmetic, it must execute cleanly!
+    ts += 120;
+    let tx1 = make_transparent_transfer(id, &alice, bob.address, 1_000_000, 20_000, 1);
+    let b103 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 103, miner.address, 20_000), tx1],
+    );
+    state
+        .apply_block(&b103)
+        .expect("Block with overflowing window length must execute cleanly");
+
+    let alice_103 = state.account(&alice.address).unwrap();
+    assert_eq!(alice_103.allowance_spent, 1_020_000);
+
+    // Block 104: Alice attempts to spend 9_000_000 + 20_000 fee (cost 9_020_000)
+    // Total spent would be 1_020_000 + 9_020_000 = 10_040_000 > 10_000_000 limit.
+    // Must be rejected with "allowance limit exceeded", confirming exhaustion is still enforced!
+    ts += 120;
+    let tx_excess = make_transparent_transfer(id, &alice, bob.address, 9_000_000, 20_000, 2);
+    let b104 = make_candidate_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 104, miner.address, 20_000), tx_excess],
+    );
+    let err = state.evaluate_candidate(&b104).unwrap_err();
+    assert!(
+        err.to_string().contains("allowance limit exceeded"),
+        "Expected 'allowance limit exceeded', got: {err}"
+    );
+}
+
+#[test]
+fn test_f07_mempool_allowance_overflow_admission() {
+    let id = devnet_chain_id();
+    let (mut state, _miner, alice, _ts) = setup_funded_state();
+    let bob = TestKeypair::from_seed(3);
+
+    // Configure Alice's account with allowance_window_len = u64::MAX
+    let acc = state.accounts.get_mut(&alice.address).unwrap();
+    acc.allowance_limit = 1_000_000;
+    acc.allowance_window_len = u64::MAX;
+    acc.allowance_window_start = 101;
+    acc.allowance_spent = 0;
+
+    let mut pool = Mempool::new();
+
+    // Transaction within limit (500_000 + 20_000 = 520_000 <= 1_000_000)
+    // Must be admitted without window overflow error
+    let tx_ok = make_transparent_transfer(id, &alice, bob.address, 500_000, 20_000, 0);
+    let tx_id = pool
+        .admit(&tx_ok, &state)
+        .expect("Mempool admission with overflowing window length must succeed");
+    assert!(pool.contains(&tx_id));
+
+    // Another transaction from fresh pool that exceeds limit (1_500_000 + 20_000 > 1_000_000)
+    // Must be rejected with AllowanceExceeded
+    let mut pool2 = Mempool::new();
+    let tx_over = make_transparent_transfer(id, &alice, bob.address, 1_500_000, 20_000, 0);
+    let err = pool2.admit(&tx_over, &state).unwrap_err();
+    assert!(
+        matches!(err, MempoolError::AllowanceExceeded(ref msg) if msg.contains("spending limit would be exceeded")),
+        "Expected AllowanceExceeded, got: {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 20. PR2 Batch 2: Nonce Exhaustion & Anchor Window (F-06 & F-01 Regression)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_f06_nonce_exhaustion_in_stateful_execution() {
+    let id = devnet_chain_id();
+    let (mut state, miner, alice, mut ts) = setup_funded_state();
+    let bob = TestKeypair::from_seed(3);
+
+    // Set Alice's committed nonce to u64::MAX - 1
+    state.accounts.get_mut(&alice.address).unwrap().nonce = u64::MAX - 1;
+
+    let mut pool = Mempool::new();
+
+    // 1. Transaction with nonce u64::MAX - 1 is admitted to mempool
+    let tx_ok = make_transparent_transfer(id, &alice, bob.address, 100_000, 20_000, u64::MAX - 1);
+    let tx_id = pool
+        .admit(&tx_ok, &state)
+        .expect("Admission from committed nonce u64::MAX - 1 must succeed");
+    assert!(pool.contains(&tx_id));
+
+    // 2. Next transaction requiring nonce u64::MAX is rejected with NonceExhausted
+    let tx_exhausted =
+        make_transparent_transfer(id, &alice, bob.address, 100_000, 20_000, u64::MAX);
+    let err_mem = pool.admit(&tx_exhausted, &state).unwrap_err();
+    assert_eq!(
+        err_mem,
+        MempoolError::NonceExhausted(alice.address),
+        "Next tx requiring nonce u64::MAX must be rejected with NonceExhausted"
+    );
+
+    // 3. Block 102 executes tx_ok -> Alice's nonce increments to u64::MAX
+    ts += 120;
+    let b102 = make_hybrid_block(
+        &state,
+        ts,
+        vec![make_coinbase(id, 102, miner.address, 20_000), tx_ok],
+    );
+    state
+        .apply_block(&b102)
+        .expect("Block 102 execution must succeed");
+    assert_eq!(state.account(&alice.address).unwrap().nonce, u64::MAX);
+
+    // 4. On-chain execution of a candidate block with nonce u64::MAX fails with nonce overflow
+    ts += 120;
+    let b103 = make_candidate_block(
+        &state,
+        ts,
+        vec![
+            make_coinbase(id, 103, miner.address, 20_000),
+            tx_exhausted.clone(),
+        ],
+    );
+    let err_chain = state.evaluate_candidate(&b103).unwrap_err();
+    assert!(
+        err_chain.to_string().contains("nonce overflow"),
+        "Candidate block with nonce u64::MAX must fail with 'nonce overflow', got: {err_chain}"
+    );
+
+    // 5. Mempool admission against committed nonce u64::MAX fails with NonceExhausted
+    let mut pool_fresh = Mempool::new();
+    let err_fresh = pool_fresh.admit(&tx_exhausted, &state).unwrap_err();
+    assert_eq!(
+        err_fresh,
+        MempoolError::NonceExhausted(alice.address),
+        "Mempool must reject any transaction from account at committed nonce u64::MAX"
+    );
 }

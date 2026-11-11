@@ -131,11 +131,14 @@ fn check_and_apply_allowance(
     cost: u128,
 ) -> Result<(), ChainError> {
     if account.allowance_limit > 0 && account.allowance_window_len > 0 {
-        let window_end = account
+        let is_expired = match account
             .allowance_window_start
             .checked_add(account.allowance_window_len)
-            .ok_or_else(|| ChainError::State("allowance window overflow".into()))?;
-        if height >= window_end {
+        {
+            Some(window_end) => height >= window_end,
+            None => false,
+        };
+        if is_expired {
             account.allowance_window_start = height;
             account.allowance_spent = 0;
         }
@@ -1889,5 +1892,56 @@ impl ChainState {
     /// Returns the upper median of the ancestor timestamps.
     pub fn ancestor_median_timestamp(&self) -> Option<u64> {
         crate::validation::upper_median(&self.ancestor_timestamps())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_check_and_apply_allowance_semantics() {
+        // 1. Normal boundary: start = 100, len = 50 -> window_end = 150
+        let mut acct = AccountState::new();
+        acct.allowance_limit = 1_000;
+        acct.allowance_window_start = 100;
+        acct.allowance_window_len = 50;
+        acct.allowance_spent = 600;
+
+        // At height 149 (< 150): window active
+        let mut a1 = acct.clone();
+        assert!(check_and_apply_allowance(&mut a1, 149, 300).is_ok());
+        assert_eq!(a1.allowance_spent, 900);
+        let mut a2 = acct.clone();
+        assert!(check_and_apply_allowance(&mut a2, 149, 500).is_err());
+
+        // At height 150 (>= 150): window expires and resets
+        let mut a3 = acct.clone();
+        assert!(check_and_apply_allowance(&mut a3, 150, 400).is_ok());
+        assert_eq!(a3.allowance_window_start, 150);
+        assert_eq!(a3.allowance_spent, 400);
+
+        // 2. Overflowing window end: start = 100, len = u64::MAX
+        let mut acct_overflow = AccountState::new();
+        acct_overflow.allowance_limit = 1_000;
+        acct_overflow.allowance_window_start = 100;
+        acct_overflow.allowance_window_len = u64::MAX;
+        acct_overflow.allowance_spent = 300;
+
+        // Window never expires mathematically; spending within limit succeeds
+        let mut a4 = acct_overflow.clone();
+        assert!(check_and_apply_allowance(&mut a4, 200, 400).is_ok());
+        assert_eq!(a4.allowance_spent, 700);
+
+        // At height = u64::MAX, window is still unexpired without arithmetic failure
+        let mut a5 = acct_overflow.clone();
+        assert!(check_and_apply_allowance(&mut a5, u64::MAX, 400).is_ok());
+        assert_eq!(a5.allowance_spent, 700);
+
+        // 4. Allowance exhaustion is enforced even when window overflows
+        let mut a6 = acct_overflow.clone();
+        assert!(check_and_apply_allowance(&mut a6, 200, 800).is_err());
+        let mut a7 = acct_overflow.clone();
+        assert!(check_and_apply_allowance(&mut a7, u64::MAX, 800).is_err());
     }
 }
