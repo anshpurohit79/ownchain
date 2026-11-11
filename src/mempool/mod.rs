@@ -3450,7 +3450,7 @@ mod tests {
         );
         let auth_key = SpendAuthorizingKey::from(&user_sk);
         let auth_bundle1 = proven1
-            .apply_signatures(&mut rng1, sighash1, &[auth_key.clone()])
+            .apply_signatures(&mut rng1, sighash1, std::slice::from_ref(&auth_key))
             .unwrap();
         let b_bytes1 = serialize_bundle(&auth_bundle1);
         let mut type5_tx1 = Vec::new();
@@ -4264,6 +4264,8 @@ mod tests {
         ));
     }
 
+    // Helper constructs a raw Type 2 ConfigureGuardians transaction with full wire payload fields.
+    #[allow(clippy::too_many_arguments)]
     fn make_test_type2_tx(
         chain_id: Hash,
         account_sk: &SigningKey,
@@ -4524,7 +4526,7 @@ mod tests {
         assert!(!pool.contains(&tx1_id), "Prior transfer must be evicted");
         assert!(pool.contains(&freeze_id), "Freeze must be admitted");
         assert!(
-            pool.account_nonces.get(&env.alice_addr).is_none(),
+            !pool.account_nonces.contains_key(&env.alice_addr),
             "Nonce reservation released"
         );
         assert_eq!(
@@ -5643,7 +5645,7 @@ mod tests {
 
         // 2. Its account nonce reservation is released
         assert!(
-            pool.account_nonces.get(&env.alice_addr).is_none(),
+            !pool.account_nonces.contains_key(&env.alice_addr),
             "Nonce 0 reservation must be released"
         );
 
