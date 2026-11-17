@@ -602,6 +602,7 @@ async fn test_e2e_invalid_tx_suppressed_and_mempool_full_allows_retry() {
         // 2. Fill 1-slot mempool with tx_1, then gossip valid tx_2 -> MempoolFull -> Ignore (not mark_seen)
         let tx_1 = make_transparent_transfer(cid, &miner1, alice.address, 100_000, 20_000, 0);
         let tx_2 = make_transparent_transfer(cid, &miner2, alice.address, 100_000, 20_000, 0);
+        let tx_2_frame = encode_frame(&tx_2).unwrap();
         node_b.submit_transaction(tx_1.clone()).await.unwrap();
         assert_eq!(node_b.status().await.unwrap().mempool_size, 1);
 
@@ -617,13 +618,13 @@ async fn test_e2e_invalid_tx_suppressed_and_mempool_full_allows_retry() {
         swarm_a
             .behaviour_mut()
             .gossipsub
-            .publish(txs_topic.clone(), encode_frame(&tx_2).unwrap())
+            .publish(txs_topic.clone(), tx_2_frame.clone())
             .unwrap();
 
         let forwarded_during_full = drive_swarms_until(
             &mut swarm_a,
             &mut swarm_c,
-            |_, _, topic, _| topic == t_hash,
+            |_, _, topic, data| topic == t_hash && data == tx_2_frame,
             Duration::from_millis(1500),
         )
         .await;
@@ -648,13 +649,13 @@ async fn test_e2e_invalid_tx_suppressed_and_mempool_full_allows_retry() {
         swarm_a
             .behaviour_mut()
             .gossipsub
-            .publish(txs_topic.clone(), encode_frame(&tx_2).unwrap())
+            .publish(txs_topic.clone(), tx_2_frame.clone())
             .unwrap();
 
         let forwarded_after_drain = drive_swarms_until(
             &mut swarm_a,
             &mut swarm_c,
-            |prop_src, _, topic, _| topic == t_hash && prop_src == peer_b,
+            |prop_src, _, topic, data| topic == t_hash && prop_src == peer_b && data == tx_2_frame,
             Duration::from_secs(5),
         )
         .await;
