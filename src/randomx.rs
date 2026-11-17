@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::raw::{c_uint, c_ulong, c_void};
 use std::ptr::null_mut;
+use std::sync::Arc;
 use std::thread;
 
 use crate::difficulty::U256;
@@ -91,6 +92,16 @@ pub struct RandomxCache {
     ptr: NonNull<c_void>,
 }
 
+// SAFETY: An initialized `randomx_cache` is immutable and self-contained in heap memory.
+// Upstream RandomX v1.2.3 initializes all cache data (`memory`, `programs`, `reciprocalCache`)
+// in `randomx_init_cache`. During hashing (`initDatasetItem` / compiled JIT) and dataset
+// initialization (`randomx_init_dataset`), access to the cache is strictly read-only.
+// Upstream demonstrates concurrent reads across threads in `vendor/randomx/src/tests/benchmark.cpp`
+// (lines 342, 358-385) and `vendor/randomx/src/tests/api-example2.cpp`.
+// Deallocation (`randomx_release_cache`) requires exclusive `&mut self` access in `Drop::drop`.
+unsafe impl Send for RandomxCache {}
+unsafe impl Sync for RandomxCache {}
+
 impl RandomxCache {
     pub fn new(key: &[u8; 32]) -> Result<Self, RandomxError> {
         unsafe {
@@ -111,6 +122,8 @@ impl Drop for RandomxCache {
         unsafe {
             randomx_release_cache(self.ptr.as_ptr());
         }
+        #[cfg(test)]
+        record_drop_event("cache");
     }
 }
 
@@ -118,10 +131,20 @@ pub struct RandomxDataset {
     ptr: NonNull<c_void>,
 }
 
+// SAFETY: An initialized `randomx_dataset` is an immutable 2080 MiB read-only memory buffer.
+// RandomX specification (`vendor/randomx/doc/specs.md` Sections 4.1 & 7) explicitly defines
+// the Dataset as a read-only memory structure. During Fast VM execution, dataset access is
+// purely read-only (`datasetRead` / `datasetPrefetch`). Upstream explicitly demonstrates
+// concurrent read access by multiple worker VMs across threads without locks in
+// `vendor/randomx/src/tests/benchmark.cpp` (lines 358-385).
+// Deallocation (`randomx_release_dataset`) requires exclusive `&mut self` access in `Drop::drop`.
+unsafe impl Send for RandomxDataset {}
+unsafe impl Sync for RandomxDataset {}
+
 /// Initializes the dataset in parallel by splitting the item range across
 /// available threads. Each thread calls `randomx_init_dataset` on a disjoint
 /// sub-range; items are independent (read-only cache, distinct write slots)
-// so this is race-free.
+/// so this is race-free.
 /// Wrapper around raw pointers to make them `Send` for cross-thread dataset
 /// initialization. Safe because each thread writes to a disjoint range of the
 /// dataset and only reads from the shared (read-only, already-initialized)
@@ -132,7 +155,7 @@ unsafe impl Send for SendRawPtr {}
 /// Initializes the dataset in parallel by splitting the item range across
 /// available threads. Each thread calls `randomx_init_dataset` on a disjoint
 /// sub-range; items are independent (read-only cache, distinct write slots)
-// so this is race-free.
+/// so this is race-free.
 fn init_dataset_parallel(dataset: SendRawPtr, cache: SendRawPtr, item_count: u64) {
     if item_count == 0 {
         return;
@@ -197,15 +220,42 @@ impl Drop for RandomxDataset {
         unsafe {
             randomx_release_dataset(self.ptr.as_ptr());
         }
+        #[cfg(test)]
+        record_drop_event("dataset");
     }
 }
 
-pub struct RandomxVm {
-    ptr: NonNull<c_void>,
+/// Backing memory resource retained by a `RandomxVm`.
+#[derive(Clone)]
+pub enum RandomxBacking {
+    Light(Arc<RandomxCache>),
+    Fast(Arc<RandomxDataset>),
 }
 
+/// A RandomX virtual machine instance.
+///
+/// Retains an `Arc` reference to its backing resource (`RandomxCache` or `RandomxDataset`),
+/// making it impossible in safe Rust to use a VM after its backing resource has been destroyed.
+///
+/// On destruction, `randomx_destroy_vm` executes in `Drop::drop` before struct fields are dropped,
+/// guaranteeing that VM destruction strictly precedes backing-resource deallocation.
+pub struct RandomxVm {
+    ptr: NonNull<c_void>,
+    backing: RandomxBacking,
+}
+
+// SAFETY: A `randomx_vm` instance is self-contained with its own scratchpad and register file.
+// It has no thread affinity or thread-local storage and can be transferred to a worker thread
+// (matching upstream `vendor/randomx/src/tests/benchmark.cpp` lines 358-378 where VMs are created
+// on the main thread and transferred to worker threads).
+//
+// NOTE: `RandomxVm` explicitly does NOT implement `Sync`. `randomx_calculate_hash` mutates
+// internal VM scratchpad and register state during hash computation; concurrent execution
+// of a single VM across threads is unsound. VMs must remain worker-local.
+unsafe impl Send for RandomxVm {}
+
 impl RandomxVm {
-    pub fn light(cache: &RandomxCache) -> Result<Self, RandomxError> {
+    pub fn light(cache: Arc<RandomxCache>) -> Result<Self, RandomxError> {
         unsafe {
             let flags = randomx_get_flags();
             let ptr = randomx_create_vm(flags, cache.ptr.as_ptr(), null_mut());
@@ -214,11 +264,12 @@ impl RandomxVm {
             }
             Ok(RandomxVm {
                 ptr: NonNull::new(ptr).ok_or(RandomxError::AllocationFailed)?,
+                backing: RandomxBacking::Light(cache),
             })
         }
     }
 
-    pub fn fast(dataset: &RandomxDataset) -> Result<Self, RandomxError> {
+    pub fn fast(dataset: Arc<RandomxDataset>) -> Result<Self, RandomxError> {
         unsafe {
             let flags = randomx_get_flags() | RANDOMX_FLAG_FULL_MEM;
             let ptr = randomx_create_vm(flags, null_mut(), dataset.ptr.as_ptr());
@@ -227,6 +278,7 @@ impl RandomxVm {
             }
             Ok(RandomxVm {
                 ptr: NonNull::new(ptr).ok_or(RandomxError::AllocationFailed)?,
+                backing: RandomxBacking::Fast(dataset),
             })
         }
     }
@@ -241,6 +293,31 @@ impl RandomxVm {
             );
         }
     }
+
+    pub fn backing(&self) -> &RandomxBacking {
+        &self.backing
+    }
+
+    pub fn mode(&self) -> RandomxMode {
+        match &self.backing {
+            RandomxBacking::Light(_) => RandomxMode::Light,
+            RandomxBacking::Fast(_) => RandomxMode::Fast,
+        }
+    }
+
+    pub fn cache(&self) -> Option<&Arc<RandomxCache>> {
+        match &self.backing {
+            RandomxBacking::Light(cache) => Some(cache),
+            RandomxBacking::Fast(_) => None,
+        }
+    }
+
+    pub fn dataset(&self) -> Option<&Arc<RandomxDataset>> {
+        match &self.backing {
+            RandomxBacking::Light(_) => None,
+            RandomxBacking::Fast(dataset) => Some(dataset),
+        }
+    }
 }
 
 impl Drop for RandomxVm {
@@ -248,7 +325,25 @@ impl Drop for RandomxVm {
         unsafe {
             randomx_destroy_vm(self.ptr.as_ptr());
         }
+        #[cfg(test)]
+        record_drop_event("vm");
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static DROP_RECORDER: RefCell<Option<Vec<&'static str>>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn record_drop_event(event: &'static str) {
+    let _ = DROP_RECORDER.try_with(|cell| {
+        if let Ok(mut opt) = cell.try_borrow_mut() {
+            if let Some(ref mut vec) = *opt {
+                vec.push(event);
+            }
+        }
+    });
 }
 
 /// Owns a cached Fast-mode triple (VM, dataset, cache) and ensures
@@ -258,14 +353,14 @@ impl Drop for RandomxVm {
 #[allow(dead_code)]
 struct CacheEntry {
     vm: RandomxVm,
-    dataset: RandomxDataset,
-    cache: RandomxCache,
+    dataset: Arc<RandomxDataset>,
+    cache: Arc<RandomxCache>,
 }
 
 #[allow(dead_code)]
 struct LightCacheEntry {
     vm: RandomxVm,
-    cache: RandomxCache,
+    cache: Arc<RandomxCache>,
 }
 
 pub fn key_height(height: u64) -> u64 {
@@ -298,8 +393,8 @@ pub fn randomx_hash(
                 return Ok(output);
             }
 
-            let cache = RandomxCache::new(key)?;
-            let vm = RandomxVm::light(&cache)?;
+            let cache = Arc::new(RandomxCache::new(key)?);
+            let vm = RandomxVm::light(Arc::clone(&cache))?;
             vm.calculate_hash(header, &mut output);
 
             // Store in the bounded cache (VM first in struct => dropped first on eviction).
@@ -325,9 +420,9 @@ pub fn randomx_hash(
                 return Ok(output);
             }
 
-            let cache = RandomxCache::new(key)?;
-            let dataset = RandomxDataset::new(&cache)?;
-            let vm = RandomxVm::fast(&dataset)?;
+            let cache = Arc::new(RandomxCache::new(key)?);
+            let dataset = Arc::new(RandomxDataset::new(&cache)?);
+            let vm = RandomxVm::fast(Arc::clone(&dataset))?;
             vm.calculate_hash(header, &mut output);
 
             // Store in the bounded cache (VM first in tuple => dropped first on eviction).
@@ -440,6 +535,109 @@ mod tests {
     fn randomx_mode_light_fast_are_distinct() {
         assert!(matches!(RandomxMode::Light, RandomxMode::Light));
         assert!(matches!(RandomxMode::Fast, RandomxMode::Fast));
+    }
+
+    #[test]
+    fn concurrency_trait_bounds() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+
+        assert_send::<RandomxCache>();
+        assert_sync::<RandomxCache>();
+
+        assert_send::<RandomxDataset>();
+        assert_sync::<RandomxDataset>();
+
+        assert_send::<RandomxVm>();
+        // RandomxVm intentionally does not implement Sync because calculate_hash
+        // mutates internal VM scratchpad and register state.
+    }
+
+    static UNIT_TEST_FAST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct DropEventCapture;
+
+    impl DropEventCapture {
+        fn start() -> Self {
+            DROP_RECORDER.with(|cell| {
+                let mut recorder = cell.borrow_mut();
+                assert!(
+                    recorder.is_none(),
+                    "DropEventCapture::start() called while another capture is already active on this thread"
+                );
+                *recorder = Some(Vec::new());
+            });
+            Self
+        }
+
+        fn finish(self) -> Vec<&'static str> {
+            DROP_RECORDER.with(|cell| cell.borrow_mut().take().unwrap_or_default())
+        }
+    }
+
+    impl Drop for DropEventCapture {
+        fn drop(&mut self) {
+            let _ = DROP_RECORDER.try_with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "DropEventCapture::start() called while another capture is already active"
+    )]
+    fn drop_event_capture_double_start_panics() {
+        let _c1 = DropEventCapture::start();
+        let _c2 = DropEventCapture::start();
+    }
+
+    #[test]
+    fn vm_destruction_precedes_backing_resource_destruction_light() {
+        let capture = DropEventCapture::start();
+        {
+            let cache = Arc::new(RandomxCache::new(&[0x42; 32]).expect("cache allocation"));
+            let vm = RandomxVm::light(cache).expect("vm creation");
+            drop(vm);
+        }
+        // Drop order must be: VM destroyed first, then cache released
+        assert_eq!(capture.finish(), vec!["vm", "cache"]);
+    }
+
+    #[test]
+    fn vm_destruction_precedes_backing_resource_destruction_fast() {
+        let _guard = UNIT_TEST_FAST_LOCK.lock().unwrap();
+        let cache = RandomxCache::new(&[0x42; 32]).expect("cache allocation");
+        let dataset = Arc::new(RandomxDataset::new(&cache).expect("dataset allocation"));
+        drop(cache);
+
+        let capture = DropEventCapture::start();
+        {
+            let vm = RandomxVm::fast(dataset).expect("vm creation");
+            drop(vm);
+        }
+        // Drop order must be: VM destroyed first, then dataset released
+        assert_eq!(capture.finish(), vec!["vm", "dataset"]);
+    }
+
+    #[test]
+    fn vm_destruction_precedes_backing_resource_destruction_fast_mode_triple() {
+        let _guard = UNIT_TEST_FAST_LOCK.lock().unwrap();
+        let cache = Arc::new(RandomxCache::new(&[0x42; 32]).expect("cache allocation"));
+        let dataset = Arc::new(RandomxDataset::new(&cache).expect("dataset allocation"));
+        let vm = RandomxVm::fast(Arc::clone(&dataset)).expect("vm creation");
+
+        let capture = DropEventCapture::start();
+        {
+            #[allow(dead_code)]
+            struct FastTriple {
+                vm: RandomxVm,
+                dataset: Arc<RandomxDataset>,
+                cache: Arc<RandomxCache>,
+            }
+            let triple = FastTriple { vm, dataset, cache };
+            drop(triple);
+        }
+        // Drop order must be: 1. Destroy VM -> 2. Release dataset -> 3. Release cache
+        assert_eq!(capture.finish(), vec!["vm", "dataset", "cache"]);
     }
 }
 thread_local! {

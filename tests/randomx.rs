@@ -4,8 +4,14 @@ use ownchain::difficulty::U256;
 use ownchain::hash::Hash;
 use ownchain::header::{Header, HEADER_LEN, VERSION_INITIAL};
 use ownchain::randomx::{
-    check_pow_target, key_height, pow_target, randomx_hash, verify_pow, RandomxError, RandomxMode,
+    check_pow_target, key_height, pow_target, randomx_hash, verify_pow, RandomxCache,
+    RandomxDataset, RandomxError, RandomxMode, RandomxVm,
 };
+use std::sync::{Arc, Mutex};
+
+/// Mutex serializing tests that allocate the ~2080 MiB Fast-mode dataset to prevent
+/// concurrent memory exhaustion when cargo test runs test cases in parallel threads.
+static FAST_MODE_LOCK: Mutex<()> = Mutex::new(());
 
 /// A fixed 32-byte key used for deterministic test vectors.
 pub const TEST_KEY: [u8; 32] = {
@@ -204,6 +210,7 @@ const GOLDEN_VECTORS: &[(u64, &str)] = &[
 
 #[test]
 fn randomx_hashes_match_independent_cpp_golden_vectors() {
+    let _guard = FAST_MODE_LOCK.lock().unwrap();
     for &(height, expected_hex) in GOLDEN_VECTORS {
         let header = test_header(height, 0);
 
@@ -239,4 +246,192 @@ fn randomx_hashes_match_independent_cpp_golden_vectors() {
             "verify_pow Fast should accept difficulty 1"
         );
     }
+}
+
+// ============================================================================
+// Phase 3 Regression Tests: Resource Ownership, Lifetime, and Sharing
+// ============================================================================
+
+#[test]
+fn vm_usable_while_retaining_backing_resource_light() {
+    let cache = Arc::new(RandomxCache::new(&TEST_KEY).expect("cache allocation"));
+    let vm = RandomxVm::light(cache).expect("vm creation");
+
+    let header = test_header(0, 0);
+    let mut hash = [0u8; 32];
+    vm.calculate_hash(&header, &mut hash);
+
+    let expected = hex::decode(GOLDEN_VECTORS[0].1).expect("valid hex");
+    assert_eq!(hash, expected.as_slice());
+}
+
+#[test]
+fn vm_usable_while_retaining_backing_resource_fast() {
+    let _guard = FAST_MODE_LOCK.lock().unwrap();
+    let cache = RandomxCache::new(&TEST_KEY).expect("cache allocation");
+    let dataset = Arc::new(RandomxDataset::new(&cache).expect("dataset allocation"));
+    drop(cache); // Proves cache can be dropped while dataset is alive
+
+    let vm = RandomxVm::fast(dataset).expect("vm creation");
+
+    let header = test_header(0, 0);
+    let mut hash = [0u8; 32];
+    vm.calculate_hash(&header, &mut hash);
+
+    let expected = hex::decode(GOLDEN_VECTORS[0].1).expect("valid hex");
+    assert_eq!(hash, expected.as_slice());
+}
+
+#[test]
+fn releasing_caller_original_arc_keeps_vm_usable_light() {
+    let cache = Arc::new(RandomxCache::new(&TEST_KEY).expect("cache allocation"));
+    let vm = RandomxVm::light(Arc::clone(&cache)).expect("vm creation");
+
+    assert_eq!(Arc::strong_count(&cache), 2);
+    // Caller releases original Arc; VM retains its own Arc clone
+    drop(cache);
+
+    assert_eq!(vm.cache().map(Arc::strong_count), Some(1));
+
+    let header = test_header(0, 0);
+    let mut hash = [0u8; 32];
+    vm.calculate_hash(&header, &mut hash);
+
+    let expected = hex::decode(GOLDEN_VECTORS[0].1).expect("valid hex");
+    assert_eq!(hash, expected.as_slice());
+}
+
+#[test]
+fn releasing_caller_original_arc_keeps_vm_usable_fast() {
+    let _guard = FAST_MODE_LOCK.lock().unwrap();
+    let cache = RandomxCache::new(&TEST_KEY).expect("cache allocation");
+    let dataset = Arc::new(RandomxDataset::new(&cache).expect("dataset allocation"));
+    let vm = RandomxVm::fast(Arc::clone(&dataset)).expect("vm creation");
+
+    assert_eq!(Arc::strong_count(&dataset), 2);
+    // Caller releases original Arc; VM retains its own Arc clone
+    drop(dataset);
+
+    assert_eq!(vm.dataset().map(Arc::strong_count), Some(1));
+
+    let header = test_header(0, 0);
+    let mut hash = [0u8; 32];
+    vm.calculate_hash(&header, &mut hash);
+
+    let expected = hex::decode(GOLDEN_VECTORS[0].1).expect("valid hex");
+    assert_eq!(hash, expected.as_slice());
+}
+
+#[test]
+fn multi_worker_shared_cache_light_mode() {
+    let cache = Arc::new(RandomxCache::new(&TEST_KEY).expect("cache allocation"));
+    let num_workers = 4;
+    let hashes_per_worker = 5;
+
+    // Precalculate expected hashes so worker threads only exercise their local VM
+    let expected_hashes: Vec<Vec<[u8; 32]>> = (0..num_workers)
+        .map(|worker_id| {
+            (0..hashes_per_worker)
+                .map(|nonce| {
+                    let header = test_header(0, worker_id as u64 * 100 + nonce as u64);
+                    randomx_hash(&TEST_KEY, &header, RandomxMode::Light).unwrap()
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut handles = Vec::new();
+    for (worker_id, expected_list) in expected_hashes.into_iter().enumerate() {
+        let cache_clone = Arc::clone(&cache);
+        let handle = std::thread::spawn(move || {
+            let vm = RandomxVm::light(cache_clone).expect("vm creation");
+            for (nonce, expected) in expected_list.iter().enumerate() {
+                let header = test_header(0, worker_id as u64 * 100 + nonce as u64);
+                let mut hash = [0u8; 32];
+                vm.calculate_hash(&header, &mut hash);
+                assert_eq!(hash, *expected);
+            }
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.join().expect("worker thread joined successfully");
+    }
+}
+
+#[test]
+fn multi_worker_shared_dataset_fast_mode() {
+    let _guard = FAST_MODE_LOCK.lock().unwrap();
+    let cache = RandomxCache::new(&TEST_KEY).expect("cache allocation");
+    let dataset = Arc::new(RandomxDataset::new(&cache).expect("dataset allocation"));
+    drop(cache); // Only the single shared dataset is needed for fast-mode workers
+
+    // Precalculate expected hashes using Light mode (mathematically identical to Fast mode)
+    // to avoid allocating redundant datasets in worker threads.
+    let num_workers = 4;
+    let hashes_per_worker = 5;
+    let expected_hashes: Vec<Vec<[u8; 32]>> = (0..num_workers)
+        .map(|worker_id| {
+            (0..hashes_per_worker)
+                .map(|nonce| {
+                    let header = test_header(0, worker_id as u64 * 100 + nonce as u64);
+                    randomx_hash(&TEST_KEY, &header, RandomxMode::Light).unwrap()
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut handles = Vec::new();
+    for (worker_id, expected_list) in expected_hashes.into_iter().enumerate() {
+        let dataset_clone = Arc::clone(&dataset);
+        let handle = std::thread::spawn(move || {
+            let vm = RandomxVm::fast(dataset_clone).expect("vm creation");
+            for (nonce, expected) in expected_list.iter().enumerate() {
+                let header = test_header(0, worker_id as u64 * 100 + nonce as u64);
+                let mut hash = [0u8; 32];
+                vm.calculate_hash(&header, &mut hash);
+                assert_eq!(hash, *expected);
+            }
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.join().expect("worker thread joined successfully");
+    }
+}
+
+#[test]
+fn resource_rotation_preserves_older_vm_validity_light() {
+    let key_v0 = TEST_KEY;
+    let mut key_v1 = TEST_KEY;
+    key_v1[0] ^= 0xFF;
+
+    let header_v0 = test_header(0, 100);
+    let header_v1 = test_header(2112, 200);
+
+    // Worker on Epoch 0 creates a VM for key_v0
+    let cache_v0 = Arc::new(RandomxCache::new(&key_v0).expect("cache v0"));
+    let vm_v0 = RandomxVm::light(Arc::clone(&cache_v0)).expect("vm v0");
+    let expected_v0 = randomx_hash(&key_v0, &header_v0, RandomxMode::Light).unwrap();
+
+    // Node rotates to Epoch 1: allocates new cache and drops its handle to cache_v0
+    let cache_v1 = Arc::new(RandomxCache::new(&key_v1).expect("cache v1"));
+    let vm_v1 = RandomxVm::light(Arc::clone(&cache_v1)).expect("vm v1");
+    let expected_v1 = randomx_hash(&key_v1, &header_v1, RandomxMode::Light).unwrap();
+
+    drop(cache_v0); // Node evicts/releases epoch 0 cache
+
+    // vm_v0 continues to hash correctly on key_v0 because it retains its own Arc
+    let mut hash_v0 = [0u8; 32];
+    vm_v0.calculate_hash(&header_v0, &mut hash_v0);
+    assert_eq!(hash_v0, expected_v0);
+
+    // vm_v1 hashes correctly on key_v1
+    let mut hash_v1 = [0u8; 32];
+    vm_v1.calculate_hash(&header_v1, &mut hash_v1);
+    assert_eq!(hash_v1, expected_v1);
+
+    assert_ne!(hash_v0, hash_v1);
 }
