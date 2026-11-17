@@ -39,8 +39,10 @@ impl OwnChainBehaviour {
 
         // 1. Gossipsub setup
         let gossipsub_config = GossipsubConfigBuilder::default()
-            .validation_mode(ValidationMode::Permissive)
+            .validation_mode(ValidationMode::Strict)
+            .validate_messages()
             .heartbeat_interval(Duration::from_millis(500))
+            .history_length(20)
             .max_transmit_size(2_100_000)
             .build()
             .map_err(|e| format!("gossipsub config error: {e}"))?;

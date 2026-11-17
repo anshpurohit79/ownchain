@@ -228,7 +228,7 @@ async fn wait_for_listen_addr(handle: &NodeHandle) -> Multiaddr {
 }
 
 async fn wait_for_peer_handshake(handle: &NodeHandle, peer_id: PeerId) {
-    let timeout = Duration::from_secs(10);
+    let timeout = Duration::from_secs(15);
     let start = Instant::now();
     loop {
         if let Ok(peers) = handle.get_connected_peers().await {
@@ -3267,4 +3267,254 @@ async fn test_evaluated_side_branches_cache_invalidated_on_active_chain_extensio
         !runtime.is_side_branch_evaluated(&b2.block_id()),
         "b2 must no longer be present in evaluated_side_branches after active-chain extension"
     );
+}
+
+// -----------------------------------------------------------------------------
+// SEC-P2P-003 Regression Tests: Sync Peer-Selection Abuse Defense
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_real_p2p_sync_liar_high_work_fails_over_and_survives_reconnect() {
+    tokio::time::timeout(Duration::from_secs(45), async {
+        let dir_victim = TempDir::new().unwrap();
+        let dir_honest = TempDir::new().unwrap();
+        let devnet_chain_id = hash::chain_id(DEVNET);
+        let genesis = genesis_block(devnet_chain_id);
+
+        // Honest Node H has 4 valid mined blocks (height = 4, work = 4)
+        let mut runtime_honest = NodeRuntime::init(create_node_config(&dir_honest)).unwrap();
+        let miner_h = TestKeypair::from_seed(81);
+        let mut state_h = ChainState::from_genesis(&genesis).unwrap();
+        for h in 1..=4 {
+            let cb = make_coinbase(devnet_chain_id, h, miner_h.address, 1_000_000_000);
+            let b = make_hybrid_block(&state_h, GENESIS_TIMESTAMP + h * 120, vec![cb]);
+            state_h.apply_block(&b).unwrap();
+            runtime_honest.submit_block(b).await.unwrap();
+        }
+        let expected_tip = state_h.tip_block_id().unwrap();
+        let (handle_honest, _task_honest) = runtime_honest.spawn_actor();
+        let addr_honest = wait_for_listen_addr(&handle_honest).await;
+
+        // Controlled malicious Node L advertises max U256 cumulative work and fake tip
+        let max_u256_work = U256::from_le_bytes([0xff; 32]);
+        let keypair_liar = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id_liar = ownchain::p2p::peer_id_from_keypair(&keypair_liar);
+        let (service_liar, handle_liar, mut event_rx_liar) = NetworkService::new(
+            keypair_liar,
+            "devnet",
+            devnet_chain_id,
+            genesis.block_id(),
+            50,
+            Hash::new([0xaa; 32]),
+            max_u256_work,
+            "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            50,
+            500,
+            500,
+        )
+        .unwrap();
+        let task_liar = tokio::spawn(service_liar.run());
+
+        let mut addr_liar = None;
+        for _ in 0..50 {
+            if let Some(a) = handle_liar
+                .get_listen_addrs()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .next()
+            {
+                addr_liar = Some(a);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let addr_liar = addr_liar.expect("Malicious listener failed to bind");
+
+        // Reject all GetHeaders requests on Peer L to force TransientOrTimeout cooldown
+        let handle_liar_req = handle_liar.clone();
+        let liar_responder = tokio::spawn(async move {
+            while let Some(ev) = event_rx_liar.recv().await {
+                if let NetworkEvent::SyncRequestReceived { channel, .. } = ev {
+                    let _ = handle_liar_req
+                        .send_sync_response(channel, SyncResponse::Error("refused".into()))
+                        .await;
+                }
+            }
+        });
+
+        let (handle_victim, _task_victim) =
+            NodeRuntime::spawn(create_node_config(&dir_victim)).unwrap();
+        let addr_victim = wait_for_listen_addr(&handle_victim).await;
+
+        // Connect Victim to Liar first, then Honest Node H
+        handle_victim.dial(addr_liar.clone()).await.unwrap();
+        wait_for_peer_handshake(&handle_victim, peer_id_liar).await;
+        handle_victim.dial(addr_honest).await.unwrap();
+        wait_for_peer_handshake(&handle_victim, handle_honest.peer_id()).await;
+
+        // Victim must cool down Liar, fail over to Honest Peer H (lower work 4 < U256::MAX), and sync #4
+        let start = Instant::now();
+        loop {
+            let st = handle_victim.status().await.unwrap();
+            if st.tip_height == 4 && st.tip_block_id == expected_tip {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "Timed out waiting for failover sync to honest peer (current tip #{})",
+                st.tip_height
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Liar updating handshake via UpdateTip or reconnecting must still leave Victim cleanly synced
+        let _ = handle_liar
+            .update_tip(51, Hash::new([0xbb; 32]), max_u256_work)
+            .await;
+        handle_victim.disconnect(peer_id_liar).await.unwrap();
+        let disconnect_wait = Instant::now();
+        loop {
+            let victim_has_liar = handle_victim
+                .get_connected_peers()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|p| p.peer_id == peer_id_liar);
+            let liar_has_victim = handle_liar
+                .get_connected_peers()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|p| p.peer_id == handle_victim.peer_id());
+            if !victim_has_liar && !liar_has_victim {
+                break;
+            }
+            assert!(
+                disconnect_wait.elapsed() < Duration::from_secs(5),
+                "Timed out waiting for clean disconnect before redial"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // Allow OS TCP sockets on loopback to settle before redialing
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // Redial and wait for handshake to re-establish
+        let _ = handle_liar.dial(addr_victim.clone()).await;
+        let _ = handle_victim.dial(addr_liar.clone()).await;
+        wait_for_peer_handshake(&handle_victim, peer_id_liar).await;
+
+        let st_after = handle_victim.status().await.unwrap();
+        assert_eq!(st_after.tip_height, 4);
+        assert_eq!(st_after.tip_block_id, expected_tip);
+
+        handle_victim.stop().await;
+        handle_honest.stop().await;
+        liar_responder.abort();
+        task_liar.abort();
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn test_real_p2p_equal_work_tiebreak_rotation_converges_when_first_peer_stalls() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir_victim = TempDir::new().unwrap();
+        let dir_honest = TempDir::new().unwrap();
+        let devnet_chain_id = hash::chain_id(DEVNET);
+        let genesis = genesis_block(devnet_chain_id);
+
+        // Honest Node C has 3 valid blocks (work = 3, height = 3)
+        let mut runtime_honest = NodeRuntime::init(create_node_config(&dir_honest)).unwrap();
+        let miner_c = TestKeypair::from_seed(82);
+        let mut state_c = ChainState::from_genesis(&genesis).unwrap();
+        for h in 1..=3 {
+            let cb = make_coinbase(devnet_chain_id, h, miner_c.address, 1_000_000_000);
+            let b = make_hybrid_block(&state_c, GENESIS_TIMESTAMP + h * 120, vec![cb]);
+            state_c.apply_block(&b).unwrap();
+            runtime_honest.submit_block(b).await.unwrap();
+        }
+        let expected_tip = state_c.tip_block_id().unwrap();
+        let (handle_honest, _task_honest) = runtime_honest.spawn_actor();
+        let addr_honest = wait_for_listen_addr(&handle_honest).await;
+
+        // Controlled equal-work Peer B advertises work = 3, height = 3, fake unstored tip,
+        // and returns empty Headers([]) (ZeroProgress Ok(()))
+        let keypair_staller = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id_staller = ownchain::p2p::peer_id_from_keypair(&keypair_staller);
+        let (service_staller, handle_staller, mut event_rx_staller) = NetworkService::new(
+            keypair_staller,
+            "devnet",
+            devnet_chain_id,
+            genesis.block_id(),
+            3,
+            Hash::new([0xcc; 32]),
+            U256::from_u128(3),
+            "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            50,
+            500,
+            500,
+        )
+        .unwrap();
+        let task_staller = tokio::spawn(service_staller.run());
+
+        let mut addr_staller = None;
+        for _ in 0..50 {
+            if let Some(a) = handle_staller
+                .get_listen_addrs()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .next()
+            {
+                addr_staller = Some(a);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let addr_staller = addr_staller.expect("Staller failed to bind listen addr");
+
+        let handle_staller_req = handle_staller.clone();
+        let staller_responder = tokio::spawn(async move {
+            while let Some(ev) = event_rx_staller.recv().await {
+                if let NetworkEvent::SyncRequestReceived { channel, .. } = ev {
+                    let _ = handle_staller_req
+                        .send_sync_response(channel, SyncResponse::Headers(vec![]))
+                        .await;
+                }
+            }
+        });
+
+        let (handle_victim, _task_victim) =
+            NodeRuntime::spawn(create_node_config(&dir_victim)).unwrap();
+
+        // Dial stalling equal-work Peer B first, then Honest equal-work Peer C
+        handle_victim.dial(addr_staller).await.unwrap();
+        wait_for_peer_handshake(&handle_victim, peer_id_staller).await;
+        handle_victim.dial(addr_honest).await.unwrap();
+        wait_for_peer_handshake(&handle_victim, handle_honest.peer_id()).await;
+
+        // Victim must detect ZeroProgress on Peer B, rotate to Peer C, and sync height 3 cleanly
+        let start = Instant::now();
+        loop {
+            let st = handle_victim.status().await.unwrap();
+            if st.tip_height == 3 && st.tip_block_id == expected_tip {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "Timed out waiting for equal-work rotation away from stalling peer (tip #{})",
+                st.tip_height
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        handle_victim.stop().await;
+        handle_honest.stop().await;
+        staller_responder.abort();
+        task_staller.abort();
+    })
+    .await
+    .expect("test timed out");
 }

@@ -40,6 +40,8 @@ pub enum ChainError {
     Encoding(EncodeError),
     /// The block failed consensus state transition.
     State(String),
+    /// Local chain state or internal invariant failure unrelated to peer payload validity.
+    Internal(String),
 }
 
 impl core::fmt::Display for ChainError {
@@ -48,6 +50,7 @@ impl core::fmt::Display for ChainError {
             ChainError::Invalid(e) => write!(f, "invalid block: {e}"),
             ChainError::Encoding(e) => write!(f, "encoding error: {e}"),
             ChainError::State(s) => write!(f, "state transition error: {s}"),
+            ChainError::Internal(s) => write!(f, "internal chain error: {s}"),
         }
     }
 }
@@ -345,7 +348,7 @@ impl ChainState {
             return Ok(());
         }
         let snap = self.history.get(&height).ok_or_else(|| {
-            ChainError::State(format!(
+            ChainError::Internal(format!(
                 "no snapshot available for rollback to height {height}"
             ))
         })?;
@@ -379,7 +382,7 @@ impl ChainState {
             .iter()
             .position(|b| b.block_id() == fork_parent_id)
             .ok_or_else(|| {
-                ChainError::State("reorg fork block not found on current chain".into())
+                ChainError::Internal("reorg fork block not found on current chain".into())
             })? as u64;
 
         let mut candidate = self.clone();
@@ -501,17 +504,15 @@ impl ChainState {
             }
             for (sender_addr, recipient, amount) in releases {
                 let sender = candidate_accounts.get_mut(&sender_addr).ok_or_else(|| {
-                    ChainError::State("sender missing during pending release".into())
+                    ChainError::Internal("sender missing during pending release".into())
                 })?;
-                sender.balance = sender
-                    .balance
-                    .checked_sub(amount)
-                    .ok_or_else(|| ChainError::State("underflow during pending release".into()))?;
+                sender.balance = sender.balance.checked_sub(amount).ok_or_else(|| {
+                    ChainError::Internal("underflow during pending release".into())
+                })?;
                 let rec = candidate_accounts.entry(recipient).or_default();
-                rec.balance = rec
-                    .balance
-                    .checked_add(amount)
-                    .ok_or_else(|| ChainError::State("overflow during pending release".into()))?;
+                rec.balance = rec.balance.checked_add(amount).ok_or_else(|| {
+                    ChainError::Internal("overflow during pending release".into())
+                })?;
                 candidate_confirmed.insert((sender_addr, recipient));
             }
 

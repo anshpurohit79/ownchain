@@ -65,19 +65,19 @@ pub enum SyncResponse {
 }
 
 // Wire message tags
-const TAG_REQ_HANDSHAKE: u8 = 0;
-const TAG_REQ_GET_STATUS: u8 = 1;
-const TAG_REQ_GET_HEADERS: u8 = 2;
-const TAG_REQ_GET_BLOCKS: u8 = 3;
-const TAG_REQ_GET_BLOCK_BY_HEIGHT: u8 = 4;
-const TAG_REQ_GET_MISSING_PARENT: u8 = 5;
+pub(crate) const TAG_REQ_HANDSHAKE: u8 = 0;
+pub(crate) const TAG_REQ_GET_STATUS: u8 = 1;
+pub(crate) const TAG_REQ_GET_HEADERS: u8 = 2;
+pub(crate) const TAG_REQ_GET_BLOCKS: u8 = 3;
+pub(crate) const TAG_REQ_GET_BLOCK_BY_HEIGHT: u8 = 4;
+pub(crate) const TAG_REQ_GET_MISSING_PARENT: u8 = 5;
 
-const TAG_RESP_HANDSHAKE: u8 = 9;
-const TAG_RESP_STATUS: u8 = 10;
-const TAG_RESP_HEADERS: u8 = 11;
-const TAG_RESP_BLOCKS: u8 = 12;
-const TAG_RESP_NOT_FOUND: u8 = 13;
-const TAG_RESP_ERROR: u8 = 14;
+pub(crate) const TAG_RESP_HANDSHAKE: u8 = 9;
+pub(crate) const TAG_RESP_STATUS: u8 = 10;
+pub(crate) const TAG_RESP_HEADERS: u8 = 11;
+pub(crate) const TAG_RESP_BLOCKS: u8 = 12;
+pub(crate) const TAG_RESP_NOT_FOUND: u8 = 13;
+pub(crate) const TAG_RESP_ERROR: u8 = 14;
 
 impl SyncRequest {
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -150,9 +150,15 @@ impl SyncRequest {
                 }
                 let start_height = u64::from_le_bytes(bytes[1..9].try_into().unwrap());
                 let max_count = u32::from_le_bytes(bytes[9..13].try_into().unwrap());
+                if max_count == 0 || max_count as usize > MAX_HEADERS_PER_RESPONSE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "GetHeaders max_count must be between 1 and MAX_HEADERS_PER_RESPONSE",
+                    ));
+                }
                 Ok(SyncRequest::GetHeaders {
                     start_height,
-                    max_count: max_count.min(MAX_HEADERS_PER_RESPONSE as u32),
+                    max_count,
                 })
             }
             TAG_REQ_GET_BLOCKS => {
@@ -163,7 +169,12 @@ impl SyncRequest {
                     ));
                 }
                 let count = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
-                let count = count.min(MAX_BLOCKS_PER_RESPONSE);
+                if count == 0 || count > MAX_BLOCKS_PER_RESPONSE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "GetBlocks count must be between 1 and MAX_BLOCKS_PER_RESPONSE",
+                    ));
+                }
                 let expected = 5 + count * 32;
                 if bytes.len() != expected {
                     return Err(io::Error::new(
@@ -321,7 +332,12 @@ impl SyncResponse {
                     ));
                 }
                 let count = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
-                let count = count.min(MAX_HEADERS_PER_RESPONSE);
+                if count > MAX_HEADERS_PER_RESPONSE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "headers count exceeds limit",
+                    ));
+                }
                 let expected = 5 + count * HEADER_LEN;
                 if bytes.len() != expected {
                     return Err(io::Error::new(
@@ -346,7 +362,12 @@ impl SyncResponse {
                     ));
                 }
                 let count = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
-                let count = count.min(MAX_BLOCKS_PER_RESPONSE);
+                if count > MAX_BLOCKS_PER_RESPONSE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "blocks count exceeds limit",
+                    ));
+                }
                 let mut o = 5;
                 let mut blocks = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -601,5 +622,177 @@ mod tests {
         } else {
             panic!("expected SyncResponse::Blocks");
         }
+    }
+
+    #[test]
+    fn test_reject_oversized_counts_and_malleable_clamping() {
+        // 1. GetHeaders with max_count exceeding MAX_HEADERS_PER_RESPONSE (500)
+        let mut bad_get_headers = vec![TAG_REQ_GET_HEADERS];
+        bad_get_headers.extend_from_slice(&1u64.to_le_bytes());
+        bad_get_headers.extend_from_slice(&(MAX_HEADERS_PER_RESPONSE as u32 + 1).to_le_bytes());
+        assert!(SyncRequest::from_bytes(&bad_get_headers).is_err());
+
+        let mut clamp_get_headers = vec![TAG_REQ_GET_HEADERS];
+        clamp_get_headers.extend_from_slice(&1u64.to_le_bytes());
+        clamp_get_headers.extend_from_slice(&1000u32.to_le_bytes());
+        assert!(SyncRequest::from_bytes(&clamp_get_headers).is_err());
+
+        // 2. GetBlocks with count exceeding MAX_BLOCKS_PER_RESPONSE (64)
+        let mut bad_get_blocks = vec![TAG_REQ_GET_BLOCKS];
+        bad_get_blocks.extend_from_slice(&(MAX_BLOCKS_PER_RESPONSE as u32 + 1).to_le_bytes());
+        for _ in 0..=MAX_BLOCKS_PER_RESPONSE {
+            bad_get_blocks.extend_from_slice(&[0x11; 32]);
+        }
+        assert!(SyncRequest::from_bytes(&bad_get_blocks).is_err());
+
+        // 3. Headers response claiming 1000 items clamped to 500
+        let mut bad_headers_resp = vec![TAG_RESP_HEADERS];
+        bad_headers_resp.extend_from_slice(&1000u32.to_le_bytes());
+        // Even if payload length matches 500 items, count 1000 must be rejected
+        bad_headers_resp.resize(5 + MAX_HEADERS_PER_RESPONSE * HEADER_LEN, 0);
+        assert!(SyncResponse::from_bytes(&bad_headers_resp).is_err());
+
+        // 4. Headers response claiming MAX_HEADERS_PER_RESPONSE + 1 items
+        let mut bad_headers_resp_plus_one = vec![TAG_RESP_HEADERS];
+        bad_headers_resp_plus_one
+            .extend_from_slice(&(MAX_HEADERS_PER_RESPONSE as u32 + 1).to_le_bytes());
+        bad_headers_resp_plus_one.resize(5 + (MAX_HEADERS_PER_RESPONSE + 1) * HEADER_LEN, 0);
+        assert!(SyncResponse::from_bytes(&bad_headers_resp_plus_one).is_err());
+
+        // 5. Blocks response claiming count exceeding MAX_BLOCKS_PER_RESPONSE
+        let mut bad_blocks_resp = vec![TAG_RESP_BLOCKS];
+        bad_blocks_resp.extend_from_slice(&(MAX_BLOCKS_PER_RESPONSE as u32 + 1).to_le_bytes());
+        assert!(SyncResponse::from_bytes(&bad_blocks_resp).is_err());
+
+        let mut bad_blocks_resp_1000 = vec![TAG_RESP_BLOCKS];
+        bad_blocks_resp_1000.extend_from_slice(&1000u32.to_le_bytes());
+        assert!(SyncResponse::from_bytes(&bad_blocks_resp_1000).is_err());
+    }
+
+    #[test]
+    fn test_truncated_wire_messages() {
+        // Truncated GetBlocks count
+        assert!(SyncRequest::from_bytes(&[TAG_REQ_GET_BLOCKS, 1, 0]).is_err());
+
+        // Truncated GetHeaders length
+        assert!(SyncRequest::from_bytes(&[TAG_REQ_GET_HEADERS, 1, 2, 3]).is_err());
+
+        // Truncated Headers response count
+        assert!(SyncResponse::from_bytes(&[TAG_RESP_HEADERS, 0x01]).is_err());
+
+        // Truncated Blocks response count
+        assert!(SyncResponse::from_bytes(&[TAG_RESP_BLOCKS, 0x01, 0x02]).is_err());
+
+        // Truncated block length in Blocks response
+        let mut trunc_block = vec![TAG_RESP_BLOCKS];
+        trunc_block.extend_from_slice(&1u32.to_le_bytes());
+        trunc_block.extend_from_slice(&[0xaa]); // incomplete 4-byte block length
+        assert!(SyncResponse::from_bytes(&trunc_block).is_err());
+
+        // Truncated block payload in Blocks response
+        let mut trunc_block_payload = vec![TAG_RESP_BLOCKS];
+        trunc_block_payload.extend_from_slice(&1u32.to_le_bytes());
+        trunc_block_payload.extend_from_slice(&100u32.to_le_bytes()); // claim 100 bytes
+        trunc_block_payload.extend_from_slice(&[0xbb; 20]); // only 20 bytes provided
+        assert!(SyncResponse::from_bytes(&trunc_block_payload).is_err());
+    }
+
+    #[test]
+    fn test_zero_count_request_rejection() {
+        // GetHeaders with max_count == 0 must be rejected with InvalidData
+        let mut zero_get_headers = vec![TAG_REQ_GET_HEADERS];
+        zero_get_headers.extend_from_slice(&10u64.to_le_bytes());
+        zero_get_headers.extend_from_slice(&0u32.to_le_bytes());
+        let err = SyncRequest::from_bytes(&zero_get_headers).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // GetBlocks with count == 0 must be rejected with InvalidData
+        let mut zero_get_blocks = vec![TAG_REQ_GET_BLOCKS];
+        zero_get_blocks.extend_from_slice(&0u32.to_le_bytes());
+        let err = SyncRequest::from_bytes(&zero_get_blocks).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_sync_protocol_frame_trailing_bytes() {
+        // Valid GetStatus: 1 byte
+        let valid_status = vec![TAG_REQ_GET_STATUS];
+        assert_eq!(
+            SyncRequest::from_bytes(&valid_status).unwrap(),
+            SyncRequest::GetStatus
+        );
+        let mut bad_status = valid_status.clone();
+        bad_status.push(0xff); // 1 trailing byte
+        assert_eq!(
+            SyncRequest::from_bytes(&bad_status).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // Valid GetHeaders: 1 + 8 + 4 = 13 bytes
+        let mut valid_get_headers = vec![TAG_REQ_GET_HEADERS];
+        valid_get_headers.extend_from_slice(&5u64.to_le_bytes());
+        valid_get_headers.extend_from_slice(&10u32.to_le_bytes());
+        assert!(SyncRequest::from_bytes(&valid_get_headers).is_ok());
+        let mut bad_get_headers = valid_get_headers.clone();
+        bad_get_headers.push(0x42); // 1 trailing byte
+        assert_eq!(
+            SyncRequest::from_bytes(&bad_get_headers)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // Valid GetBlockByHeight: 1 + 8 = 9 bytes
+        let mut valid_by_height = vec![TAG_REQ_GET_BLOCK_BY_HEIGHT];
+        valid_by_height.extend_from_slice(&7u64.to_le_bytes());
+        assert!(SyncRequest::from_bytes(&valid_by_height).is_ok());
+        let mut bad_by_height = valid_by_height.clone();
+        bad_by_height.extend_from_slice(&[0x01, 0x02]); // trailing bytes
+        assert_eq!(
+            SyncRequest::from_bytes(&bad_by_height).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // Valid GetMissingParent: 1 + 32 = 33 bytes
+        let mut valid_missing_parent = vec![TAG_REQ_GET_MISSING_PARENT];
+        valid_missing_parent.extend_from_slice(&[0xaa; 32]);
+        assert!(SyncRequest::from_bytes(&valid_missing_parent).is_ok());
+        let mut bad_missing_parent = valid_missing_parent.clone();
+        bad_missing_parent.push(0x00);
+        assert_eq!(
+            SyncRequest::from_bytes(&bad_missing_parent)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // Valid NotFound response: 1 byte
+        let valid_not_found = vec![TAG_RESP_NOT_FOUND];
+        assert_eq!(
+            SyncResponse::from_bytes(&valid_not_found).unwrap(),
+            SyncResponse::NotFound
+        );
+        let mut bad_not_found = valid_not_found.clone();
+        bad_not_found.push(0x99);
+        assert_eq!(
+            SyncResponse::from_bytes(&bad_not_found).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        // Valid Error response: 1 + 2 + len
+        let mut valid_error = vec![TAG_RESP_ERROR];
+        let msg = "boom";
+        valid_error.extend_from_slice(&(msg.len() as u16).to_le_bytes());
+        valid_error.extend_from_slice(msg.as_bytes());
+        assert_eq!(
+            SyncResponse::from_bytes(&valid_error).unwrap(),
+            SyncResponse::Error(msg.into())
+        );
+        let mut bad_error = valid_error.clone();
+        bad_error.push(0x00); // 1 trailing byte
+        assert_eq!(
+            SyncResponse::from_bytes(&bad_error).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }

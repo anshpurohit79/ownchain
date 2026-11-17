@@ -14,14 +14,16 @@ pub const MAX_FRAME_LENGTH: usize = 2_100_000;
 pub const LENGTH_PREFIX_LEN: usize = 4;
 
 /// Errors arising during P2P frame encoding or decoding.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum FramingError {
     /// Frame exceeds the maximum allowed length.
     FrameTooLarge { actual: usize, max: usize },
     /// Input stream was truncated before reading full frame.
     Truncated { expected: usize, actual: usize },
+    /// Frame contains non-empty trailing bytes after the length prefix payload.
+    TrailingBytes { remaining: usize },
     /// I/O error during read or write.
-    Io(io::Error),
+    Io(String),
 }
 
 impl core::fmt::Display for FramingError {
@@ -36,6 +38,12 @@ impl core::fmt::Display for FramingError {
                     "frame truncated: expected {expected} bytes, got {actual}"
                 )
             }
+            FramingError::TrailingBytes { remaining } => {
+                write!(
+                    f,
+                    "frame contains {remaining} unexpected trailing bytes after payload"
+                )
+            }
             FramingError::Io(e) => write!(f, "framing I/O error: {e}"),
         }
     }
@@ -45,7 +53,7 @@ impl std::error::Error for FramingError {}
 
 impl From<io::Error> for FramingError {
     fn from(e: io::Error) -> Self {
-        FramingError::Io(e)
+        FramingError::Io(e.to_string())
     }
 }
 
@@ -79,7 +87,7 @@ pub fn decode_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, FramingError> {
                 actual: 0,
             }
         } else {
-            FramingError::Io(e)
+            FramingError::Io(e.to_string())
         }
     })?;
 
@@ -126,6 +134,20 @@ pub fn decode_frame_slice(bytes: &[u8]) -> Result<(&[u8], &[u8]), FramingError> 
     Ok((&bytes[LENGTH_PREFIX_LEN..total], &bytes[total..]))
 }
 
+/// Decodes a frame from a contiguous byte slice, strictly verifying that the frame consumes the entire slice.
+///
+/// Returns `Ok(payload)` if the entire slice is consumed.
+/// Returns `Err(FramingError::TrailingBytes)` if any unconsumed trailing bytes remain.
+pub fn decode_frame_slice_exact(bytes: &[u8]) -> Result<&[u8], FramingError> {
+    let (payload, remaining) = decode_frame_slice(bytes)?;
+    if !remaining.is_empty() {
+        return Err(FramingError::TrailingBytes {
+            remaining: remaining.len(),
+        });
+    }
+    Ok(payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +165,50 @@ mod tests {
         let (slice_decoded, rem) = decode_frame_slice(&framed).unwrap();
         assert_eq!(slice_decoded, msg);
         assert!(rem.is_empty());
+
+        let exact_decoded = decode_frame_slice_exact(&framed).unwrap();
+        assert_eq!(exact_decoded, msg);
+    }
+
+    #[test]
+    fn test_decode_frame_slice_exact_rejects_trailing_bytes() {
+        let msg = b"block payload";
+        let mut framed = encode_frame(msg).unwrap();
+
+        // 1. Valid message with no trailing bytes
+        assert_eq!(decode_frame_slice_exact(&framed).unwrap(), msg);
+
+        // 2. Valid message followed by one extra byte
+        let mut framed_plus_one = framed.clone();
+        framed_plus_one.push(0xaa);
+        assert_eq!(
+            decode_frame_slice_exact(&framed_plus_one),
+            Err(FramingError::TrailingBytes { remaining: 1 })
+        );
+
+        // 3. Valid message followed by multiple extra bytes
+        let mut framed_plus_multi = framed.clone();
+        framed_plus_multi.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(
+            decode_frame_slice_exact(&framed_plus_multi),
+            Err(FramingError::TrailingBytes { remaining: 4 })
+        );
+
+        // 4. Truncated frame (incomplete payload)
+        framed.pop();
+        assert!(matches!(
+            decode_frame_slice_exact(&framed),
+            Err(FramingError::Truncated { .. })
+        ));
+
+        // 5. Truncated length prefix (less than 4 bytes)
+        assert!(matches!(
+            decode_frame_slice_exact(&[0x01, 0x02]),
+            Err(FramingError::Truncated {
+                expected: 4,
+                actual: 2
+            })
+        ));
     }
 
     #[test]
