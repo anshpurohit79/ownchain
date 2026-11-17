@@ -202,14 +202,12 @@ impl OrchardTree {
     pub fn append(&mut self, cmx: &ExtractedNoteCommitment) {
         let mut cur = MerkleHashOrchard::from_cmx(cmx);
         let mut c = self.count;
-        for lvl in 0..32 {
+        for (lvl, slot) in self.frontier.iter_mut().enumerate() {
             if (c & 1) == 0 {
-                self.frontier[lvl] = Some(cur);
+                *slot = Some(cur);
                 break;
             } else {
-                let left = self.frontier[lvl]
-                    .take()
-                    .expect("frontier node missing at level");
+                let left = slot.take().expect("frontier node missing at level");
                 cur = MerkleHashOrchard::combine_batch((lvl as u8).into(), [(&left, &cur)])
                     .pop()
                     .unwrap();
@@ -228,8 +226,8 @@ impl OrchardTree {
         let empty_roots = EMPTY_ROOTS.map(|b| MerkleHashOrchard::from_bytes(&b).unwrap());
 
         let mut root_val: Option<(usize, MerkleHashOrchard)> = None;
-        for lvl in 0..32 {
-            if let Some(node) = self.frontier[lvl] {
+        for (lvl, slot) in self.frontier.iter().enumerate() {
+            if let Some(node) = *slot {
                 match root_val {
                     None => {
                         root_val = Some((lvl, node));

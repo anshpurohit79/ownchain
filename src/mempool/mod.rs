@@ -104,6 +104,8 @@ pub enum MempoolError {
     PendingGovernanceConflict { account: Hash, existing_tx: Hash },
     /// Malformed transaction payload or guardian signatures.
     Malformed(String),
+    /// Internal mempool bookkeeping or local runtime failure unrelated to peer payload validity.
+    Internal(String),
 }
 
 impl core::fmt::Display for MempoolError {
@@ -184,6 +186,7 @@ impl core::fmt::Display for MempoolError {
                 "governance conflict for account {account}: existing pending tx {existing_tx}"
             ),
             MempoolError::Malformed(s) => write!(f, "malformed transaction: {s}"),
+            MempoolError::Internal(s) => write!(f, "internal mempool error: {s}"),
         }
     }
 }
@@ -269,6 +272,8 @@ pub struct Mempool {
     cancellation_targets: BTreeMap<Hash, Hash>,
     /// Active governance locks per account: target_account -> GovernanceLock.
     pending_governance_locks: BTreeMap<Hash, GovernanceLock>,
+    /// Transaction IDs recently evicted (via conflict replacement or revalidation drops).
+    recently_evicted: Vec<Hash>,
 }
 
 impl Mempool {
@@ -292,7 +297,21 @@ impl Mempool {
             total_pending_shielded_drain: 0,
             cancellation_targets: BTreeMap::new(),
             pending_governance_locks: BTreeMap::new(),
+            recently_evicted: Vec::new(),
         }
+    }
+
+    fn record_evicted(&mut self, tx_id: Hash) {
+        const MAX_RECENTLY_EVICTED_LOG: usize = 10_000;
+        if self.recently_evicted.len() >= MAX_RECENTLY_EVICTED_LOG {
+            self.recently_evicted.remove(0);
+        }
+        self.recently_evicted.push(tx_id);
+    }
+
+    /// Drains and returns transaction IDs recently evicted by replacement or revalidation.
+    pub fn drain_evicted_tx_ids(&mut self) -> Vec<Hash> {
+        std::mem::take(&mut self.recently_evicted)
     }
 
     /// Returns the number of transactions currently in the mempool.
@@ -446,7 +465,7 @@ impl Mempool {
             .len()
             .checked_sub(to_evict.len())
             .ok_or_else(|| {
-                MempoolError::Malformed(
+                MempoolError::Internal(
                     "eviction count exceeds total transactions in mempool".into(),
                 )
             })?;
@@ -459,13 +478,13 @@ impl Mempool {
 
         let evicted_bytes: usize = to_evict.iter().try_fold(0usize, |acc, id| {
             let meta = self.tx_meta.get(id).ok_or_else(|| {
-                MempoolError::Malformed(format!("missing metadata for evicted transaction {id}"))
+                MempoolError::Internal(format!("missing metadata for evicted transaction {id}"))
             })?;
             acc.checked_add(meta.size)
-                .ok_or_else(|| MempoolError::Malformed("evicted bytes calculation overflow".into()))
+                .ok_or_else(|| MempoolError::Internal("evicted bytes calculation overflow".into()))
         })?;
         let surviving_bytes = self.total_bytes.checked_sub(evicted_bytes).ok_or_else(|| {
-            MempoolError::Malformed("evicted bytes exceed total bytes in mempool".into())
+            MempoolError::Internal("evicted bytes exceed total bytes in mempool".into())
         })?;
         let projected_total_bytes = surviving_bytes
             .checked_add(raw_tx.len())
@@ -478,7 +497,7 @@ impl Mempool {
         let new_shielded_drain = if meta.shielded_drain > 0 {
             self.total_pending_shielded_drain
                 .checked_add(meta.shielded_drain)
-                .ok_or_else(|| MempoolError::Malformed("shielded drain overflow".into()))?
+                .ok_or_else(|| MempoolError::Internal("shielded drain overflow".into()))?
         } else {
             self.total_pending_shielded_drain
         };
@@ -488,14 +507,12 @@ impl Mempool {
             if let Some(acct) = meta.sender_account {
                 let evicted_allowance: u128 = to_evict.iter().try_fold(0u128, |acc, id| {
                     let m = self.tx_meta.get(id).ok_or_else(|| {
-                        MempoolError::AllowanceExceeded(format!(
+                        MempoolError::Internal(format!(
                             "missing metadata for evicted transaction {id}"
                         ))
                     })?;
                     acc.checked_add(m.allowance_consumption).ok_or_else(|| {
-                        MempoolError::AllowanceExceeded(
-                            "evicted allowance calculation overflow".into(),
-                        )
+                        MempoolError::Internal("evicted allowance calculation overflow".into())
                     })
                 })?;
                 let current = self
@@ -505,7 +522,7 @@ impl Mempool {
                     .unwrap_or(0);
                 let surviving_allowance =
                     current.checked_sub(evicted_allowance).ok_or_else(|| {
-                        MempoolError::AllowanceExceeded(
+                        MempoolError::Internal(
                             "evicted allowance exceeds current pending reservation".into(),
                         )
                     })?;
@@ -514,7 +531,7 @@ impl Mempool {
                     surviving_allowance
                         .checked_add(meta.allowance_consumption)
                         .ok_or_else(|| {
-                            MempoolError::AllowanceExceeded("allowance reservation overflow".into())
+                            MempoolError::Internal("allowance reservation overflow".into())
                         })?,
                 ))
             } else {
@@ -527,6 +544,7 @@ impl Mempool {
         // All validations and checked arithmetic succeeded: atomically evict conflicting transactions
         for evict_id in &to_evict {
             self.remove(evict_id);
+            self.record_evicted(*evict_id);
         }
 
         // Register in mempool state atomically
@@ -650,7 +668,7 @@ impl Mempool {
                     .ok_or_else(|| MempoolError::Malformed("spend overflow".into()))?;
                 let spendable = acct
                     .spendable_balance(tip_h)
-                    .map_err(|_| MempoolError::Malformed("spendable balance calculation".into()))?;
+                    .map_err(|_| MempoolError::Internal("spendable balance calculation".into()))?;
                 if needed > spendable {
                     return Err(MempoolError::InsufficientSpendableBalance {
                         account: sender_addr,
@@ -782,7 +800,7 @@ impl Mempool {
                     .ok_or_else(|| MempoolError::Malformed("fee overflow".into()))?;
                 let spendable = acct
                     .spendable_balance(tip_h)
-                    .map_err(|_| MempoolError::Malformed("spendable balance".into()))?;
+                    .map_err(|_| MempoolError::Internal("spendable balance".into()))?;
                 if needed > spendable {
                     return Err(MempoolError::InsufficientSpendableBalance {
                         account: account_addr,
@@ -1005,18 +1023,18 @@ impl Mempool {
                 // Calculate projected pending transparent spend excluding evicted transactions
                 let evicted_spends: u128 = to_evict.iter().try_fold(0u128, |acc, id| {
                     let m = self.tx_meta.get(id).ok_or_else(|| {
-                        MempoolError::Malformed(format!(
+                        MempoolError::Internal(format!(
                             "missing metadata for evicted transaction {id}"
                         ))
                     })?;
                     acc.checked_add(m.account_spend).ok_or_else(|| {
-                        MempoolError::Malformed("evicted spends calculation overflow".into())
+                        MempoolError::Internal("evicted spends calculation overflow".into())
                     })
                 })?;
                 let current_pending = self.account_spends.get(&target_addr).copied().unwrap_or(0);
                 let projected_pending =
                     current_pending.checked_sub(evicted_spends).ok_or_else(|| {
-                        MempoolError::Malformed(
+                        MempoolError::Internal(
                             "evicted spends exceed current pending spend reservation".into(),
                         )
                     })?;
@@ -1025,7 +1043,7 @@ impl Mempool {
                     .ok_or_else(|| MempoolError::Malformed("fee overflow".into()))?;
                 let spendable = target
                     .spendable_balance(tip_h)
-                    .map_err(|_| MempoolError::Malformed("spendable balance".into()))?;
+                    .map_err(|_| MempoolError::Internal("spendable balance".into()))?;
                 if needed > spendable {
                     return Err(MempoolError::InsufficientSpendableBalance {
                         account: target_addr,
@@ -1196,7 +1214,7 @@ impl Mempool {
                     .ok_or_else(|| MempoolError::Malformed("fee overflow".into()))?;
                 let spendable = sender
                     .spendable_balance(tip_h)
-                    .map_err(|_| MempoolError::Malformed("spendable balance".into()))?;
+                    .map_err(|_| MempoolError::Internal("spendable balance".into()))?;
                 if needed > spendable {
                     return Err(MempoolError::InsufficientSpendableBalance {
                         account: sender_addr,
@@ -1254,7 +1272,7 @@ impl Mempool {
                 let current_drain = self
                     .total_pending_shielded_drain
                     .checked_add(pool_drain)
-                    .ok_or_else(|| MempoolError::Malformed("shielded drain overflow".into()))?;
+                    .ok_or_else(|| MempoolError::Internal("shielded drain overflow".into()))?;
                 if current_drain > pool_balance {
                     return Err(MempoolError::InsufficientShieldedPoolBalance {
                         available: pool_balance,
@@ -1465,7 +1483,7 @@ impl Mempool {
                     .ok_or_else(|| MempoolError::Malformed("spend overflow".into()))?;
                 let spendable = acct
                     .spendable_balance(tip_h)
-                    .map_err(|_| MempoolError::Malformed("spendable balance".into()))?;
+                    .map_err(|_| MempoolError::Internal("spendable balance".into()))?;
                 if needed > spendable {
                     return Err(MempoolError::InsufficientSpendableBalance {
                         account: sender_addr,
@@ -1799,6 +1817,7 @@ impl Mempool {
     /// Handles a chain reorganization: revalidates all pending mempool transactions against `new_chain_state`.
     pub fn on_reorganization(&mut self, new_chain_state: &ChainState) {
         self.revalidate(new_chain_state);
+        self.recently_evicted.clear();
     }
 
     /// Revalidates all mempool transactions against `chain_state`.
@@ -1825,9 +1844,11 @@ impl Mempool {
         self.account_allowance_reservations.clear();
         self.pending_governance_locks.clear();
 
-        for (_id, raw_tx) in current_txs {
+        for (id, raw_tx) in current_txs {
             // Attempt re-admission against new state
-            let _ = self.admit(&raw_tx, chain_state);
+            if self.admit(&raw_tx, chain_state).is_err() {
+                self.record_evicted(id);
+            }
         }
     }
 }

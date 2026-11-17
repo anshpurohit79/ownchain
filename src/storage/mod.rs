@@ -15,6 +15,7 @@ use crate::difficulty::U256;
 use crate::error::EncodeError;
 use crate::genesis::genesis_block;
 use crate::hash::Hash;
+use crate::header::{Header, HEADER_LEN};
 
 /// The database schema version for OwnChain persistent storage.
 pub const DATABASE_SCHEMA_VERSION: u32 = 1;
@@ -592,6 +593,39 @@ impl BlockStore {
         }
     }
 
+    /// Retrieves the block header at height `height` on the active canonical chain
+    /// directly from stored block bytes without deserializing full transaction bodies.
+    pub fn get_header_by_height(&self, height: u64) -> Result<Option<Header>, StorageError> {
+        let read_tx = self.db.begin_read()?;
+        let height_idx = read_tx.open_table(TABLE_HEIGHT_INDEX)?;
+        match height_idx.get(height)? {
+            Some(id_val) => {
+                let id = Hash::new(*id_val.value());
+                let blocks = read_tx.open_table(TABLE_BLOCKS)?;
+                match blocks.get(id.as_bytes())? {
+                    Some(bytes) => {
+                        let raw = bytes.value();
+                        if raw.len() < HEADER_LEN {
+                            return Err(StorageError::CorruptedBlock {
+                                block_id: id,
+                                source: EncodeError::InvalidHeaderLength { actual: raw.len() },
+                            });
+                        }
+                        let header = Header::from_bytes(&raw[..HEADER_LEN]).map_err(|e| {
+                            StorageError::CorruptedBlock {
+                                block_id: id,
+                                source: e,
+                            }
+                        })?;
+                        Ok(Some(header))
+                    }
+                    None => Ok(None),
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Retrieves block metadata by block ID.
     pub fn get_block_metadata(
         &self,
@@ -1130,5 +1164,20 @@ mod tests {
         let flag = std::sync::atomic::AtomicBool::new(true);
         let cancel_res = store.capture_canonical_chain_snapshot_cooperative(2, Some(&flag));
         assert!(cancel_res.is_err(), "Must abort when cancel_flag is true");
+
+        // 6. Test get_header_by_height directly extracts header without full block deserialization
+        let h0 = store.get_header_by_height(0).unwrap().unwrap();
+        assert_eq!(h0, genesis.header);
+        assert_eq!(h0.block_id(), genesis.block_id());
+
+        let h1 = store.get_header_by_height(1).unwrap().unwrap();
+        assert_eq!(h1, b1.header);
+        assert_eq!(h1.block_id(), b1.block_id());
+
+        let h2 = store.get_header_by_height(2).unwrap().unwrap();
+        assert_eq!(h2, b2.header);
+        assert_eq!(h2.block_id(), b2.block_id());
+
+        assert!(store.get_header_by_height(3).unwrap().is_none());
     }
 }

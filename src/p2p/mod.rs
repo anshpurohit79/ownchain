@@ -13,7 +13,10 @@ pub mod network;
 pub mod protocol;
 
 pub use behaviour::OwnChainBehaviour;
-pub use framing::{decode_frame, decode_frame_slice, encode_frame, FramingError, MAX_FRAME_LENGTH};
+pub use framing::{
+    decode_frame, decode_frame_slice, decode_frame_slice_exact, encode_frame, FramingError,
+    MAX_FRAME_LENGTH,
+};
 pub use handshake::{
     HandshakeError, HandshakeMessage, HANDSHAKE_PROTOCOL_ID, HANDSHAKE_PROTOCOL_VERSION,
 };
