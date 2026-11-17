@@ -210,6 +210,7 @@ async fn pump_until_mesh_ready(
     let b_hash = blocks_topic.hash();
     let t_hash = txs_topic.hash();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut handshake_done = false;
     while tokio::time::Instant::now() < deadline {
         let b_ready = swarm
             .behaviour()
@@ -221,34 +222,43 @@ async fn pump_until_mesh_ready(
             .gossipsub
             .mesh_peers(&t_hash)
             .any(|p| *p == target_peer);
-        if b_ready && t_ready {
+        if b_ready && t_ready && handshake_done {
+            tokio::time::sleep(Duration::from_millis(100)).await;
             return;
         }
         tokio::select! {
             ev = swarm.select_next_some() => {
-                if let SwarmEvent::Behaviour(HarnessPeerBehaviourEvent::RequestResponse(
-                    ReqRespEvent::Message {
-                        message: ReqRespMessage::Request { request: SyncRequest::Handshake(_), channel, .. },
-                        ..
+                match ev {
+                    SwarmEvent::Behaviour(HarnessPeerBehaviourEvent::RequestResponse(
+                        ReqRespEvent::Message {
+                            message: ReqRespMessage::Request { request: SyncRequest::Handshake(_), channel, .. },
+                            ..
+                        }
+                    )) => {
+                        let hs = HandshakeMessage {
+                            protocol_version: HANDSHAKE_PROTOCOL_VERSION,
+                            chain_id,
+                            genesis_hash,
+                            tip_height: 0,
+                            tip_block_id: genesis_hash,
+                            cumulative_work: U256::zero(),
+                            capabilities: 0,
+                            software_version: "harness/1".into(),
+                        };
+                        let _ = swarm.behaviour_mut().request_response.send_response(channel, SyncResponse::Handshake(hs));
                     }
-                )) = ev {
-                    let hs = HandshakeMessage {
-                        protocol_version: HANDSHAKE_PROTOCOL_VERSION,
-                        chain_id,
-                        genesis_hash,
-                        tip_height: 0,
-                        tip_block_id: genesis_hash,
-                        cumulative_work: U256::zero(),
-                        capabilities: 0,
-                        software_version: "harness/1".into(),
-                    };
-                    let _ = swarm.behaviour_mut().request_response.send_response(channel, SyncResponse::Handshake(hs));
+                    SwarmEvent::Behaviour(HarnessPeerBehaviourEvent::RequestResponse(
+                        ReqRespEvent::ResponseSent { peer, .. },
+                    )) if peer == target_peer => {
+                        handshake_done = true;
+                    }
+                    _ => {}
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(20)) => {}
         }
     }
-    panic!("Timed out waiting for mesh readiness with peer {target_peer}");
+    panic!("Timed out waiting for mesh readiness with peer {target_peer} (handshake_done={handshake_done})");
 }
 
 async fn drive_swarms_until<F>(

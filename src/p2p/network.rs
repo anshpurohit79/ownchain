@@ -2319,37 +2319,47 @@ mod tests {
     ) {
         let topic_hash = topic.hash();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut handshake_done = false;
         while tokio::time::Instant::now() < deadline {
-            if swarm
+            let mesh_ready = swarm
                 .behaviour()
                 .gossipsub
                 .mesh_peers(&topic_hash)
-                .any(|p| *p == target_peer)
-            {
+                .any(|p| *p == target_peer);
+            if mesh_ready && handshake_done {
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 return;
             }
             tokio::select! {
                 ev = swarm.select_next_some() => {
-                    if let SwarmEvent::Behaviour(TestGossipPeerBehaviourEvent::RequestResponse(
-                        ReqRespEvent::Message { message: ReqRespMessage::Request { request: SyncRequest::Handshake(_), channel, .. }, .. }
-                    )) = ev {
-                        let hs = HandshakeMessage {
-                            protocol_version: HANDSHAKE_PROTOCOL_VERSION,
-                            chain_id: handshake_chain_id,
-                            genesis_hash: handshake_genesis_hash,
-                            tip_height: 0,
-                            tip_block_id: handshake_genesis_hash,
-                            cumulative_work: U256::zero(),
-                            capabilities: 0,
-                            software_version: "test/1".into(),
-                        };
-                        let _ = swarm.behaviour_mut().request_response.send_response(channel, SyncResponse::Handshake(hs));
+                    match ev {
+                        SwarmEvent::Behaviour(TestGossipPeerBehaviourEvent::RequestResponse(
+                            ReqRespEvent::Message { message: ReqRespMessage::Request { request: SyncRequest::Handshake(_), channel, .. }, .. }
+                        )) => {
+                            let hs = HandshakeMessage {
+                                protocol_version: HANDSHAKE_PROTOCOL_VERSION,
+                                chain_id: handshake_chain_id,
+                                genesis_hash: handshake_genesis_hash,
+                                tip_height: 0,
+                                tip_block_id: handshake_genesis_hash,
+                                cumulative_work: U256::zero(),
+                                capabilities: 0,
+                                software_version: "test/1".into(),
+                            };
+                            let _ = swarm.behaviour_mut().request_response.send_response(channel, SyncResponse::Handshake(hs));
+                        }
+                        SwarmEvent::Behaviour(TestGossipPeerBehaviourEvent::RequestResponse(
+                            ReqRespEvent::ResponseSent { peer, .. },
+                        )) if peer == target_peer => {
+                            handshake_done = true;
+                        }
+                        _ => {}
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(20)) => {}
             }
         }
-        panic!("Timed out waiting for mesh peer {target_peer} on topic {topic_hash}");
+        panic!("Timed out waiting for mesh peer {target_peer} on topic {topic_hash} (handshake_done={handshake_done})");
     }
 
     async fn get_service_listen_addr(handle: &NetworkHandle) -> Multiaddr {
