@@ -4,8 +4,8 @@ use ownchain::difficulty::U256;
 use ownchain::hash::Hash;
 use ownchain::header::{Header, HEADER_LEN, VERSION_INITIAL};
 use ownchain::randomx::{
-    check_pow_target, key_height, pow_target, randomx_hash, verify_pow, RandomxCache,
-    RandomxDataset, RandomxError, RandomxMode, RandomxVm,
+    check_pow_target, key_height, pow_target, randomx_hash, shared_cache, shared_dataset,
+    verify_pow, RandomxCache, RandomxDataset, RandomxError, RandomxMode, RandomxVm,
 };
 use std::sync::{Arc, Mutex};
 
@@ -434,4 +434,210 @@ fn resource_rotation_preserves_older_vm_validity_light() {
     assert_eq!(hash_v1, expected_v1);
 
     assert_ne!(hash_v0, hash_v1);
+}
+
+// ============================================================================
+// PR #9 Process-Wide RandomX Resource Sharing Tests
+// ============================================================================
+
+/// Mutex serializing tests that manipulate process-wide shared cache epochs to ensure
+/// deterministic key rotation assertions across parallel test threads.
+static SHARED_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn shared_cache_same_key_reuse_across_threads() {
+    let _guard = SHARED_CACHE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let key = [0xa1; 32];
+    let num_threads = 4;
+    let mut handles = Vec::new();
+
+    for _ in 0..num_threads {
+        handles.push(std::thread::spawn(move || {
+            shared_cache(&key).expect("shared cache")
+        }));
+    }
+
+    let caches: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    for i in 1..caches.len() {
+        assert!(
+            Arc::ptr_eq(&caches[0], &caches[i]),
+            "All threads must receive identical Arc allocation for the same key"
+        );
+    }
+}
+
+#[test]
+fn shared_cache_concurrent_initialization_no_duplicate() {
+    let _guard = SHARED_CACHE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let key = [0xa2; 32];
+    let num_threads = 8;
+    let barrier = Arc::new(std::sync::Barrier::new(num_threads));
+    let mut handles = Vec::new();
+
+    for _ in 0..num_threads {
+        let b = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            b.wait();
+            shared_cache(&key).expect("shared cache")
+        }));
+    }
+
+    let caches: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    for i in 1..caches.len() {
+        assert!(
+            Arc::ptr_eq(&caches[0], &caches[i]),
+            "Concurrent initialization must share the single allocation"
+        );
+    }
+    // Verify allocation sharing and presence in shared cache manager
+    let mgr_cache = ownchain::randomx::shared_cache_manager()
+        .get_existing(&key)
+        .expect("Shared cache must be present in process manager");
+    assert!(
+        Arc::ptr_eq(&caches[0], &mgr_cache),
+        "All threads and the manager must reference the same allocation"
+    );
+}
+
+#[test]
+fn shared_cache_weak_upgrade_preserves_active_epoch() {
+    let _guard = SHARED_CACHE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let key_b = [0xb1; 32];
+    let key_a = [0xb2; 32];
+
+    // 1. Initialize key_b
+    let cache_b = shared_cache(&key_b).expect("cache b");
+    let vm_b = RandomxVm::light(Arc::clone(&cache_b)).expect("vm b");
+    drop(cache_b); // Only vm_b holds strong ref to key_b
+
+    // 2. Rotate active epoch to key_a
+    let cache_a = shared_cache(&key_a).expect("cache a");
+    assert_eq!(
+        ownchain::randomx::shared_cache_manager().active_key(),
+        Some(key_a)
+    );
+
+    // 3. Request key_b via shared_cache_manager().get_or_init (passive retrieval)
+    let upgraded_b = ownchain::randomx::shared_cache_manager()
+        .get_or_init(&key_b, |_| {
+            panic!("key_b should be upgraded from tracked, not initialized!")
+        })
+        .expect("upgrade b");
+    assert!(Arc::ptr_eq(&upgraded_b, vm_b.cache().unwrap()));
+
+    // 4. Active key must STILL be key_a!
+    assert_eq!(
+        ownchain::randomx::shared_cache_manager().active_key(),
+        Some(key_a),
+        "Upgrading weak reference for historical key must not evict active epoch"
+    );
+    assert!(Arc::ptr_eq(
+        &ownchain::randomx::shared_cache_manager()
+            .get_existing(&key_a)
+            .unwrap(),
+        &cache_a
+    ));
+}
+
+#[test]
+fn shared_cache_key_rotation_and_old_resource_cleanup() {
+    let _guard = SHARED_CACHE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let key_v0 = [0xa3; 32];
+    let key_v1 = [0xa4; 32];
+
+    let cache_v0 = shared_cache(&key_v0).expect("allocate cache v0");
+    let vm_v0 = RandomxVm::light(Arc::clone(&cache_v0)).expect("vm v0");
+
+    let header_v0 = test_header(0, 10);
+    let mut out_v0 = [0u8; 32];
+    vm_v0.calculate_hash(&header_v0, &mut out_v0);
+
+    // Caller drops its handle; VM still retains its own Arc clone
+    drop(cache_v0);
+
+    // Rotate active epoch to key_v1
+    let cache_v1 = shared_cache(&key_v1).expect("allocate cache v1");
+    let vm_v1 = RandomxVm::light(Arc::clone(&cache_v1)).expect("vm v1");
+
+    let header_v1 = test_header(2112, 20);
+    let mut out_v1 = [0u8; 32];
+    vm_v1.calculate_hash(&header_v1, &mut out_v1);
+    assert_ne!(out_v0, out_v1);
+
+    // Manager active is key_v1; vm_v0 holds the only strong reference to key_v0
+    let weak_v0 = Arc::downgrade(vm_v0.cache().unwrap());
+    assert_eq!(weak_v0.strong_count(), 1);
+
+    // Dropping the old VM drops the last legitimate reference to key_v0
+    drop(vm_v0);
+    assert!(
+        weak_v0.upgrade().is_none(),
+        "Old resource must be released when its last legitimate reference is dropped"
+    );
+}
+
+#[test]
+fn shared_dataset_same_key_reuse_across_threads() {
+    let _guard = FAST_MODE_LOCK.lock().unwrap();
+    let num_threads = 4;
+    let mut handles = Vec::new();
+
+    for _ in 0..num_threads {
+        handles.push(std::thread::spawn(|| {
+            shared_dataset(&TEST_KEY).expect("shared dataset")
+        }));
+    }
+
+    let datasets: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    for i in 1..datasets.len() {
+        assert!(
+            Arc::ptr_eq(&datasets[0], &datasets[i]),
+            "All threads must receive identical Arc allocation for the shared dataset"
+        );
+    }
+}
+
+#[test]
+fn shared_dataset_multi_worker_local_vms_sharing() {
+    let _guard = FAST_MODE_LOCK.lock().unwrap();
+    // Reuses the process-wide shared dataset for TEST_KEY (no duplicate allocation!)
+    let dataset = shared_dataset(&TEST_KEY).expect("shared dataset");
+
+    let num_workers = 4;
+    let hashes_per_worker = 5;
+
+    let mut handles = Vec::new();
+    for worker_id in 0..num_workers {
+        let ds = Arc::clone(&dataset);
+        let handle = std::thread::spawn(move || {
+            // Each worker creates its own thread-local VM
+            let vm = RandomxVm::fast(ds).expect("vm creation");
+            let mut results = Vec::new();
+            for nonce in 0..hashes_per_worker {
+                let header = test_header(0, worker_id as u64 * 100 + nonce as u64);
+                let mut out = [0u8; 32];
+                vm.calculate_hash(&header, &mut out);
+                results.push(out);
+            }
+            results
+        });
+        handles.push(handle);
+    }
+
+    for (worker_id, handle) in handles.into_iter().enumerate() {
+        let results = handle.join().expect("worker completed successfully");
+        for (nonce, hash) in results.into_iter().enumerate() {
+            let header = test_header(0, worker_id as u64 * 100 + nonce as u64);
+            let expected = randomx_hash(&TEST_KEY, &header, RandomxMode::Light).unwrap();
+            assert_eq!(hash, expected, "Worker VM hash must match expected hash");
+        }
+    }
 }

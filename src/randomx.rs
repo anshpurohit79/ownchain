@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::raw::{c_uint, c_ulong, c_void};
 use std::ptr::null_mut;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread;
 
 use crate::difficulty::U256;
@@ -76,11 +76,6 @@ extern "C" {
 pub const RANDOMX_FLAG_DEFAULT: c_uint = 0;
 pub const RANDOMX_FLAG_FULL_MEM: c_uint = 4;
 pub const RANDOMX_HASH_SIZE: usize = 32;
-
-/// Maximum number of (key -> fast-mode resources) entries retained in the
-/// thread-local cache. Bounded to prevent unbounded memory growth.
-/// Limited to 1 entry: only the most recently used key's cache is retained.
-const MAX_FAST_MODE_CACHE_ENTRIES: usize = 1;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RandomxMode {
@@ -346,21 +341,324 @@ fn record_drop_event(event: &'static str) {
     });
 }
 
-/// Owns a cached Fast-mode triple (VM, dataset, cache) and ensures
-/// deterministic Drop order: VM is destroyed first, then dataset,
-/// then cache. This matches the requirement that the VM outlives
-/// the dataset, and the cache is released last.
-#[allow(dead_code)]
-struct CacheEntry {
-    vm: RandomxVm,
-    dataset: Arc<RandomxDataset>,
-    cache: Arc<RandomxCache>,
+// ============================================================================
+// Process-wide RandomX Resource Management
+// ============================================================================
+
+struct InFlight<T> {
+    lock: Mutex<Option<Result<Arc<T>, RandomxError>>>,
+    cvar: Condvar,
 }
 
-#[allow(dead_code)]
-struct LightCacheEntry {
-    vm: RandomxVm,
-    cache: Arc<RandomxCache>,
+struct ManagerState<T> {
+    active: Option<([u8; 32], Arc<T>)>,
+    intended_active: Option<[u8; 32]>,
+    tracked: HashMap<[u8; 32], Weak<T>>,
+    in_flight: HashMap<[u8; 32], Arc<InFlight<T>>>,
+}
+
+struct InFlightGuard<'a, T> {
+    manager: &'a Mutex<ManagerState<T>>,
+    key: [u8; 32],
+    inflight: Arc<InFlight<T>>,
+    completed: bool,
+}
+
+impl<'a, T> Drop for InFlightGuard<'a, T> {
+    fn drop(&mut self) {
+        if !self.completed {
+            let mut state = self.manager.lock().unwrap_or_else(|e| e.into_inner());
+            state.in_flight.remove(&self.key);
+            if state.intended_active == Some(self.key) {
+                state.intended_active = state.active.as_ref().map(|(k, _)| *k);
+            }
+            drop(state);
+
+            let mut guard = self.inflight.lock.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_none() {
+                *guard = Some(Err(RandomxError::InitializationFailed));
+                self.inflight.cvar.notify_all();
+            }
+        }
+    }
+}
+
+/// Process-wide, key-aware resource manager for large RandomX allocations.
+///
+/// Deduplicates concurrent initializations for the same key, safely rotates
+/// active epoch resources, and allows old resources to remain alive as long
+/// as existing VMs retain `Arc` references, releasing them immediately once
+/// the last reference is dropped.
+pub struct SharedResourceManager<T> {
+    state: Mutex<ManagerState<T>>,
+}
+
+impl<T> Default for SharedResourceManager<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> SharedResourceManager<T> {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(ManagerState {
+                active: None,
+                intended_active: None,
+                tracked: HashMap::new(),
+                in_flight: HashMap::new(),
+            }),
+        }
+    }
+
+    /// Returns the key of the currently active resource, if any.
+    pub fn active_key(&self) -> Option<[u8; 32]> {
+        let state = self.state.lock().ok()?;
+        state.active.as_ref().map(|(k, _)| *k)
+    }
+
+    /// Returns the key of the intended active epoch, if any.
+    pub fn intended_active_key(&self) -> Option<[u8; 32]> {
+        let state = self.state.lock().ok()?;
+        state.intended_active
+    }
+
+    /// Designates `key` as the intended active epoch.
+    ///
+    /// If an instance for `key` is already active or in memory (tracked), it is promoted
+    /// to active immediately. If an initialization is in flight or started later, it
+    /// will become the active resource upon successful completion. Initializations
+    /// for other keys will not overwrite this active epoch.
+    pub fn set_active_epoch(&self, key: &[u8; 32]) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.intended_active = Some(*key);
+        if let Some((ref active_key, _)) = state.active {
+            if active_key == key {
+                return;
+            }
+        }
+        if let Some(weak) = state.tracked.get(key) {
+            if let Some(arc) = weak.upgrade() {
+                let prev = state.active.take();
+                if let Some((prev_key, prev_arc)) = prev {
+                    state.tracked.insert(prev_key, Arc::downgrade(&prev_arc));
+                }
+                state.active = Some((*key, arc));
+            }
+        }
+    }
+
+    /// Rotates the active epoch to `key`, initializing it if necessary.
+    pub fn set_active<F>(&self, key: &[u8; 32], init: F) -> Result<Arc<T>, RandomxError>
+    where
+        F: FnOnce(&[u8; 32]) -> Result<Arc<T>, RandomxError>,
+    {
+        self.set_active_epoch(key);
+        self.get_or_init(key, init)
+    }
+
+    /// Returns an existing `Arc<T>` for `key` if one is active or still retained
+    /// by existing VMs, without triggering a new allocation.
+    pub fn get_existing(&self, key: &[u8; 32]) -> Option<Arc<T>> {
+        let state = self.state.lock().ok()?;
+        if let Some((ref active_key, ref arc)) = state.active {
+            if active_key == key {
+                return Some(Arc::clone(arc));
+            }
+        }
+        if let Some(weak) = state.tracked.get(key) {
+            if let Some(arc) = weak.upgrade() {
+                return Some(arc);
+            }
+        }
+        None
+    }
+
+    /// Retrieves an existing resource for `key` or initializes it process-wide using `init`.
+    ///
+    /// Concurrent callers for the same key will wait for a single initialization rather
+    /// than performing duplicate allocations.
+    pub fn get_or_init<F>(&self, key: &[u8; 32], init: F) -> Result<Arc<T>, RandomxError>
+    where
+        F: FnOnce(&[u8; 32]) -> Result<Arc<T>, RandomxError>,
+    {
+        let inflight = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+
+            // 1. Check if currently active matches key
+            if let Some((ref active_key, ref arc)) = state.active {
+                if active_key == key {
+                    return Ok(Arc::clone(arc));
+                }
+            }
+
+            // 2. Check if a weak reference is still alive (held by existing VMs)
+            // F-01: Returning an existing resource for a historical key must not evict or
+            // mutate the currently active epoch.
+            if let Some(weak) = state.tracked.get(key) {
+                if let Some(arc) = weak.upgrade() {
+                    return Ok(arc);
+                }
+            }
+
+            // 3. Check if another thread is currently initializing this key
+            if let Some(inflight) = state.in_flight.get(key).cloned() {
+                drop(state);
+                let mut guard = inflight.lock.lock().unwrap_or_else(|e| e.into_inner());
+                while guard.is_none() {
+                    guard = inflight.cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+                }
+                return guard.as_ref().unwrap().clone();
+            }
+
+            // 4. We are the designated initializer for this key
+            let inflight = Arc::new(InFlight {
+                lock: Mutex::new(None),
+                cvar: Condvar::new(),
+            });
+            state.in_flight.insert(*key, Arc::clone(&inflight));
+            inflight
+        };
+
+        let mut guard = InFlightGuard {
+            manager: &self.state,
+            key: *key,
+            inflight: Arc::clone(&inflight),
+            completed: false,
+        };
+
+        // Initialize outside the manager state lock to avoid blocking concurrent queries
+        let init_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init(key)));
+
+        let res = match init_res {
+            Ok(r) => r,
+            Err(_) => Err(RandomxError::InitializationFailed),
+        };
+
+        // Update state and clean up in-flight coordinator
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.in_flight.remove(key);
+
+            match res {
+                Ok(ref arc) => {
+                    state.tracked.insert(*key, Arc::downgrade(arc));
+
+                    // F-02: Only promote to active if this key is the intended active epoch,
+                    // or if no active epoch has been established yet.
+                    let should_activate = state.intended_active == Some(*key)
+                        || (state.active.is_none() && state.intended_active.is_none());
+
+                    if should_activate {
+                        let prev = state.active.take();
+                        if let Some((prev_key, prev_arc)) = prev {
+                            state.tracked.insert(prev_key, Arc::downgrade(&prev_arc));
+                        }
+                        state.active = Some((*key, Arc::clone(arc)));
+                        state.intended_active = Some(*key);
+                    }
+
+                    // Lazy cleanup of dropped weak references
+                    state.tracked.retain(|_, w| w.strong_count() > 0);
+                }
+                Err(_) => {
+                    if state.intended_active == Some(*key) {
+                        state.intended_active = state.active.as_ref().map(|(k, _)| *k);
+                    }
+                }
+            }
+        }
+
+        // Mark completed before notifying waiters
+        guard.completed = true;
+
+        // F-03: Recover from poisoned in-flight mutex when publishing result
+        let mut g = inflight.lock.lock().unwrap_or_else(|e| e.into_inner());
+        *g = Some(res.clone());
+        inflight.cvar.notify_all();
+
+        res
+    }
+
+    #[cfg(test)]
+    pub fn clear(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.active = None;
+            state.intended_active = None;
+            state.tracked.clear();
+            state.in_flight.clear();
+        }
+    }
+}
+
+static SHARED_CACHE_MANAGER: OnceLock<SharedResourceManager<RandomxCache>> = OnceLock::new();
+static SHARED_DATASET_MANAGER: OnceLock<SharedResourceManager<RandomxDataset>> = OnceLock::new();
+
+pub fn shared_cache_manager() -> &'static SharedResourceManager<RandomxCache> {
+    SHARED_CACHE_MANAGER.get_or_init(SharedResourceManager::new)
+}
+
+pub fn shared_dataset_manager() -> &'static SharedResourceManager<RandomxDataset> {
+    SHARED_DATASET_MANAGER.get_or_init(SharedResourceManager::new)
+}
+
+/// Returns a process-wide shared `RandomxCache` for `key`.
+///
+/// Threads requesting the same key will share the same underlying allocation.
+/// When the epoch key rotates, the active cache is replaced, and the previous
+/// cache is released as soon as the last VM referencing it is dropped.
+pub fn shared_cache(key: &[u8; 32]) -> Result<Arc<RandomxCache>, RandomxError> {
+    shared_cache_manager().set_active(key, |k| RandomxCache::new(k).map(Arc::new))
+}
+
+/// Returns a process-wide shared `RandomxDataset` for `key`.
+///
+/// Threads requesting the same key will share the same underlying allocation.
+/// Does not retain the temporary 256 MiB initialization cache permanently if
+/// no existing shared cache was present.
+pub fn shared_dataset(key: &[u8; 32]) -> Result<Arc<RandomxDataset>, RandomxError> {
+    shared_dataset_manager().set_active(key, |k| {
+        let cache_arc = shared_cache_manager().get_existing(k);
+        let dataset = match cache_arc {
+            Some(existing_cache) => RandomxDataset::new(&existing_cache)?,
+            None => {
+                let temp_cache = RandomxCache::new(k)?;
+                RandomxDataset::new(&temp_cache)?
+            }
+        };
+        Ok(Arc::new(dataset))
+    })
+}
+
+/// Sets the intended active epoch for process-wide shared RandomX resources.
+pub fn set_active_epoch(key: &[u8; 32]) {
+    shared_cache_manager().set_active_epoch(key);
+    shared_dataset_manager().set_active_epoch(key);
+}
+
+/// Retrieves a shared `RandomxCache` for `key` without rotating the active epoch.
+pub fn shared_cache_passive(key: &[u8; 32]) -> Result<Arc<RandomxCache>, RandomxError> {
+    shared_cache_manager().get_or_init(key, |k| RandomxCache::new(k).map(Arc::new))
+}
+
+/// Retrieves a shared `RandomxDataset` for `key` without rotating the active epoch.
+pub fn shared_dataset_passive(key: &[u8; 32]) -> Result<Arc<RandomxDataset>, RandomxError> {
+    shared_dataset_manager().get_or_init(key, |k| {
+        let cache_arc = shared_cache_manager().get_existing(k);
+        let dataset = match cache_arc {
+            Some(existing_cache) => RandomxDataset::new(&existing_cache)?,
+            None => {
+                let temp_cache = RandomxCache::new(k)?;
+                RandomxDataset::new(&temp_cache)?
+            }
+        };
+        Ok(Arc::new(dataset))
+    })
+}
+
+thread_local! {
+    static LIGHT_MODE_VM: RefCell<Option<([u8; 32], RandomxVm)>> = const { RefCell::new(None) };
+    static FAST_MODE_VM: RefCell<Option<([u8; 32], RandomxVm)>> = const { RefCell::new(None) };
 }
 
 pub fn key_height(height: u64) -> u64 {
@@ -382,58 +680,49 @@ pub fn randomx_hash(
     let mut output = [0u8; RANDOMX_HASH_SIZE];
     match mode {
         RandomxMode::Light => {
-            // Reuse cached light-mode resources for this key when available.
-            if let Some(output) = LIGHT_MODE_CACHE.with(|cell| {
-                cell.borrow().get(key).map(|entry| {
-                    let mut out = [0u8; RANDOMX_HASH_SIZE];
-                    entry.vm.calculate_hash(header, &mut out);
-                    out
-                })
-            }) {
+            let handled = LIGHT_MODE_VM.with(|cell| {
+                let opt = cell.borrow();
+                if let Some((ref cached_key, ref vm)) = *opt {
+                    if cached_key == key {
+                        vm.calculate_hash(header, &mut output);
+                        return true;
+                    }
+                }
+                false
+            });
+            if handled {
                 return Ok(output);
             }
 
-            let cache = Arc::new(RandomxCache::new(key)?);
-            let vm = RandomxVm::light(Arc::clone(&cache))?;
+            let cache = shared_cache_passive(key)?;
+            let vm = RandomxVm::light(cache)?;
             vm.calculate_hash(header, &mut output);
 
-            // Store in the bounded cache (VM first in struct => dropped first on eviction).
-            LIGHT_MODE_CACHE.with(|cell| {
-                let mut map = cell.borrow_mut();
-                if map.len() >= MAX_FAST_MODE_CACHE_ENTRIES {
-                    if let Some(first_key) = map.keys().next().cloned() {
-                        map.remove(&first_key);
-                    }
-                }
-                map.insert(*key, LightCacheEntry { vm, cache });
+            LIGHT_MODE_VM.with(|cell| {
+                *cell.borrow_mut() = Some((*key, vm));
             });
         }
         RandomxMode::Fast => {
-            // Reuse cached fast-mode resources for this key when available.
-            if let Some(output) = FAST_MODE_CACHE.with(|cell| {
-                cell.borrow().get(key).map(|entry| {
-                    let mut out = [0u8; RANDOMX_HASH_SIZE];
-                    entry.vm.calculate_hash(header, &mut out);
-                    out
-                })
-            }) {
+            let handled = FAST_MODE_VM.with(|cell| {
+                let opt = cell.borrow();
+                if let Some((ref cached_key, ref vm)) = *opt {
+                    if cached_key == key {
+                        vm.calculate_hash(header, &mut output);
+                        return true;
+                    }
+                }
+                false
+            });
+            if handled {
                 return Ok(output);
             }
 
-            let cache = Arc::new(RandomxCache::new(key)?);
-            let dataset = Arc::new(RandomxDataset::new(&cache)?);
-            let vm = RandomxVm::fast(Arc::clone(&dataset))?;
+            let dataset = shared_dataset_passive(key)?;
+            let vm = RandomxVm::fast(dataset)?;
             vm.calculate_hash(header, &mut output);
 
-            // Store in the bounded cache (VM first in tuple => dropped first on eviction).
-            FAST_MODE_CACHE.with(|cell| {
-                let mut map = cell.borrow_mut();
-                if map.len() >= MAX_FAST_MODE_CACHE_ENTRIES {
-                    if let Some(first_key) = map.keys().next().cloned() {
-                        map.remove(&first_key);
-                    }
-                }
-                map.insert(*key, CacheEntry { vm, dataset, cache })
+            FAST_MODE_VM.with(|cell| {
+                *cell.borrow_mut() = Some((*key, vm));
             });
         }
     }
@@ -554,6 +843,7 @@ mod tests {
     }
 
     static UNIT_TEST_FAST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static UNIT_TEST_SHARED_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct DropEventCapture;
 
@@ -639,16 +929,309 @@ mod tests {
         // Drop order must be: 1. Destroy VM -> 2. Release dataset -> 3. Release cache
         assert_eq!(capture.finish(), vec!["vm", "dataset", "cache"]);
     }
-}
-thread_local! {
-    /// Cache of light-mode resources keyed by the RandomX key.
-    static LIGHT_MODE_CACHE: RefCell<HashMap<[u8; 32], LightCacheEntry>> =
-        RefCell::new(HashMap::new());
 
-    /// Cache of fast-mode resources keyed by the RandomX key. Stored as
-    /// `CacheEntry` (vm, dataset, cache) so that struct drop order
-    /// releases the VM first, then the dataset, then the cache — matching the
-    /// dependency order (VM uses dataset, dataset uses cache).
-    static FAST_MODE_CACHE: RefCell<HashMap<[u8; 32], CacheEntry>> =
-        RefCell::new(HashMap::new());
+    #[test]
+    fn shared_cache_same_key_reuse() {
+        let _guard = UNIT_TEST_SHARED_LOCK.lock().unwrap();
+        let key = [0x51; 32];
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            handles.push(std::thread::spawn(move || {
+                shared_cache(&key).expect("shared cache")
+            }));
+        }
+        let caches: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for i in 1..caches.len() {
+            assert!(Arc::ptr_eq(&caches[0], &caches[i]));
+        }
+    }
+
+    #[test]
+    fn shared_cache_concurrent_initialization_no_duplicate() {
+        let _guard = UNIT_TEST_SHARED_LOCK.lock().unwrap();
+        let key = [0x52; 32];
+        let num_threads = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(num_threads));
+        let mut handles = Vec::new();
+
+        for _ in 0..num_threads {
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                shared_cache(&key).expect("shared cache")
+            }));
+        }
+
+        let caches: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for i in 1..caches.len() {
+            assert!(Arc::ptr_eq(&caches[0], &caches[i]));
+        }
+        let mgr_cache = shared_cache_manager()
+            .get_existing(&key)
+            .expect("Shared cache must be present in process manager");
+        assert!(Arc::ptr_eq(&caches[0], &mgr_cache));
+    }
+
+    #[test]
+    fn shared_cache_key_rotation_replaces_active() {
+        let _guard = UNIT_TEST_SHARED_LOCK.lock().unwrap();
+        let k0 = [0x53; 32];
+        let k1 = [0x54; 32];
+
+        let c0 = shared_cache(&k0).expect("c0");
+        let c1 = shared_cache(&k1).expect("c1");
+        assert!(!Arc::ptr_eq(&c0, &c1));
+
+        let c1_again = shared_cache(&k1).expect("c1 again");
+        assert!(Arc::ptr_eq(&c1, &c1_again));
+    }
+
+    #[test]
+    fn shared_cache_old_resource_released_after_final_drop() {
+        let _guard = UNIT_TEST_SHARED_LOCK.lock().unwrap();
+        let key_v0 = [0x55; 32];
+        let key_v1 = [0x56; 32];
+
+        let cache_v0 = shared_cache(&key_v0).expect("v0");
+        let vm_v0 = RandomxVm::light(cache_v0).expect("vm v0");
+
+        let capture = DropEventCapture::start();
+        // Rotate manager to key_v1
+        let _cache_v1 = shared_cache(&key_v1).expect("v1");
+
+        // Dropping vm_v0 should drop the VM, then drop cache_v0!
+        drop(vm_v0);
+
+        let events = capture.finish();
+        // Drop order: vm first, then cache!
+        assert_eq!(events, vec!["vm", "cache"]);
+        assert!(shared_cache_manager().get_existing(&key_v0).is_none());
+    }
+
+    #[test]
+    fn shared_dataset_does_not_retain_cache_permanently() {
+        let _guard = UNIT_TEST_FAST_LOCK.lock().unwrap();
+        let key = [0x57; 32];
+        assert!(shared_cache_manager().get_existing(&key).is_none());
+
+        let dataset = shared_dataset(&key).expect("shared dataset");
+        // Verify dataset was initialized and retained as active in manager
+        assert!(shared_dataset_manager().get_existing(&key).is_some());
+        assert!(Arc::ptr_eq(
+            &dataset,
+            &shared_dataset_manager().get_existing(&key).unwrap()
+        ));
+
+        // Cache must NOT be permanently retained in shared_cache_manager!
+        assert!(shared_cache_manager().get_existing(&key).is_none());
+    }
+
+    #[test]
+    fn shared_dataset_same_key_reuse() {
+        let _guard = UNIT_TEST_FAST_LOCK.lock().unwrap();
+        let key = [0x58; 32];
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            handles.push(std::thread::spawn(move || {
+                shared_dataset(&key).expect("shared dataset")
+            }));
+        }
+        let datasets: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for i in 1..datasets.len() {
+            assert!(Arc::ptr_eq(&datasets[0], &datasets[i]));
+        }
+    }
+
+    #[test]
+    fn shared_dataset_multi_worker_local_vms() {
+        let _guard = UNIT_TEST_FAST_LOCK.lock().unwrap();
+        let key = [0x58; 32];
+        let dataset = shared_dataset(&key).expect("dataset");
+
+        let num_workers = 4;
+        let mut handles = Vec::new();
+        for i in 0..num_workers {
+            let ds = Arc::clone(&dataset);
+            handles.push(std::thread::spawn(move || {
+                let vm = RandomxVm::fast(ds).expect("vm creation");
+                let header = [i as u8; HEADER_LEN];
+                let mut out = [0u8; 32];
+                vm.calculate_hash(&header, &mut out);
+                out
+            }));
+        }
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.join().unwrap());
+        }
+        assert_eq!(results.len(), 4);
+        for res in results {
+            assert_ne!(res, [0u8; 32]);
+        }
+    }
+
+    #[test]
+    fn weak_upgrade_does_not_evict_active_resource() {
+        let manager = SharedResourceManager::<u32>::new();
+        let key_b = [0x61; 32];
+        let key_a = [0x62; 32];
+
+        // 1. Initialize active key B, then retain external reference
+        let res_b = manager
+            .set_active(&key_b, |_| Ok(Arc::new(100)))
+            .expect("init B");
+        assert_eq!(manager.active_key(), Some(key_b));
+
+        // 2. Rotate to active key A. B is now weakly tracked.
+        let res_a = manager
+            .set_active(&key_a, |_| Ok(Arc::new(200)))
+            .expect("init A");
+        assert_eq!(manager.active_key(), Some(key_a));
+        assert!(Arc::ptr_eq(&manager.get_existing(&key_a).unwrap(), &res_a));
+
+        // 3. Request B again through the weak-reference upgrade path.
+        // The closure must not be executed (panics if invoked).
+        let upgraded_b = manager
+            .get_or_init(&key_b, |_| {
+                panic!("B must be upgraded from weak, not re-initialized!")
+            })
+            .expect("upgrade B");
+        assert!(Arc::ptr_eq(&upgraded_b, &res_b));
+
+        // 4. Verify A remains the active resource and was not evicted.
+        assert_eq!(
+            manager.active_key(),
+            Some(key_a),
+            "Active resource A must remain active when upgrading weak reference B"
+        );
+        assert!(Arc::ptr_eq(&manager.get_existing(&key_a).unwrap(), &res_a));
+    }
+
+    #[test]
+    fn concurrent_out_of_order_initialization_preserves_active_epoch() {
+        let manager = Arc::new(SharedResourceManager::<u32>::new());
+        let key_slow = [0x71; 32];
+        let key_fast = [0x72; 32];
+
+        let barrier_start = Arc::new(std::sync::Barrier::new(2));
+        let barrier_slow = Arc::new(std::sync::Barrier::new(2));
+
+        let mgr_slow = Arc::clone(&manager);
+        let b_start_slow = Arc::clone(&barrier_start);
+        let b_slow = Arc::clone(&barrier_slow);
+
+        // Thread 1: Initiates initialization for key_slow (e.g. historical block validation)
+        let handle_slow = std::thread::spawn(move || {
+            mgr_slow.get_or_init(&key_slow, |_| {
+                // Signal that slow thread is inside init
+                b_start_slow.wait();
+                // Block until fast thread has finished and set active epoch
+                b_slow.wait();
+                Ok(Arc::new(111))
+            })
+        });
+
+        // Wait until thread 1 has started initializing key_slow
+        barrier_start.wait();
+
+        // Main thread / Thread 2: Sets key_fast as the intended active epoch and completes
+        manager.set_active_epoch(&key_fast);
+        let res_fast = manager
+            .get_or_init(&key_fast, |_| Ok(Arc::new(222)))
+            .expect("fast init");
+
+        // Fast key is now the active key
+        assert_eq!(manager.active_key(), Some(key_fast));
+        assert!(Arc::ptr_eq(
+            &manager.get_existing(&key_fast).unwrap(),
+            &res_fast
+        ));
+
+        // Unblock the slow thread so its initialization completes *after* key_fast
+        barrier_slow.wait();
+        let res_slow = handle_slow.join().unwrap().expect("slow init succeeds");
+        assert_eq!(*res_slow, 111);
+
+        // Verify key_fast is NOT overwritten by the stale completion of key_slow!
+        assert_eq!(
+            manager.active_key(),
+            Some(key_fast),
+            "Stale initialization completion must not overwrite intended active epoch"
+        );
+        assert!(Arc::ptr_eq(
+            &manager.get_existing(&key_fast).unwrap(),
+            &res_fast
+        ));
+
+        // Verify key_slow is tracked and accessible while referenced
+        assert!(Arc::ptr_eq(
+            &manager.get_existing(&key_slow).unwrap(),
+            &res_slow
+        ));
+    }
+
+    #[test]
+    fn initialization_failure_notifies_waiters_and_allows_retry() {
+        let manager = Arc::new(SharedResourceManager::<u32>::new());
+        let key = [0x81; 32];
+        let num_waiters = 4;
+        let barrier = Arc::new(std::sync::Barrier::new(num_waiters + 1));
+
+        let mut handles = Vec::new();
+        for _ in 0..num_waiters {
+            let mgr = Arc::clone(&manager);
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                mgr.get_or_init(&key, |_| Err(RandomxError::InitializationFailed))
+            }));
+        }
+
+        // Release all waiters simultaneously
+        barrier.wait();
+
+        let mut failed_count = 0;
+        for h in handles {
+            let res = h.join().unwrap();
+            assert!(matches!(res, Err(RandomxError::InitializationFailed)));
+            failed_count += 1;
+        }
+        assert_eq!(failed_count, num_waiters);
+
+        // In-flight state must be cleared, allowing future requests to retry and succeed
+        let retry_res = manager
+            .get_or_init(&key, |_| Ok(Arc::new(999)))
+            .expect("retry must succeed");
+        assert_eq!(*retry_res, 999);
+        assert_eq!(manager.active_key(), Some(key));
+    }
+
+    #[test]
+    fn in_flight_guard_panic_cleanup_notifies_waiters() {
+        let manager = Arc::new(SharedResourceManager::<u32>::new());
+        let key = [0x82; 32];
+        let barrier_start = Arc::new(std::sync::Barrier::new(2));
+
+        let mgr_panicker = Arc::clone(&manager);
+        let b_start = Arc::clone(&barrier_start);
+
+        // Thread 1: starts initialization and panics inside init
+        let handle_panic = std::thread::spawn(move || {
+            let _ = mgr_panicker.get_or_init(&key, |_| {
+                b_start.wait();
+                panic!("deliberate panic inside initializer");
+            });
+        });
+
+        // Wait until initializer has started
+        barrier_start.wait();
+
+        let _ = handle_panic.join();
+
+        // After panic, in-flight state must be cleared and subsequent call must succeed
+        let res = manager
+            .get_or_init(&key, |_| Ok(Arc::new(777)))
+            .expect("retry after panic must succeed");
+        assert_eq!(*res, 777);
+    }
 }
