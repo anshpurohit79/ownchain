@@ -1364,6 +1364,19 @@ async fn test_real_p2p_runtime_responsiveness_during_sync() {
                     channel,
                 }) => {
                     if peer_id == handle_a.peer_id() {
+                        if matches!(request, SyncRequest::GetStatus) {
+                            let _ = network_handle_b
+                                .send_sync_response(
+                                    channel,
+                                    SyncResponse::Status {
+                                        tip_height: 6,
+                                        tip_block_id: blocks_b.last().unwrap().block_id(),
+                                        cumulative_work: U256::from_u128(6),
+                                    },
+                                )
+                                .await;
+                            continue;
+                        }
                         break (request, channel);
                     }
                 }
@@ -1610,6 +1623,19 @@ async fn test_real_p2p_sync_cancellation_and_peer_disconnect() {
                     channel,
                 }) => {
                     if peer_id == handle_a.peer_id() {
+                        if matches!(request, SyncRequest::GetStatus) {
+                            let _ = network_handle_b
+                                .send_sync_response(
+                                    channel,
+                                    SyncResponse::Status {
+                                        tip_height: 5,
+                                        tip_block_id: blocks_b.last().unwrap().block_id(),
+                                        cumulative_work: U256::from_u128(5),
+                                    },
+                                )
+                                .await;
+                            continue;
+                        }
                         assert!(
                             matches!(request, SyncRequest::GetHeaders { .. }),
                             "First sync request must be GetHeaders, got {:?}",
@@ -1747,7 +1773,22 @@ async fn test_real_p2p_sync_ancestor_discovery_chain_mutation_restart() {
                     peer_id,
                     request,
                     channel,
-                }) if peer_id == handle_a.peer_id() => break (request, channel),
+                }) if peer_id == handle_a.peer_id() => {
+                    if matches!(request, SyncRequest::GetStatus) {
+                        let _ = network_handle_b
+                            .send_sync_response(
+                                channel,
+                                SyncResponse::Status {
+                                    tip_height: 4,
+                                    tip_block_id: blocks_b.last().unwrap().block_id(),
+                                    cumulative_work: U256::from_u128(4),
+                                },
+                            )
+                            .await;
+                        continue;
+                    }
+                    break (request, channel);
+                }
                 Some(_) => {}
                 None => panic!("Node B event stream closed"),
             }
@@ -1781,6 +1822,18 @@ async fn test_real_p2p_sync_ancestor_discovery_chain_mutation_restart() {
                 {
                     if peer_id == peer_id_a {
                         match request {
+                            SyncRequest::GetStatus => {
+                                let _ = network_handle_b
+                                    .send_sync_response(
+                                        channel,
+                                        SyncResponse::Status {
+                                            tip_height: 4,
+                                            tip_block_id: b_blocks_clone.last().unwrap().block_id(),
+                                            cumulative_work: U256::from_u128(4),
+                                        },
+                                    )
+                                    .await;
+                            }
                             SyncRequest::GetHeaders {
                                 start_height,
                                 max_count,
@@ -2053,6 +2106,22 @@ async fn test_real_p2p_shutdown_aborts_and_joins_active_sync() {
         // Wait until Node B receives the initial GetHeaders request
         loop {
             match network_event_rx_b.recv().await {
+                Some(NetworkEvent::SyncRequestReceived {
+                    peer_id,
+                    request: SyncRequest::GetStatus,
+                    channel,
+                }) if peer_id == handle_a.peer_id() => {
+                    let _ = network_handle_b
+                        .send_sync_response(
+                            channel,
+                            SyncResponse::Status {
+                                tip_height: 10,
+                                tip_block_id: Hash::new([0xbb; 32]),
+                                cumulative_work: U256::from_u128(10),
+                            },
+                        )
+                        .await;
+                }
                 Some(NetworkEvent::SyncRequestReceived {
                     peer_id,
                     request: SyncRequest::GetHeaders { .. },
