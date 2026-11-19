@@ -573,10 +573,11 @@ async fn test_mempool_admission_gossip_and_conflict_rejection() {
             let cb = make_coinbase(devnet_chain_id, h, miner.address, 10_000_000);
             let b = make_hybrid_block(&chain_state, GENESIS_TIMESTAMP + h * 120, vec![cb]);
             chain_state.apply_block(&b).unwrap();
-            node_a.submit_block(b).await.unwrap();
+            node_a.submit_block(b.clone()).await.unwrap();
+            node_b.submit_block(b).await.unwrap();
         }
 
-        // Wait for Node B to receive and validate all blocks up to height 101
+        // Both nodes independently hold the mature chain needed for the mempool checks.
         let tip_101_id = chain_state.tip_block_id().unwrap();
         wait_for_tip(&node_b, 101, tip_101_id).await;
 
