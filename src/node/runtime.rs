@@ -326,6 +326,34 @@ pub(crate) struct AdvertisedTipClaim {
     pub cumulative_work: U256,
 }
 
+/// Explicit synchronization target for an attempt, refreshed via `SyncRequest::GetStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SyncTarget {
+    pub tip_height: u64,
+    pub tip_block_id: Hash,
+    pub cumulative_work: U256,
+}
+
+impl From<AdvertisedTipClaim> for SyncTarget {
+    fn from(c: AdvertisedTipClaim) -> Self {
+        SyncTarget {
+            tip_height: c.tip_height,
+            tip_block_id: c.tip_block_id,
+            cumulative_work: c.cumulative_work,
+        }
+    }
+}
+
+impl From<SyncTarget> for AdvertisedTipClaim {
+    fn from(t: SyncTarget) -> Self {
+        AdvertisedTipClaim {
+            tip_block_id: t.tip_block_id,
+            tip_height: t.tip_height,
+            cumulative_work: t.cumulative_work,
+        }
+    }
+}
+
 /// Structured progress receipt returned by `NodeRuntime` for each applied block batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SyncBatchReceipt {
@@ -401,10 +429,12 @@ pub(crate) enum SyncWorkerSuccess {
         blocks_applied: u64,
         final_height: u64,
         final_tip_id: Hash,
+        target: Option<SyncTarget>,
     },
     AlreadySynchronized {
         tip_height: u64,
         tip_block_id: Hash,
+        target: Option<SyncTarget>,
     },
 }
 
@@ -422,6 +452,8 @@ pub(crate) enum SyncWorkerError {
     FalseAdvertisedClaim(String),
     LocalOrStorage(String),
     BudgetExhausted(String),
+    PeerChainChanging(String),
+    TargetStatusUnavailable(String),
 }
 
 impl core::fmt::Display for SyncWorkerError {
@@ -431,7 +463,9 @@ impl core::fmt::Display for SyncWorkerError {
             | SyncWorkerError::TransientOrProtocol(s)
             | SyncWorkerError::FalseAdvertisedClaim(s)
             | SyncWorkerError::LocalOrStorage(s)
-            | SyncWorkerError::BudgetExhausted(s) => f.write_str(s),
+            | SyncWorkerError::BudgetExhausted(s)
+            | SyncWorkerError::PeerChainChanging(s)
+            | SyncWorkerError::TargetStatusUnavailable(s) => f.write_str(s),
             SyncWorkerError::Incomplete {
                 requested_height,
                 expected_target,
@@ -456,6 +490,7 @@ enum SyncFailureClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SyncOutcomeEvaluation {
     LocalFaultNoPeerPenalty,
+    RetryablePeerChainChanging,
     VerifiedSuccess,
     Penalized(SyncFailureClass),
 }
@@ -923,6 +958,7 @@ struct ActiveSyncOperation {
     abort_handle: tokio::task::AbortHandle,
     cancel_flag: Arc<std::sync::atomic::AtomicBool>,
     advertised_claim: Option<AdvertisedTipClaim>,
+    active_target: Option<SyncTarget>,
     initiated_by_manual: bool,
     active_blocks_persisted: u64,
     side_blocks_persisted: u64,
@@ -979,6 +1015,11 @@ pub struct NodeStatus {
 
 /// Internal messages dispatched from background sync workers to `NodeRuntime`.
 pub(crate) enum RuntimeSyncMessage {
+    /// Update or refresh the explicit sync attempt target.
+    SetAttemptTarget {
+        sync_operation_id: u64,
+        target: SyncTarget,
+    },
     /// Sync worker delivers a batch of fetched blocks to be applied by the runtime.
     ApplyBlockBatch {
         sync_operation_id: u64,
@@ -1023,6 +1064,10 @@ pub enum NodeCommand {
     ReevaluateStoredBranch {
         tip_block_id: Hash,
         respond_to: oneshot::Sender<Result<BlockProcessingOutcome, String>>,
+    },
+    IsTxMeshReady {
+        peer_id: PeerId,
+        respond_to: oneshot::Sender<Result<bool, String>>,
     },
     Stop {
         respond_to: oneshot::Sender<()>,
@@ -1176,6 +1221,19 @@ impl NodeHandle {
         self.command_tx
             .send(NodeCommand::ReevaluateStoredBranch {
                 tip_block_id,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|_| "Node runtime has shut down".to_string())?;
+        rx.await
+            .map_err(|_| "Node runtime dropped response".to_string())?
+    }
+
+    pub async fn is_tx_mesh_ready(&self, peer_id: PeerId) -> Result<bool, String> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(NodeCommand::IsTxMeshReady {
+                peer_id,
                 respond_to: tx,
             })
             .await
@@ -1989,6 +2047,10 @@ impl NodeRuntime {
                             let res = self.reevaluate_stored_branch(tip_block_id).await;
                             let _ = respond_to.send(res);
                         }
+                        Some(NodeCommand::IsTxMeshReady { peer_id, respond_to }) => {
+                            let res = self.network_handle.is_tx_mesh_ready(peer_id).await;
+                            let _ = respond_to.send(res);
+                        }
                         Some(NodeCommand::Stop { respond_to }) => {
                             stop_responder = Some(respond_to);
                             break;
@@ -2073,6 +2135,7 @@ impl NodeRuntime {
         self.sync_msg_rx.close();
         while let Ok(msg) = self.sync_msg_rx.try_recv() {
             match msg {
+                RuntimeSyncMessage::SetAttemptTarget { .. } => {}
                 RuntimeSyncMessage::ApplyBlockBatch { respond_to, .. } => {
                     let mut receipt = SyncBatchReceipt::empty();
                     receipt.status = Err(SyncBatchError::InternalOrStorage(
@@ -2535,48 +2598,18 @@ impl NodeRuntime {
             .map(|c| c.tip_height)
             .unwrap_or(peer_tip_height);
         let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (snap_tx, snap_rx) = oneshot::channel();
-
-        let storage = self.storage.clone();
-        let flag_clone = cancel_flag.clone();
-        self.snapshot_tasks.spawn_blocking(move || {
-            let res = storage.capture_canonical_chain_snapshot_cooperative(
-                effective_peer_tip_height,
-                Some(&flag_clone),
-            );
-            let _ = snap_tx.send(res);
-        });
 
         let network_handle = self.network_handle.clone();
         let sync_tx = self.sync_msg_tx.clone();
         let chain_id = self.config.chain_id;
         let cancel_flag_for_worker = cancel_flag.clone();
+        let storage_for_worker = self.storage.clone();
 
         let worker_handle = self.sync_tasks.spawn(async move {
-            let snap_res = match snap_rx.await {
-                Ok(res) => res,
-                Err(_) => Err(StorageError::InvalidOperation(
-                    "Snapshot task cancelled or terminated".into(),
-                )),
-            };
-
-            let (tip_height, tip_block_id, block_ids) = match snap_res {
-                Ok(tuple) => tuple,
-                Err(storage_err) => {
-                    return SyncTaskResult {
-                        sync_operation_id,
-                        peer_id,
-                        result: Err(SyncWorkerError::LocalOrStorage(format!(
-                            "Storage error capturing snapshot: {storage_err}"
-                        ))),
-                    };
-                }
-            };
-
-            let snapshot = ActiveChainSnapshot {
-                tip_height,
-                tip_block_id,
-                block_ids: Arc::new(block_ids),
+            let initial_snapshot = ActiveChainSnapshot {
+                tip_height: 0,
+                tip_block_id: Hash::ZERO,
+                block_ids: Arc::new(Vec::new()),
             };
 
             let ctx = SyncWorkerContext {
@@ -2584,10 +2617,12 @@ impl NodeRuntime {
                 peer_id,
                 peer_tip_height: effective_peer_tip_height,
                 chain_id,
-                snapshot,
+                snapshot: initial_snapshot,
                 network_handle,
                 sync_tx,
                 advertised_claim,
+                target: None,
+                storage: Some(storage_for_worker),
                 sync_timeout: None,
                 cancel_flag: cancel_flag_for_worker,
             };
@@ -2629,6 +2664,7 @@ impl NodeRuntime {
             abort_handle: worker_handle,
             cancel_flag,
             advertised_claim,
+            active_target: None,
             initiated_by_manual,
             active_blocks_persisted: 0,
             side_blocks_persisted: 0,
@@ -2641,6 +2677,23 @@ impl NodeRuntime {
     /// Handles internal synchronization messages on the runtime actor loop.
     async fn handle_sync_message(&mut self, msg: RuntimeSyncMessage) {
         match msg {
+            RuntimeSyncMessage::SetAttemptTarget {
+                sync_operation_id,
+                target,
+            } => {
+                if let Some(active) = self.active_sync.as_mut() {
+                    if active.sync_operation_id == sync_operation_id {
+                        active.active_target = Some(target);
+                        tracing::debug!(
+                            sync_operation_id,
+                            peer_id = %active.peer_id,
+                            target_height = target.tip_height,
+                            target_tip_id = %target.tip_block_id,
+                            "Updated active sync attempt target"
+                        );
+                    }
+                }
+            }
             RuntimeSyncMessage::ApplyBlockBatch {
                 sync_operation_id,
                 peer_id,
@@ -2653,7 +2706,11 @@ impl NodeRuntime {
                             && active.peer_id == peer_id =>
                     {
                         (
-                            active.advertised_claim.map(|c| c.tip_block_id),
+                            active
+                                .active_target
+                                .as_ref()
+                                .map(|t| t.tip_block_id)
+                                .or_else(|| active.advertised_claim.map(|c| c.tip_block_id)),
                             active.cancel_flag.load(std::sync::atomic::Ordering::SeqCst),
                         )
                     }
@@ -2841,13 +2898,21 @@ impl NodeRuntime {
         active_op: &ActiveSyncOperation,
         worker_result: &Result<SyncWorkerSuccess, SyncWorkerError>,
     ) -> SyncOutcomeEvaluation {
+        // 0. Retryable reorg exhaustion: peer chain is moving, do not penalize.
+        if matches!(worker_result, Err(SyncWorkerError::PeerChainChanging(_))) {
+            return SyncOutcomeEvaluation::RetryablePeerChainChanging;
+        }
+
         // 1. Local faults (storage/RandomX/context, shutdown cancellation, local disconnect)
         //    never penalize or reset the peer.
         if matches!(
             active_op.observed_batch_error,
             Some(SyncBatchError::InternalOrStorage(_)) | Some(SyncBatchError::StaleOperation)
-        ) || matches!(worker_result, Err(SyncWorkerError::LocalOrStorage(_)))
-        {
+        ) || matches!(
+            worker_result,
+            Err(SyncWorkerError::LocalOrStorage(_))
+                | Err(SyncWorkerError::TargetStatusUnavailable(_))
+        ) {
             return SyncOutcomeEvaluation::LocalFaultNoPeerPenalty;
         }
 
@@ -2862,23 +2927,42 @@ impl NodeRuntime {
             return SyncOutcomeEvaluation::Penalized(SyncFailureClass::InvalidChainData);
         }
 
-        // 3. Evaluate stored advertised tip metadata independently of how the block arrived.
+        // 3. Evaluate stored target tip metadata independently of how the block arrived.
+        let effective_target = active_op
+            .active_target
+            .or_else(|| active_op.advertised_claim.map(SyncTarget::from))
+            .or(match worker_result {
+                Ok(SyncWorkerSuccess::VerifiedSuccess {
+                    target: Some(t), ..
+                }) => {
+                    if active_op.reached_advertised_tip_via_sync {
+                        Some(*t)
+                    } else {
+                        None
+                    }
+                }
+                Ok(SyncWorkerSuccess::AlreadySynchronized {
+                    target: Some(t), ..
+                }) => Some(*t),
+                _ => None,
+            });
+
         let mut claim_meta_matched = false;
-        if let Some(claim) = active_op.advertised_claim {
-            match self.storage.get_block_metadata(&claim.tip_block_id) {
+        if let Some(target) = effective_target {
+            match self.storage.get_block_metadata(&target.tip_block_id) {
                 Err(e) => {
                     tracing::warn!(
                         sync_operation_id = active_op.sync_operation_id,
                         peer_id = %active_op.peer_id,
-                        tip = %claim.tip_block_id,
+                        tip = %target.tip_block_id,
                         error = %e,
-                        "Storage error reading advertised tip metadata at sync completion"
+                        "Storage error reading target tip metadata at sync completion"
                     );
                     return SyncOutcomeEvaluation::LocalFaultNoPeerPenalty;
                 }
                 Ok(Some(meta)) => {
-                    if meta.height != claim.tip_height
-                        || meta.cumulative_work != claim.cumulative_work
+                    if meta.height != target.tip_height
+                        || meta.cumulative_work != target.cumulative_work
                     {
                         return SyncOutcomeEvaluation::Penalized(
                             SyncFailureClass::FalseAdvertisedWorkClaim,
@@ -2896,6 +2980,12 @@ impl NodeRuntime {
 
         // 4. Handle worker error variants
         match worker_result {
+            Err(SyncWorkerError::PeerChainChanging(_)) => {
+                SyncOutcomeEvaluation::RetryablePeerChainChanging
+            }
+            Err(SyncWorkerError::TargetStatusUnavailable(_)) => {
+                SyncOutcomeEvaluation::LocalFaultNoPeerPenalty
+            }
             Err(SyncWorkerError::FalseAdvertisedClaim(_)) => {
                 SyncOutcomeEvaluation::Penalized(SyncFailureClass::FalseAdvertisedWorkClaim)
             }
@@ -2929,25 +3019,27 @@ impl NodeRuntime {
             Ok(SyncWorkerSuccess::AlreadySynchronized {
                 tip_height,
                 tip_block_id,
+                target,
             }) => {
-                if let Some(claim) = active_op.advertised_claim {
+                let eval_target = target.as_ref().copied().or(effective_target);
+                if let Some(target) = eval_target {
                     if !claim_meta_matched {
                         SyncOutcomeEvaluation::Penalized(SyncFailureClass::FalseAdvertisedWorkClaim)
-                    } else if claim.tip_height == *tip_height {
-                        if claim.tip_block_id == *tip_block_id {
+                    } else if target.tip_height == *tip_height {
+                        if target.tip_block_id == *tip_block_id {
                             SyncOutcomeEvaluation::VerifiedSuccess
                         } else {
                             SyncOutcomeEvaluation::Penalized(
                                 SyncFailureClass::FalseAdvertisedWorkClaim,
                             )
                         }
-                    } else if claim.tip_height < *tip_height {
-                        // For a lower-height peer claim, verify the advertised block ID is on the
+                    } else if target.tip_height < *tip_height {
+                        // For a lower-height peer target, verify the target block ID is on the
                         // active canonical chain before accepting AlreadySynchronized.
                         // A known side-branch block must not silently qualify as a canonical-prefix AlreadySynchronized outcome.
-                        match self.storage.get_header_by_height(claim.tip_height) {
+                        match self.storage.get_header_by_height(target.tip_height) {
                             Ok(Some(canonical_header)) => {
-                                if canonical_header.block_id() == claim.tip_block_id {
+                                if canonical_header.block_id() == target.tip_block_id {
                                     SyncOutcomeEvaluation::VerifiedSuccess
                                 } else {
                                     SyncOutcomeEvaluation::Penalized(
@@ -2964,7 +3056,7 @@ impl NodeRuntime {
                                     peer_id = %active_op.peer_id,
                                     error = %e,
                                     "Storage error reading canonical header at height {} during AlreadySynchronized evaluation",
-                                    claim.tip_height
+                                    target.tip_height
                                 );
                                 SyncOutcomeEvaluation::LocalFaultNoPeerPenalty
                             }
@@ -2977,7 +3069,8 @@ impl NodeRuntime {
                 }
             }
             Ok(SyncWorkerSuccess::VerifiedSuccess { .. }) => {
-                if active_op.advertised_claim.is_some() {
+                let eval_target = effective_target;
+                if eval_target.is_some() {
                     if validated_persisted > 0
                         && active_op.reached_advertised_tip_via_sync
                         && claim_meta_matched
@@ -3005,7 +3098,8 @@ impl NodeRuntime {
     ) {
         let evaluation = self.evaluate_active_sync_outcome(&active_op, &worker_result);
         match evaluation {
-            SyncOutcomeEvaluation::LocalFaultNoPeerPenalty => {}
+            SyncOutcomeEvaluation::LocalFaultNoPeerPenalty
+            | SyncOutcomeEvaluation::RetryablePeerChainChanging => {}
             SyncOutcomeEvaluation::VerifiedSuccess => {
                 self.sync_penalties
                     .record_verified_success(&active_op.peer_id, now);
@@ -3022,6 +3116,13 @@ impl NodeRuntime {
         if let Some(notifier) = active_op.notifier.take() {
             let res = match evaluation {
                 SyncOutcomeEvaluation::VerifiedSuccess => Ok(()),
+                SyncOutcomeEvaluation::RetryablePeerChainChanging => {
+                    let msg = match &worker_result {
+                        Err(e) => format!("sync retryable because peer chain is changing: {e}"),
+                        _ => "sync retryable because peer chain is changing".to_string(),
+                    };
+                    Err(msg)
+                }
                 SyncOutcomeEvaluation::LocalFaultNoPeerPenalty => {
                     let msg = match &worker_result {
                         Err(e) => format!("sync aborted due to local fault: {e}"),
@@ -3445,6 +3546,8 @@ struct SyncWorkerContext {
     network_handle: NetworkHandle,
     sync_tx: mpsc::Sender<RuntimeSyncMessage>,
     advertised_claim: Option<AdvertisedTipClaim>,
+    target: Option<SyncTarget>,
+    storage: Option<Arc<BlockStore>>,
     sync_timeout: Option<Duration>,
     cancel_flag: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -3453,8 +3556,110 @@ const SYNC_BATCH_SIZE: u32 = MAX_BLOCKS_PER_RESPONSE as u32;
 const MAX_SYNC_BLOCKS: u64 = 10_000;
 const MAX_SYNC_ROUND_TRIPS: u32 = 500;
 const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_REORG_RESTARTS: usize = 2;
 
 impl NodeRuntime {
+    async fn fetch_peer_status(
+        network_handle: &NetworkHandle,
+        peer_id: PeerId,
+        _chain_id: Hash,
+        deadline: tokio::time::Instant,
+        timeout_duration: Duration,
+    ) -> Result<SyncTarget, SyncWorkerError> {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(SyncWorkerError::BudgetExhausted(format!(
+                "Sync timeout of {:?} exceeded requesting peer status",
+                timeout_duration
+            )));
+        }
+        match tokio::time::timeout_at(
+            deadline,
+            network_handle.send_sync_request(peer_id, SyncRequest::GetStatus),
+        )
+        .await
+        {
+            Err(_) => Err(SyncWorkerError::BudgetExhausted(format!(
+                "Sync timeout of {:?} exceeded requesting peer status",
+                timeout_duration
+            ))),
+            Ok(Ok(SyncResponse::Status {
+                tip_height,
+                tip_block_id,
+                cumulative_work,
+            })) => Ok(SyncTarget {
+                tip_height,
+                tip_block_id,
+                cumulative_work,
+            }),
+            Ok(Ok(other)) => Err(SyncWorkerError::TransientOrProtocol(format!(
+                "Unexpected sync response from {peer_id} when querying status: {other:?}"
+            ))),
+            Ok(Err(e)) => Err(SyncWorkerError::TargetStatusUnavailable(format!(
+                "Transport error querying status from {peer_id}: {e}"
+            ))),
+        }
+    }
+
+    async fn notify_attempt_target(
+        sync_tx: &mpsc::Sender<RuntimeSyncMessage>,
+        sync_operation_id: u64,
+        target: SyncTarget,
+        cancel_flag: &Arc<std::sync::atomic::AtomicBool>,
+        deadline: tokio::time::Instant,
+        timeout_duration: Duration,
+    ) -> Result<(), SyncWorkerError> {
+        tokio::time::timeout_at(
+            deadline,
+            sync_tx.send(RuntimeSyncMessage::SetAttemptTarget {
+                sync_operation_id,
+                target,
+            }),
+        )
+        .await
+        .map_err(|_| {
+            cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            SyncWorkerError::BudgetExhausted(format!(
+                "Sync timeout of {:?} exceeded notifying runtime of target",
+                timeout_duration
+            ))
+        })?
+        .map_err(|_| {
+            SyncWorkerError::LocalOrStorage(
+                "Node runtime shut down during sync target update".to_string(),
+            )
+        })?;
+
+        Ok(())
+    }
+
+    async fn capture_snapshot_cooperative(
+        storage: &Arc<BlockStore>,
+        target_height: u64,
+        cancel_flag: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<ActiveChainSnapshot, SyncWorkerError> {
+        let storage_clone = storage.clone();
+        let flag_clone = cancel_flag.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            storage_clone
+                .capture_canonical_chain_snapshot_cooperative(target_height, Some(&flag_clone))
+        })
+        .await
+        .map_err(|e| {
+            SyncWorkerError::LocalOrStorage(format!(
+                "Snapshot task panicked or failed to join: {e}"
+            ))
+        })?
+        .map_err(|e| {
+            SyncWorkerError::LocalOrStorage(format!("Storage error capturing snapshot: {e}"))
+        })?;
+
+        Ok(ActiveChainSnapshot {
+            tip_height: res.0,
+            tip_block_id: res.1,
+            block_ids: Arc::new(res.2),
+        })
+    }
+
     /// Outbound synchronization worker performing ancestor discovery and batched block fetches.
     async fn run_sync_worker(ctx: SyncWorkerContext) -> Result<SyncWorkerSuccess, SyncWorkerError> {
         let SyncWorkerContext {
@@ -3462,10 +3667,12 @@ impl NodeRuntime {
             peer_id,
             peer_tip_height,
             chain_id,
-            snapshot,
+            snapshot: mut local_snapshot,
             network_handle,
             sync_tx,
             advertised_claim,
+            target: initial_target,
+            storage,
             sync_timeout,
             cancel_flag,
         } = ctx;
@@ -3473,492 +3680,1105 @@ impl NodeRuntime {
         let timeout_duration = sync_timeout.unwrap_or(SYNC_TIMEOUT);
         let deadline = tokio::time::Instant::now() + timeout_duration;
 
-        // 1. Discover common ancestor between local snapshot and peer chain
-        let min_h = snapshot.tip_height().min(peer_tip_height);
-        let common_ancestor_height = if min_h == 0 {
-            let genesis_id = snapshot
-                .get_block_id(0)
-                .unwrap_or_else(|| genesis_block(chain_id).block_id());
-            if let Some(ref claim) = advertised_claim {
-                if claim.tip_height == 0 && claim.tip_block_id != genesis_id {
-                    return Err(SyncWorkerError::FalseAdvertisedClaim(format!(
-                        "Peer {peer_id} advertised invalid genesis tip block ID {} at height 0 (expected {})",
-                        claim.tip_block_id,
-                        genesis_id
-                    )));
-                }
-            }
-            0
-        } else {
-            if tokio::time::Instant::now() >= deadline {
-                return Err(SyncWorkerError::BudgetExhausted(format!(
-                    "Sync timeout of {:?} exceeded during ancestor discovery",
-                    timeout_duration
+        let genesis_id = genesis_block(chain_id).block_id();
+        if let Some(ref claim) = advertised_claim {
+            if claim.tip_height == 0 && claim.tip_block_id != genesis_id {
+                return Err(SyncWorkerError::FalseAdvertisedClaim(format!(
+                    "Peer {peer_id} advertised invalid genesis tip block ID {} at height 0 (expected {})",
+                    claim.tip_block_id,
+                    genesis_id
                 )));
             }
-            // Fast path: check if peer matches our snapshot at min_h
-            let fast_req = SyncRequest::GetHeaders {
-                start_height: min_h,
-                max_count: 1,
-            };
-            let fast_match = match tokio::time::timeout_at(
-                deadline,
-                network_handle.send_sync_request(peer_id, fast_req),
-            )
-            .await
-            {
-                Err(_) => {
-                    return Err(SyncWorkerError::BudgetExhausted(format!(
-                        "Sync timeout of {:?} exceeded during fast-path query",
-                        timeout_duration
-                    )));
-                }
-                Ok(Ok(SyncResponse::Headers(headers))) => {
-                    if headers.is_empty() {
-                        return Err(SyncWorkerError::Incomplete {
-                            requested_height: min_h,
-                            expected_target: peer_tip_height,
-                            reason: "fast-path header query returned empty headers".into(),
-                        });
-                    }
-                    if headers.len() > 1 {
-                        return Err(SyncWorkerError::ConsensusInvalid(format!(
-                            "fast-path header query returned {} headers, expected 1",
-                            headers.len()
-                        )));
-                    }
-                    let h = &headers[0];
-                    if h.height != min_h {
-                        return Err(SyncWorkerError::ConsensusInvalid(format!(
-                            "fast-path header has height {}, expected {min_h}",
-                            h.height
-                        )));
-                    }
-                    if h.chain_id != chain_id {
-                        return Err(SyncWorkerError::ConsensusInvalid(format!(
-                            "fast-path header has invalid chain ID {}, expected {chain_id}",
-                            h.chain_id
-                        )));
-                    }
-                    // Verify consistency with advertised tip if this query is at the peer's claimed tip
-                    if let Some(ref claim) = advertised_claim {
-                        if claim.tip_height == min_h && h.block_id() != claim.tip_block_id {
-                            return Err(SyncWorkerError::FalseAdvertisedClaim(format!(
-                                "Peer {peer_id} advertised tip block ID {} at height {min_h}, but served header with block ID {}",
-                                claim.tip_block_id,
-                                h.block_id()
-                            )));
-                        }
-                    }
-                    Some(h.block_id()) == snapshot.get_block_id(min_h)
-                }
-                Ok(Ok(other)) => {
-                    return Err(SyncWorkerError::TransientOrProtocol(format!(
-                        "Unexpected response during fast-path header query from {peer_id}: {other:?}"
-                    )));
-                }
-                Ok(Err(e)) => {
-                    return Err(SyncWorkerError::TransientOrProtocol(format!(
-                        "Transport error querying fast-path header at height {min_h} from {peer_id}: {e}"
-                    )));
-                }
-            };
+        }
 
-            if fast_match {
-                min_h
-            } else {
-                // Binary search for common ancestor in [0, min_h - 1]
-                let mut low = 0u64;
-                let mut high = min_h.saturating_sub(1);
-
-                while low < high {
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(SyncWorkerError::BudgetExhausted(format!(
-                            "Sync timeout of {:?} exceeded during ancestor discovery",
-                            timeout_duration
-                        )));
-                    }
-                    let mid = low + (high - low).div_ceil(2);
-                    let req = SyncRequest::GetHeaders {
-                        start_height: mid,
-                        max_count: 1,
-                    };
-                    match tokio::time::timeout_at(
+        let mut current_target: SyncTarget = match initial_target {
+            Some(t) => t,
+            None => {
+                if let Some(ref st) = storage {
+                    match Self::fetch_peer_status(
+                        &network_handle,
+                        peer_id,
+                        chain_id,
                         deadline,
-                        network_handle.send_sync_request(peer_id, req),
+                        timeout_duration,
                     )
                     .await
                     {
-                        Err(_) => {
-                            return Err(SyncWorkerError::BudgetExhausted(format!(
-                                "Sync timeout of {:?} exceeded during binary search query",
-                                timeout_duration
-                            )));
+                        Ok(fresh) => {
+                            Self::notify_attempt_target(
+                                &sync_tx,
+                                sync_operation_id,
+                                fresh,
+                                &cancel_flag,
+                                deadline,
+                                timeout_duration,
+                            )
+                            .await?;
+                            local_snapshot = Self::capture_snapshot_cooperative(
+                                st,
+                                fresh.tip_height,
+                                &cancel_flag,
+                            )
+                            .await?;
+                            fresh
                         }
-                        Ok(Ok(SyncResponse::Headers(headers))) => {
-                            if headers.is_empty() {
-                                return Err(SyncWorkerError::Incomplete {
-                                    requested_height: mid,
-                                    expected_target: peer_tip_height,
-                                    reason: "binary search header query returned empty headers"
-                                        .into(),
-                                });
-                            }
-                            if headers.len() > 1 {
-                                return Err(SyncWorkerError::ConsensusInvalid(format!(
-                                    "binary search header query returned {} headers, expected 1",
-                                    headers.len()
-                                )));
-                            }
-                            let h = &headers[0];
-                            if h.height != mid {
-                                return Err(SyncWorkerError::ConsensusInvalid(format!(
-                                    "binary search header has height {}, expected {mid}",
-                                    h.height
-                                )));
-                            }
-                            if h.chain_id != chain_id {
-                                return Err(SyncWorkerError::ConsensusInvalid(format!(
-                                    "binary search header has invalid chain ID {}, expected {chain_id}",
-                                    h.chain_id
-                                )));
-                            }
-                            if Some(h.block_id()) == snapshot.get_block_id(mid) {
-                                low = mid;
+                        Err(e) => {
+                            if let Some(claim) = advertised_claim {
+                                if claim.tip_height == 0 && claim.tip_block_id == genesis_id {
+                                    let target = SyncTarget::from(claim);
+                                    let _ = Self::notify_attempt_target(
+                                        &sync_tx,
+                                        sync_operation_id,
+                                        target,
+                                        &cancel_flag,
+                                        deadline,
+                                        timeout_duration,
+                                    )
+                                    .await;
+                                    local_snapshot =
+                                        Self::capture_snapshot_cooperative(st, 0, &cancel_flag)
+                                            .await?;
+                                    target
+                                } else {
+                                    return Err(e);
+                                }
                             } else {
-                                high = mid.saturating_sub(1);
+                                return Err(e);
                             }
-                        }
-                        Ok(Ok(other)) => {
-                            return Err(SyncWorkerError::TransientOrProtocol(format!(
-                                "Unexpected response querying header at height {mid} during ancestor discovery with {peer_id}: {other:?}"
-                            )));
-                        }
-                        Ok(Err(e)) => {
-                            return Err(SyncWorkerError::TransientOrProtocol(format!(
-                                "Failed to query header at height {mid} during ancestor discovery with {peer_id}: {e}"
-                            )));
                         }
                     }
+                } else if let Some(claim) = advertised_claim {
+                    claim.into()
+                } else {
+                    let (tip_id, work) = if peer_tip_height == 0 {
+                        let g = genesis_block(chain_id);
+                        (g.block_id(), U256::from_u128(g.header.difficulty))
+                    } else {
+                        (Hash::ZERO, U256::zero())
+                    };
+                    SyncTarget {
+                        tip_height: peer_tip_height,
+                        tip_block_id: tip_id,
+                        cumulative_work: work,
+                    }
                 }
-
-                low
             }
         };
 
-        if common_ancestor_height == peer_tip_height {
-            tracing::info!(
-                "Already synchronized with peer {} at height #{}",
-                peer_id,
-                peer_tip_height
-            );
-            return Ok(SyncWorkerSuccess::AlreadySynchronized {
-                tip_height: snapshot.tip_height(),
-                tip_block_id: snapshot.tip_block_id(),
-            });
-        }
+        let mut reorg_restarts: usize = 0;
 
-        tracing::info!(
-            "Common ancestor with peer {} found at height #{}. Fetching replacement blocks #{}..#{}",
-            peer_id,
-            common_ancestor_height,
-            common_ancestor_height + 1,
-            peer_tip_height
-        );
+        'attempt_loop: loop {
+            let target = current_target;
+            let snapshot = &local_snapshot;
 
-        let mut current_h = common_ancestor_height.saturating_add(1);
-        let mut total_blocks_applied = 0u64;
-        let mut total_bodies_processed = 0u64;
-        let mut last_applied_block_id = snapshot
-            .get_block_id(common_ancestor_height)
-            .unwrap_or(Hash::ZERO);
-        let mut last_applied_height = common_ancestor_height;
-        let mut round_trips = 0u32;
-
-        while current_h <= peer_tip_height {
-            if tokio::time::Instant::now() >= deadline {
-                return Err(SyncWorkerError::BudgetExhausted(format!(
-                    "Sync timeout of {:?} exceeded",
-                    timeout_duration
-                )));
-            }
-            if total_bodies_processed >= MAX_SYNC_BLOCKS {
-                return Err(SyncWorkerError::BudgetExhausted(format!(
-                    "Max sync blocks limit ({MAX_SYNC_BLOCKS}) reached before reaching target #{peer_tip_height}"
-                )));
-            }
-            round_trips = round_trips.checked_add(1).ok_or_else(|| {
-                SyncWorkerError::BudgetExhausted("Round trips count overflowed".into())
-            })?;
-            if round_trips > MAX_SYNC_ROUND_TRIPS {
-                return Err(SyncWorkerError::BudgetExhausted(format!(
-                    "Max sync round trips limit ({MAX_SYNC_ROUND_TRIPS}) reached"
-                )));
-            }
-
-            let remaining_budget = MAX_SYNC_BLOCKS.saturating_sub(total_bodies_processed);
-            let count = (peer_tip_height.saturating_sub(current_h).saturating_add(1))
-                .min(SYNC_BATCH_SIZE as u64)
-                .min(remaining_budget) as u32;
-            let req = SyncRequest::GetHeaders {
-                start_height: current_h,
-                max_count: count,
-            };
-
-            let headers = match tokio::time::timeout_at(
-                deadline,
-                network_handle.send_sync_request(peer_id, req),
-            )
-            .await
-            {
-                Err(_) => {
+            // 1. Discover common ancestor between local snapshot and peer chain
+            let min_h = snapshot.tip_height().min(target.tip_height);
+            let common_ancestor_height = if min_h == 0 {
+                let genesis_id = snapshot
+                    .get_block_id(0)
+                    .unwrap_or_else(|| genesis_block(chain_id).block_id());
+                if target.tip_height == 0 && target.tip_block_id != genesis_id {
+                    // Check if peer changed tip
+                    if let Ok(new_target) = Self::fetch_peer_status(
+                        &network_handle,
+                        peer_id,
+                        chain_id,
+                        deadline,
+                        timeout_duration,
+                    )
+                    .await
+                    {
+                        if new_target != target {
+                            if reorg_restarts < MAX_REORG_RESTARTS {
+                                reorg_restarts += 1;
+                                current_target = new_target;
+                                Self::notify_attempt_target(
+                                    &sync_tx,
+                                    sync_operation_id,
+                                    current_target,
+                                    &cancel_flag,
+                                    deadline,
+                                    timeout_duration,
+                                )
+                                .await?;
+                                if let Some(ref st) = storage {
+                                    local_snapshot = Self::capture_snapshot_cooperative(
+                                        st,
+                                        current_target.tip_height,
+                                        &cancel_flag,
+                                    )
+                                    .await?;
+                                }
+                                continue 'attempt_loop;
+                            } else {
+                                return Err(SyncWorkerError::PeerChainChanging(format!(
+                                    "Peer {peer_id} changed sync target at height 0; restart budget exhausted"
+                                )));
+                            }
+                        }
+                    }
+                    return Err(SyncWorkerError::FalseAdvertisedClaim(format!(
+                        "Peer {peer_id} advertised invalid genesis tip block ID {} at height 0 (expected {})",
+                        target.tip_block_id,
+                        genesis_id
+                    )));
+                }
+                0
+            } else {
+                if tokio::time::Instant::now() >= deadline {
                     return Err(SyncWorkerError::BudgetExhausted(format!(
-                        "Sync timeout of {:?} exceeded requesting batch headers",
+                        "Sync timeout of {:?} exceeded during ancestor discovery",
                         timeout_duration
                     )));
                 }
-                Ok(Ok(SyncResponse::Headers(headers))) => headers,
-                Ok(Ok(other)) => {
-                    return Err(SyncWorkerError::TransientOrProtocol(format!(
-                        "Unexpected sync headers response from {peer_id}: {other:?}"
-                    )));
-                }
-                Ok(Err(e)) => {
-                    return Err(SyncWorkerError::TransientOrProtocol(format!(
-                        "Network error requesting headers #{current_h}.. from {peer_id}: {e}"
-                    )));
+                // Fast path: check if peer matches our snapshot at min_h
+                let fast_req = SyncRequest::GetHeaders {
+                    start_height: min_h,
+                    max_count: 1,
+                };
+                let fast_match = match tokio::time::timeout_at(
+                    deadline,
+                    network_handle.send_sync_request(peer_id, fast_req),
+                )
+                .await
+                {
+                    Err(_) => {
+                        return Err(SyncWorkerError::BudgetExhausted(format!(
+                            "Sync timeout of {:?} exceeded during fast-path query",
+                            timeout_duration
+                        )));
+                    }
+                    Ok(Ok(SyncResponse::Headers(headers))) => {
+                        if headers.is_empty() {
+                            return Err(SyncWorkerError::Incomplete {
+                                requested_height: min_h,
+                                expected_target: target.tip_height,
+                                reason: "fast-path header query returned empty headers".into(),
+                            });
+                        }
+                        if headers.len() > 1 {
+                            return Err(SyncWorkerError::ConsensusInvalid(format!(
+                                "fast-path header query returned {} headers, expected 1",
+                                headers.len()
+                            )));
+                        }
+                        let h = &headers[0];
+                        if h.height != min_h {
+                            return Err(SyncWorkerError::ConsensusInvalid(format!(
+                                "fast-path header has height {}, expected {min_h}",
+                                h.height
+                            )));
+                        }
+                        if h.chain_id != chain_id {
+                            return Err(SyncWorkerError::ConsensusInvalid(format!(
+                                "fast-path header has invalid chain ID {}, expected {chain_id}",
+                                h.chain_id
+                            )));
+                        }
+                        // Verify consistency with target if this query is at the peer's claimed tip
+                        if !target.tip_block_id.is_zero()
+                            && target.tip_height == min_h
+                            && h.block_id() != target.tip_block_id
+                        {
+                            // Target tip mismatch! Check if peer reorganized
+                            if let Ok(new_target) = Self::fetch_peer_status(
+                                &network_handle,
+                                peer_id,
+                                chain_id,
+                                deadline,
+                                timeout_duration,
+                            )
+                            .await
+                            {
+                                if new_target != target {
+                                    if reorg_restarts < MAX_REORG_RESTARTS {
+                                        reorg_restarts += 1;
+                                        current_target = new_target;
+                                        Self::notify_attempt_target(
+                                            &sync_tx,
+                                            sync_operation_id,
+                                            current_target,
+                                            &cancel_flag,
+                                            deadline,
+                                            timeout_duration,
+                                        )
+                                        .await?;
+                                        if let Some(ref st) = storage {
+                                            local_snapshot = Self::capture_snapshot_cooperative(
+                                                st,
+                                                current_target.tip_height,
+                                                &cancel_flag,
+                                            )
+                                            .await?;
+                                        }
+                                        continue 'attempt_loop;
+                                    } else {
+                                        return Err(SyncWorkerError::PeerChainChanging(format!(
+                                            "Peer {peer_id} changed sync target during fast-path check; restart budget exhausted"
+                                        )));
+                                    }
+                                }
+                            }
+                            return Err(SyncWorkerError::FalseAdvertisedClaim(format!(
+                                "Peer {peer_id} advertised tip block ID {} at height {min_h}, but served header with block ID {}",
+                                target.tip_block_id,
+                                h.block_id()
+                            )));
+                        }
+                        Some(h.block_id()) == snapshot.get_block_id(min_h)
+                    }
+                    Ok(Ok(other)) => {
+                        return Err(SyncWorkerError::TransientOrProtocol(format!(
+                            "Unexpected response during fast-path header query from {peer_id}: {other:?}"
+                        )));
+                    }
+                    Ok(Err(e)) => {
+                        return Err(SyncWorkerError::TransientOrProtocol(format!(
+                            "Transport error querying fast-path header at height {min_h} from {peer_id}: {e}"
+                        )));
+                    }
+                };
+
+                if fast_match {
+                    min_h
+                } else {
+                    // Binary search for common ancestor in [0, min_h - 1]
+                    let mut low = 0u64;
+                    let mut high = min_h.saturating_sub(1);
+
+                    while low < high {
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(SyncWorkerError::BudgetExhausted(format!(
+                                "Sync timeout of {:?} exceeded during ancestor discovery",
+                                timeout_duration
+                            )));
+                        }
+                        let mid = low + (high - low).div_ceil(2);
+                        let req = SyncRequest::GetHeaders {
+                            start_height: mid,
+                            max_count: 1,
+                        };
+                        match tokio::time::timeout_at(
+                            deadline,
+                            network_handle.send_sync_request(peer_id, req),
+                        )
+                        .await
+                        {
+                            Err(_) => {
+                                return Err(SyncWorkerError::BudgetExhausted(format!(
+                                    "Sync timeout of {:?} exceeded during binary search query",
+                                    timeout_duration
+                                )));
+                            }
+                            Ok(Ok(SyncResponse::Headers(headers))) => {
+                                if headers.is_empty() {
+                                    return Err(SyncWorkerError::Incomplete {
+                                        requested_height: mid,
+                                        expected_target: target.tip_height,
+                                        reason: "binary search header query returned empty headers"
+                                            .into(),
+                                    });
+                                }
+                                if headers.len() > 1 {
+                                    return Err(SyncWorkerError::ConsensusInvalid(format!(
+                                        "binary search header query returned {} headers, expected 1",
+                                        headers.len()
+                                    )));
+                                }
+                                let h = &headers[0];
+                                if h.height != mid {
+                                    return Err(SyncWorkerError::ConsensusInvalid(format!(
+                                        "binary search header has height {}, expected {mid}",
+                                        h.height
+                                    )));
+                                }
+                                if h.chain_id != chain_id {
+                                    return Err(SyncWorkerError::ConsensusInvalid(format!(
+                                        "binary search header has invalid chain ID {}, expected {chain_id}",
+                                        h.chain_id
+                                    )));
+                                }
+                                if Some(h.block_id()) == snapshot.get_block_id(mid) {
+                                    low = mid;
+                                } else {
+                                    high = mid.saturating_sub(1);
+                                }
+                            }
+                            Ok(Ok(other)) => {
+                                return Err(SyncWorkerError::TransientOrProtocol(format!(
+                                    "Unexpected response querying header at height {mid} during ancestor discovery with {peer_id}: {other:?}"
+                                )));
+                            }
+                            Ok(Err(e)) => {
+                                return Err(SyncWorkerError::TransientOrProtocol(format!(
+                                    "Failed to query header at height {mid} during ancestor discovery with {peer_id}: {e}"
+                                )));
+                            }
+                        }
+                    }
+
+                    low
                 }
             };
 
-            if headers.is_empty() {
-                return Err(SyncWorkerError::Incomplete {
-                    requested_height: current_h,
-                    expected_target: peer_tip_height,
-                    reason: "peer returned empty headers before reaching target height".into(),
+            if common_ancestor_height == target.tip_height {
+                // Exact verification for AlreadySynchronized
+                let local_id_at_target = snapshot.get_block_id(target.tip_height);
+                if !target.tip_block_id.is_zero() && local_id_at_target != Some(target.tip_block_id)
+                {
+                    // Check if peer reorganized
+                    if let Ok(new_target) = Self::fetch_peer_status(
+                        &network_handle,
+                        peer_id,
+                        chain_id,
+                        deadline,
+                        timeout_duration,
+                    )
+                    .await
+                    {
+                        if new_target != target {
+                            if reorg_restarts < MAX_REORG_RESTARTS {
+                                reorg_restarts += 1;
+                                current_target = new_target;
+                                Self::notify_attempt_target(
+                                    &sync_tx,
+                                    sync_operation_id,
+                                    current_target,
+                                    &cancel_flag,
+                                    deadline,
+                                    timeout_duration,
+                                )
+                                .await?;
+                                if let Some(ref st) = storage {
+                                    local_snapshot = Self::capture_snapshot_cooperative(
+                                        st,
+                                        current_target.tip_height,
+                                        &cancel_flag,
+                                    )
+                                    .await?;
+                                }
+                                continue 'attempt_loop;
+                            } else {
+                                return Err(SyncWorkerError::PeerChainChanging(format!(
+                                    "Peer {peer_id} changed sync target; restart budget exhausted"
+                                )));
+                            }
+                        }
+                    }
+                    return Err(SyncWorkerError::FalseAdvertisedClaim(format!(
+                        "Peer {peer_id} claimed tip block ID {} at height {}, but local canonical chain has {:?}",
+                        target.tip_block_id,
+                        target.tip_height,
+                        local_id_at_target
+                    )));
+                }
+
+                if !target.tip_block_id.is_zero() {
+                    if let Some(ref st) = storage {
+                        match st.get_block_metadata(&target.tip_block_id) {
+                            Ok(Some(meta)) => {
+                                if meta.height != target.tip_height
+                                    || meta.cumulative_work != target.cumulative_work
+                                {
+                                    return Err(SyncWorkerError::FalseAdvertisedClaim(format!(
+                                        "Peer {peer_id} claimed cumulative work {:?} at height {}, but stored block has work {:?} at height {}",
+                                        target.cumulative_work, target.tip_height, meta.cumulative_work, meta.height
+                                    )));
+                                }
+                            }
+                            Ok(None) => {
+                                return Err(SyncWorkerError::FalseAdvertisedClaim(format!(
+                                    "Peer {peer_id} claimed tip block {} not found in local storage",
+                                    target.tip_block_id
+                                )));
+                            }
+                            Err(e) => {
+                                return Err(SyncWorkerError::LocalOrStorage(format!(
+                                    "Storage error reading block metadata for {}: {e}",
+                                    target.tip_block_id
+                                )));
+                            }
+                        }
+                    }
+                }
+
+                tracing::info!(
+                    "Already synchronized with peer {} at height #{}",
+                    peer_id,
+                    target.tip_height
+                );
+                return Ok(SyncWorkerSuccess::AlreadySynchronized {
+                    tip_height: snapshot.tip_height(),
+                    tip_block_id: snapshot.tip_block_id(),
+                    target: Some(target),
                 });
             }
 
-            if headers.len() > count as usize {
-                return Err(SyncWorkerError::ConsensusInvalid(format!(
-                    "Peer returned {} headers, exceeding requested count {}",
-                    headers.len(),
-                    count
-                )));
-            }
+            tracing::info!(
+                "Common ancestor with peer {} found at height #{}. Fetching replacement blocks #{}..#{}",
+                peer_id,
+                common_ancestor_height,
+                common_ancestor_height + 1,
+                target.tip_height
+            );
 
-            // Validate header chain contiguity, heights, and linkage
-            let mut prev_id = last_applied_block_id;
-            for (i, header) in headers.iter().enumerate() {
-                let expected_height = current_h.saturating_add(i as u64);
-                if header.height != expected_height {
-                    return Err(SyncWorkerError::ConsensusInvalid(format!(
-                        "Header at index {i} has height {}, expected {expected_height}",
-                        header.height
-                    )));
-                }
-                if header.chain_id != chain_id {
-                    return Err(SyncWorkerError::ConsensusInvalid(format!(
-                        "Header #{expected_height} has invalid chain ID {}, expected {chain_id}",
-                        header.chain_id
-                    )));
-                }
-                if header.parent_block_id != prev_id {
-                    return Err(SyncWorkerError::ConsensusInvalid(format!(
-                        "Header #{expected_height} parent {} does not match previous block ID {}",
-                        header.parent_block_id, prev_id
-                    )));
-                }
-                prev_id = header.block_id();
-            }
+            let mut current_h = common_ancestor_height.saturating_add(1);
+            let mut total_blocks_applied = 0u64;
+            let mut total_bodies_processed = 0u64;
+            let mut last_applied_block_id = snapshot
+                .get_block_id(common_ancestor_height)
+                .unwrap_or(Hash::ZERO);
+            let mut last_applied_height = common_ancestor_height;
+            let mut round_trips = 0u32;
 
-            // Verify consistency with advertised tip if batch contains the claimed tip header
-            if let Some(ref claim) = advertised_claim {
-                for header in &headers {
-                    if header.height == claim.tip_height && header.block_id() != claim.tip_block_id
+            while current_h <= target.tip_height {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(SyncWorkerError::BudgetExhausted(format!(
+                        "Sync timeout of {:?} exceeded",
+                        timeout_duration
+                    )));
+                }
+                if total_bodies_processed >= MAX_SYNC_BLOCKS {
+                    return Err(SyncWorkerError::BudgetExhausted(format!(
+                        "Max sync blocks limit ({MAX_SYNC_BLOCKS}) reached before reaching target #{}",
+                        target.tip_height
+                    )));
+                }
+                round_trips = round_trips.checked_add(1).ok_or_else(|| {
+                    SyncWorkerError::BudgetExhausted("Round trips count overflowed".into())
+                })?;
+                if round_trips > MAX_SYNC_ROUND_TRIPS {
+                    return Err(SyncWorkerError::BudgetExhausted(format!(
+                        "Max sync round trips limit ({MAX_SYNC_ROUND_TRIPS}) reached"
+                    )));
+                }
+
+                let remaining_budget = MAX_SYNC_BLOCKS.saturating_sub(total_bodies_processed);
+                let count = (target
+                    .tip_height
+                    .saturating_sub(current_h)
+                    .saturating_add(1))
+                .min(SYNC_BATCH_SIZE as u64)
+                .min(remaining_budget) as u32;
+                let req = SyncRequest::GetHeaders {
+                    start_height: current_h,
+                    max_count: count,
+                };
+
+                let headers = match tokio::time::timeout_at(
+                    deadline,
+                    network_handle.send_sync_request(peer_id, req),
+                )
+                .await
+                {
+                    Err(_) => {
+                        return Err(SyncWorkerError::BudgetExhausted(format!(
+                            "Sync timeout of {:?} exceeded requesting batch headers",
+                            timeout_duration
+                        )));
+                    }
+                    Ok(Ok(SyncResponse::Headers(headers))) => headers,
+                    Ok(Ok(other)) => {
+                        return Err(SyncWorkerError::TransientOrProtocol(format!(
+                            "Unexpected sync headers response from {peer_id}: {other:?}"
+                        )));
+                    }
+                    Ok(Err(e)) => {
+                        return Err(SyncWorkerError::TransientOrProtocol(format!(
+                            "Network error requesting headers #{current_h}.. from {peer_id}: {e}"
+                        )));
+                    }
+                };
+
+                if headers.is_empty() {
+                    // Check if peer reorganized
+                    if let Ok(new_target) = Self::fetch_peer_status(
+                        &network_handle,
+                        peer_id,
+                        chain_id,
+                        deadline,
+                        timeout_duration,
+                    )
+                    .await
                     {
+                        if new_target != target {
+                            if reorg_restarts < MAX_REORG_RESTARTS {
+                                reorg_restarts += 1;
+                                current_target = new_target;
+                                Self::notify_attempt_target(
+                                    &sync_tx,
+                                    sync_operation_id,
+                                    current_target,
+                                    &cancel_flag,
+                                    deadline,
+                                    timeout_duration,
+                                )
+                                .await?;
+                                if let Some(ref st) = storage {
+                                    local_snapshot = Self::capture_snapshot_cooperative(
+                                        st,
+                                        current_target.tip_height,
+                                        &cancel_flag,
+                                    )
+                                    .await?;
+                                }
+                                continue 'attempt_loop;
+                            } else {
+                                return Err(SyncWorkerError::PeerChainChanging(format!(
+                                    "Peer {peer_id} reorganized mid-sync; restart budget exhausted"
+                                )));
+                            }
+                        }
+                    }
+                    return Err(SyncWorkerError::Incomplete {
+                        requested_height: current_h,
+                        expected_target: target.tip_height,
+                        reason: "peer returned empty headers before reaching target height".into(),
+                    });
+                }
+
+                if headers.len() > count as usize {
+                    return Err(SyncWorkerError::ConsensusInvalid(format!(
+                        "Peer returned {} headers, exceeding requested count {}",
+                        headers.len(),
+                        count
+                    )));
+                }
+
+                // Validate header chain contiguity, heights, and linkage
+                let mut prev_id = last_applied_block_id;
+                let mut linkage_broken = false;
+                for (i, header) in headers.iter().enumerate() {
+                    let expected_height = current_h.saturating_add(i as u64);
+                    if header.height != expected_height {
+                        return Err(SyncWorkerError::ConsensusInvalid(format!(
+                            "Header at index {i} has height {}, expected {expected_height}",
+                            header.height
+                        )));
+                    }
+                    if header.chain_id != chain_id {
+                        return Err(SyncWorkerError::ConsensusInvalid(format!(
+                            "Header #{expected_height} has invalid chain ID {}, expected {chain_id}",
+                            header.chain_id
+                        )));
+                    }
+                    if header.parent_block_id != prev_id {
+                        linkage_broken = true;
+                        break;
+                    }
+                    prev_id = header.block_id();
+                }
+
+                if linkage_broken {
+                    // Check if peer reorganized mid-sync
+                    if let Ok(new_target) = Self::fetch_peer_status(
+                        &network_handle,
+                        peer_id,
+                        chain_id,
+                        deadline,
+                        timeout_duration,
+                    )
+                    .await
+                    {
+                        if new_target != target {
+                            if reorg_restarts < MAX_REORG_RESTARTS {
+                                reorg_restarts += 1;
+                                current_target = new_target;
+                                Self::notify_attempt_target(
+                                    &sync_tx,
+                                    sync_operation_id,
+                                    current_target,
+                                    &cancel_flag,
+                                    deadline,
+                                    timeout_duration,
+                                )
+                                .await?;
+                                if let Some(ref st) = storage {
+                                    local_snapshot = Self::capture_snapshot_cooperative(
+                                        st,
+                                        current_target.tip_height,
+                                        &cancel_flag,
+                                    )
+                                    .await?;
+                                }
+                                continue 'attempt_loop;
+                            } else {
+                                return Err(SyncWorkerError::PeerChainChanging(format!(
+                                    "Peer {peer_id} reorganized mid-sync (target changed); restart budget exhausted"
+                                )));
+                            }
+                        }
+                    }
+                    return Err(SyncWorkerError::ConsensusInvalid(format!(
+                        "Header batch parent does not match previous block ID {prev_id}"
+                    )));
+                }
+
+                // Verify consistency with target if batch contains the claimed tip header
+                for header in &headers {
+                    if !target.tip_block_id.is_zero()
+                        && header.height == target.tip_height
+                        && header.block_id() != target.tip_block_id
+                    {
+                        // Check if peer reorganized
+                        if let Ok(new_target) = Self::fetch_peer_status(
+                            &network_handle,
+                            peer_id,
+                            chain_id,
+                            deadline,
+                            timeout_duration,
+                        )
+                        .await
+                        {
+                            if new_target != target {
+                                if reorg_restarts < MAX_REORG_RESTARTS {
+                                    reorg_restarts += 1;
+                                    current_target = new_target;
+                                    Self::notify_attempt_target(
+                                        &sync_tx,
+                                        sync_operation_id,
+                                        current_target,
+                                        &cancel_flag,
+                                        deadline,
+                                        timeout_duration,
+                                    )
+                                    .await?;
+                                    if let Some(ref st) = storage {
+                                        local_snapshot = Self::capture_snapshot_cooperative(
+                                            st,
+                                            current_target.tip_height,
+                                            &cancel_flag,
+                                        )
+                                        .await?;
+                                    }
+                                    continue 'attempt_loop;
+                                } else {
+                                    return Err(SyncWorkerError::PeerChainChanging(format!(
+                                        "Peer {peer_id} reorganized mid-sync; restart budget exhausted"
+                                    )));
+                                }
+                            }
+                        }
                         return Err(SyncWorkerError::FalseAdvertisedClaim(format!(
                             "Peer {peer_id} advertised tip block ID {} at height {}, but served header with block ID {}",
-                            claim.tip_block_id, claim.tip_height, header.block_id()
+                            target.tip_block_id, target.tip_height, header.block_id()
                         )));
                     }
                 }
-            }
 
-            let block_ids: Vec<Hash> = headers.iter().map(|h| h.block_id()).collect();
+                let block_ids: Vec<Hash> = headers.iter().map(|h| h.block_id()).collect();
 
-            // Request blocks for these headers
-            let block_req = SyncRequest::GetBlocks {
-                block_ids: block_ids.clone(),
-            };
-            let blocks = match tokio::time::timeout_at(
-                deadline,
-                network_handle.send_sync_request(peer_id, block_req),
-            )
-            .await
-            {
-                Err(_) => {
-                    return Err(SyncWorkerError::BudgetExhausted(format!(
-                        "Sync timeout of {:?} exceeded requesting blocks",
-                        timeout_duration
-                    )));
+                // Request blocks for these headers
+                let block_req = SyncRequest::GetBlocks {
+                    block_ids: block_ids.clone(),
+                };
+                let blocks = match tokio::time::timeout_at(
+                    deadline,
+                    network_handle.send_sync_request(peer_id, block_req),
+                )
+                .await
+                {
+                    Err(_) => {
+                        return Err(SyncWorkerError::BudgetExhausted(format!(
+                            "Sync timeout of {:?} exceeded requesting blocks",
+                            timeout_duration
+                        )));
+                    }
+                    Ok(Ok(SyncResponse::Blocks(blocks))) => blocks,
+                    Ok(Ok(other)) => {
+                        // Check if peer reorganized between headers and blocks
+                        if let Ok(new_target) = Self::fetch_peer_status(
+                            &network_handle,
+                            peer_id,
+                            chain_id,
+                            deadline,
+                            timeout_duration,
+                        )
+                        .await
+                        {
+                            if new_target != target {
+                                if reorg_restarts < MAX_REORG_RESTARTS {
+                                    reorg_restarts += 1;
+                                    current_target = new_target;
+                                    Self::notify_attempt_target(
+                                        &sync_tx,
+                                        sync_operation_id,
+                                        current_target,
+                                        &cancel_flag,
+                                        deadline,
+                                        timeout_duration,
+                                    )
+                                    .await?;
+                                    if let Some(ref st) = storage {
+                                        local_snapshot = Self::capture_snapshot_cooperative(
+                                            st,
+                                            current_target.tip_height,
+                                            &cancel_flag,
+                                        )
+                                        .await?;
+                                    }
+                                    continue 'attempt_loop;
+                                } else {
+                                    return Err(SyncWorkerError::PeerChainChanging(format!(
+                                        "Peer {peer_id} reorganized between headers and blocks; restart budget exhausted"
+                                    )));
+                                }
+                            }
+                        }
+                        return Err(SyncWorkerError::TransientOrProtocol(format!(
+                            "Unexpected sync blocks response from {peer_id}: {other:?}"
+                        )));
+                    }
+                    Ok(Err(e)) => {
+                        // Check if peer reorganized between headers and blocks
+                        if let Ok(new_target) = Self::fetch_peer_status(
+                            &network_handle,
+                            peer_id,
+                            chain_id,
+                            deadline,
+                            timeout_duration,
+                        )
+                        .await
+                        {
+                            if new_target != target {
+                                if reorg_restarts < MAX_REORG_RESTARTS {
+                                    reorg_restarts += 1;
+                                    current_target = new_target;
+                                    Self::notify_attempt_target(
+                                        &sync_tx,
+                                        sync_operation_id,
+                                        current_target,
+                                        &cancel_flag,
+                                        deadline,
+                                        timeout_duration,
+                                    )
+                                    .await?;
+                                    if let Some(ref st) = storage {
+                                        local_snapshot = Self::capture_snapshot_cooperative(
+                                            st,
+                                            current_target.tip_height,
+                                            &cancel_flag,
+                                        )
+                                        .await?;
+                                    }
+                                    continue 'attempt_loop;
+                                } else {
+                                    return Err(SyncWorkerError::PeerChainChanging(format!(
+                                        "Peer {peer_id} reorganized between headers and blocks; restart budget exhausted"
+                                    )));
+                                }
+                            }
+                        }
+                        return Err(SyncWorkerError::TransientOrProtocol(format!(
+                            "Network error requesting blocks from {peer_id}: {e}"
+                        )));
+                    }
+                };
+
+                if blocks.is_empty() {
+                    // Check if peer reorganized
+                    if let Ok(new_target) = Self::fetch_peer_status(
+                        &network_handle,
+                        peer_id,
+                        chain_id,
+                        deadline,
+                        timeout_duration,
+                    )
+                    .await
+                    {
+                        if new_target != target {
+                            if reorg_restarts < MAX_REORG_RESTARTS {
+                                reorg_restarts += 1;
+                                current_target = new_target;
+                                Self::notify_attempt_target(
+                                    &sync_tx,
+                                    sync_operation_id,
+                                    current_target,
+                                    &cancel_flag,
+                                    deadline,
+                                    timeout_duration,
+                                )
+                                .await?;
+                                if let Some(ref st) = storage {
+                                    local_snapshot = Self::capture_snapshot_cooperative(
+                                        st,
+                                        current_target.tip_height,
+                                        &cancel_flag,
+                                    )
+                                    .await?;
+                                }
+                                continue 'attempt_loop;
+                            } else {
+                                return Err(SyncWorkerError::PeerChainChanging(format!(
+                                    "Peer {peer_id} returned empty blocks due to reorg; restart budget exhausted"
+                                )));
+                            }
+                        }
+                    }
+                    return Err(SyncWorkerError::Incomplete {
+                        requested_height: current_h,
+                        expected_target: target.tip_height,
+                        reason: "peer returned empty blocks for non-empty headers".into(),
+                    });
                 }
-                Ok(Ok(SyncResponse::Blocks(blocks))) => blocks,
-                Ok(Ok(other)) => {
-                    return Err(SyncWorkerError::TransientOrProtocol(format!(
-                        "Unexpected sync blocks response from {peer_id}: {other:?}"
-                    )));
-                }
-                Ok(Err(e)) => {
-                    return Err(SyncWorkerError::TransientOrProtocol(format!(
-                        "Network error requesting blocks from {peer_id}: {e}"
-                    )));
-                }
-            };
 
-            if blocks.is_empty() {
-                return Err(SyncWorkerError::Incomplete {
-                    requested_height: current_h,
-                    expected_target: peer_tip_height,
-                    reason: "peer returned empty blocks for non-empty headers".into(),
-                });
-            }
-
-            if blocks.len() > headers.len() {
-                return Err(SyncWorkerError::ConsensusInvalid(format!(
-                    "Peer returned {} blocks, exceeding requested count {}",
-                    blocks.len(),
-                    headers.len()
-                )));
-            }
-
-            // Verify each block strictly matches its corresponding requested header and position
-            for (i, (block, header)) in blocks.iter().zip(headers.iter()).enumerate() {
-                let actual_id = block.header.block_id();
-                let expected_id = block_ids[i];
-                if actual_id != expected_id {
+                if blocks.len() > headers.len() {
                     return Err(SyncWorkerError::ConsensusInvalid(format!(
-                        "Block at index {i} ID {actual_id} does not match requested block ID {expected_id}"
+                        "Peer returned {} blocks, exceeding requested count {}",
+                        blocks.len(),
+                        headers.len()
                     )));
                 }
-                if &block.header != header {
-                    return Err(SyncWorkerError::ConsensusInvalid(format!(
-                        "Block body header at index {i} does not match requested header"
-                    )));
-                }
-                let expected_height = current_h.saturating_add(i as u64);
-                if block.header.height != expected_height {
-                    return Err(SyncWorkerError::ConsensusInvalid(format!(
-                        "Block at index {i} has height {}, expected {expected_height}",
-                        block.header.height
-                    )));
-                }
-            }
 
-            let (ack_tx, ack_rx) = oneshot::channel();
-            tokio::time::timeout_at(
-                deadline,
-                sync_tx.send(RuntimeSyncMessage::ApplyBlockBatch {
-                    sync_operation_id,
-                    peer_id,
-                    blocks,
-                    respond_to: ack_tx,
-                }),
-            )
-            .await
-            .map_err(|_| {
-                cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                SyncWorkerError::BudgetExhausted(format!(
-                    "Sync timeout of {:?} exceeded sending block batch to runtime",
-                    timeout_duration
-                ))
-            })?
-            .map_err(|_| {
-                SyncWorkerError::LocalOrStorage("Node runtime shut down during sync".to_string())
-            })?;
+                // Verify each block strictly matches its corresponding requested header and position
+                for (i, (block, header)) in blocks.iter().zip(headers.iter()).enumerate() {
+                    let actual_id = block.header.block_id();
+                    let expected_id = block_ids[i];
+                    if actual_id != expected_id {
+                        return Err(SyncWorkerError::ConsensusInvalid(format!(
+                            "Block at index {i} ID {actual_id} does not match requested block ID {expected_id}"
+                        )));
+                    }
+                    if &block.header != header {
+                        return Err(SyncWorkerError::ConsensusInvalid(format!(
+                            "Block body header at index {i} does not match requested header"
+                        )));
+                    }
+                    let expected_height = current_h.saturating_add(i as u64);
+                    if block.header.height != expected_height {
+                        return Err(SyncWorkerError::ConsensusInvalid(format!(
+                            "Block at index {i} has height {}, expected {expected_height}",
+                            block.header.height
+                        )));
+                    }
+                }
 
-            let receipt = tokio::time::timeout_at(deadline, ack_rx)
+                let (ack_tx, ack_rx) = oneshot::channel();
+                tokio::time::timeout_at(
+                    deadline,
+                    sync_tx.send(RuntimeSyncMessage::ApplyBlockBatch {
+                        sync_operation_id,
+                        peer_id,
+                        blocks,
+                        respond_to: ack_tx,
+                    }),
+                )
                 .await
                 .map_err(|_| {
                     cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                     SyncWorkerError::BudgetExhausted(format!(
-                        "Sync timeout of {:?} exceeded waiting for block batch receipt",
+                        "Sync timeout of {:?} exceeded sending block batch to runtime",
                         timeout_duration
                     ))
                 })?
                 .map_err(|_| {
                     SyncWorkerError::LocalOrStorage(
-                        "Node runtime dropped block batch response".to_string(),
+                        "Node runtime shut down during sync".to_string(),
                     )
                 })?;
 
-            let processed = receipt.blocks_processed as u64;
-            total_bodies_processed = total_bodies_processed.saturating_add(processed);
-
-            if receipt.blocks_processed > 0 {
-                let newly_applied =
-                    (receipt.active_blocks_persisted + receipt.side_blocks_persisted) as u64;
-                total_blocks_applied = total_blocks_applied.saturating_add(newly_applied);
-                if let Some(&id) = block_ids.get(receipt.blocks_processed - 1) {
-                    last_applied_block_id = id;
-                } else if let Some(&id) = block_ids.last() {
-                    last_applied_block_id = id;
-                }
-                last_applied_height = current_h.saturating_add(processed.saturating_sub(1));
-                current_h = last_applied_height.saturating_add(1);
-                if last_applied_height >= peer_tip_height {
-                    break;
-                }
-            }
-
-            if let Err(err) = receipt.status {
-                return Err(match err {
-                    SyncBatchError::ConsensusInvalid(msg) => {
-                        SyncWorkerError::ConsensusInvalid(msg)
-                    }
-                    SyncBatchError::DisconnectedOrphan {
-                        block_id,
-                        parent_id,
-                        height,
-                        index,
-                    } => SyncWorkerError::ConsensusInvalid(format!(
-                        "Peer delivered disconnected orphan block #{height} ({block_id}) at batch index {index}, parent {parent_id} unknown"
-                    )),
-                    SyncBatchError::InternalOrStorage(msg) => {
-                        SyncWorkerError::LocalOrStorage(msg)
-                    }
-                    SyncBatchError::StaleOperation => {
+                let receipt = tokio::time::timeout_at(deadline, ack_rx)
+                    .await
+                    .map_err(|_| {
+                        cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        SyncWorkerError::BudgetExhausted(format!(
+                            "Sync timeout of {:?} exceeded waiting for block batch receipt",
+                            timeout_duration
+                        ))
+                    })?
+                    .map_err(|_| {
                         SyncWorkerError::LocalOrStorage(
-                            "stale sync generation".to_string(),
+                            "Node runtime dropped block batch response".to_string(),
                         )
+                    })?;
+
+                let processed = receipt.blocks_processed as u64;
+                total_bodies_processed = total_bodies_processed.saturating_add(processed);
+
+                if receipt.blocks_processed > 0 {
+                    let newly_applied =
+                        (receipt.active_blocks_persisted + receipt.side_blocks_persisted) as u64;
+                    total_blocks_applied = total_blocks_applied.saturating_add(newly_applied);
+                    if let Some(&id) = block_ids.get(receipt.blocks_processed - 1) {
+                        last_applied_block_id = id;
+                    } else if let Some(&id) = block_ids.last() {
+                        last_applied_block_id = id;
                     }
-                });
+                    last_applied_height = current_h.saturating_add(processed.saturating_sub(1));
+                    current_h = last_applied_height.saturating_add(1);
+                    if last_applied_height >= target.tip_height {
+                        break;
+                    }
+                }
+
+                if let Err(err) = receipt.status {
+                    return Err(match err {
+                        SyncBatchError::ConsensusInvalid(msg) => {
+                            SyncWorkerError::ConsensusInvalid(msg)
+                        }
+                        SyncBatchError::DisconnectedOrphan {
+                            block_id,
+                            parent_id,
+                            height,
+                            index,
+                        } => SyncWorkerError::ConsensusInvalid(format!(
+                            "Peer delivered disconnected orphan block #{height} ({block_id}) at batch index {index}, parent {parent_id} unknown"
+                        )),
+                        SyncBatchError::InternalOrStorage(msg) => {
+                            SyncWorkerError::LocalOrStorage(msg)
+                        }
+                        SyncBatchError::StaleOperation => {
+                            SyncWorkerError::LocalOrStorage(
+                                "stale sync generation".to_string(),
+                            )
+                        }
+                    });
+                }
+
+                if receipt.blocks_processed == 0 {
+                    return Err(SyncWorkerError::Incomplete {
+                        requested_height: current_h,
+                        expected_target: target.tip_height,
+                        reason: "Zero blocks processed in batch application".into(),
+                    });
+                }
             }
 
-            if receipt.blocks_processed == 0 {
+            if last_applied_height < target.tip_height {
+                // Check if peer reorganized to a shorter chain
+                if let Ok(new_target) = Self::fetch_peer_status(
+                    &network_handle,
+                    peer_id,
+                    chain_id,
+                    deadline,
+                    timeout_duration,
+                )
+                .await
+                {
+                    if new_target != target {
+                        if reorg_restarts < MAX_REORG_RESTARTS {
+                            reorg_restarts += 1;
+                            current_target = new_target;
+                            Self::notify_attempt_target(
+                                &sync_tx,
+                                sync_operation_id,
+                                current_target,
+                                &cancel_flag,
+                                deadline,
+                                timeout_duration,
+                            )
+                            .await?;
+                            if let Some(ref st) = storage {
+                                local_snapshot = Self::capture_snapshot_cooperative(
+                                    st,
+                                    current_target.tip_height,
+                                    &cancel_flag,
+                                )
+                                .await?;
+                            }
+                            continue 'attempt_loop;
+                        } else {
+                            return Err(SyncWorkerError::PeerChainChanging(format!(
+                                "Peer {peer_id} changed sync target; restart budget exhausted"
+                            )));
+                        }
+                    }
+                }
                 return Err(SyncWorkerError::Incomplete {
                     requested_height: current_h,
-                    expected_target: peer_tip_height,
-                    reason: "Zero blocks processed in batch application".into(),
+                    expected_target: target.tip_height,
+                    reason: format!(
+                        "Sync loop exited before reaching target height: applied #{last_applied_height} < target #{}",
+                        target.tip_height
+                    ),
                 });
             }
-        }
 
-        if last_applied_height < peer_tip_height {
-            return Err(SyncWorkerError::Incomplete {
-                requested_height: current_h,
-                expected_target: peer_tip_height,
-                reason: format!(
-                    "Sync loop exited before reaching target height: applied #{last_applied_height} < target #{peer_tip_height}"
-                ),
+            // Final target verification:
+            // 1. Verify terminal block ID matches target.tip_block_id
+            if !target.tip_block_id.is_zero() && last_applied_block_id != target.tip_block_id {
+                if let Ok(new_target) = Self::fetch_peer_status(
+                    &network_handle,
+                    peer_id,
+                    chain_id,
+                    deadline,
+                    timeout_duration,
+                )
+                .await
+                {
+                    if new_target != target {
+                        if reorg_restarts < MAX_REORG_RESTARTS {
+                            reorg_restarts += 1;
+                            current_target = new_target;
+                            Self::notify_attempt_target(
+                                &sync_tx,
+                                sync_operation_id,
+                                current_target,
+                                &cancel_flag,
+                                deadline,
+                                timeout_duration,
+                            )
+                            .await?;
+                            if let Some(ref st) = storage {
+                                local_snapshot = Self::capture_snapshot_cooperative(
+                                    st,
+                                    current_target.tip_height,
+                                    &cancel_flag,
+                                )
+                                .await?;
+                            }
+                            continue 'attempt_loop;
+                        } else {
+                            return Err(SyncWorkerError::PeerChainChanging(format!(
+                                "Peer {peer_id} changed sync target at completion; restart budget exhausted"
+                            )));
+                        }
+                    }
+                }
+                return Err(SyncWorkerError::FalseAdvertisedClaim(format!(
+                    "Peer {peer_id} advertised tip block ID {} at height {}, but terminal applied block ID was {}",
+                    target.tip_block_id, target.tip_height, last_applied_block_id
+                )));
+            }
+
+            // 2. If storage is available, verify verified target block metadata
+            if !target.tip_block_id.is_zero() {
+                if let Some(ref st) = storage {
+                    match st.get_block_metadata(&target.tip_block_id) {
+                        Ok(Some(meta)) => {
+                            if meta.height != target.tip_height
+                                || meta.cumulative_work != target.cumulative_work
+                            {
+                                return Err(SyncWorkerError::FalseAdvertisedClaim(format!(
+                                    "Peer {peer_id} claimed cumulative work {:?} at height {}, but persisted block has work {:?} at height {}",
+                                    target.cumulative_work, target.tip_height, meta.cumulative_work, meta.height
+                                )));
+                            }
+                        }
+                        Ok(None) => {
+                            return Err(SyncWorkerError::LocalOrStorage(format!(
+                                "Persisted target block {} metadata not found in local storage",
+                                target.tip_block_id
+                            )));
+                        }
+                        Err(e) => {
+                            return Err(SyncWorkerError::LocalOrStorage(format!(
+                                "Storage error reading block metadata for {}: {e}",
+                                target.tip_block_id
+                            )));
+                        }
+                    }
+                }
+            }
+
+            let final_height = last_applied_height;
+            return Ok(SyncWorkerSuccess::VerifiedSuccess {
+                blocks_applied: total_blocks_applied,
+                final_height,
+                final_tip_id: last_applied_block_id,
+                target: Some(target),
             });
         }
-
-        let final_height = last_applied_height;
-        Ok(SyncWorkerSuccess::VerifiedSuccess {
-            blocks_applied: total_blocks_applied,
-            final_height,
-            final_tip_id: last_applied_block_id,
-        })
     }
 
     async fn handle_network_event(&mut self, event: NetworkEvent) {
@@ -4764,6 +5584,7 @@ mod tests {
                     blocks_applied: 1,
                     final_height: 1,
                     final_tip_id: Hash::ZERO,
+                    target: None,
                 }),
             }
         });
@@ -4778,6 +5599,7 @@ mod tests {
             abort_handle: handle_normal,
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             advertised_claim: None,
+            active_target: None,
             initiated_by_manual: true,
             active_blocks_persisted: 1,
             side_blocks_persisted: 0,
@@ -4815,6 +5637,7 @@ mod tests {
             abort_handle: handle_panic,
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             advertised_claim: None,
+            active_target: None,
             initiated_by_manual: true,
             active_blocks_persisted: 0,
             side_blocks_persisted: 0,
@@ -4854,6 +5677,7 @@ mod tests {
                     blocks_applied: 0,
                     final_height: 0,
                     final_tip_id: Hash::ZERO,
+                    target: None,
                 }),
             }
         });
@@ -4868,6 +5692,7 @@ mod tests {
             abort_handle: handle_cancel,
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             advertised_claim: None,
+            active_target: None,
             initiated_by_manual: true,
             active_blocks_persisted: 0,
             side_blocks_persisted: 0,
@@ -4917,6 +5742,7 @@ mod tests {
                     blocks_applied: 0,
                     final_height: 0,
                     final_tip_id: Hash::ZERO,
+                    target: None,
                 }),
             }
         });
@@ -4932,6 +5758,7 @@ mod tests {
             abort_handle: new_handle,
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             advertised_claim: None,
+            active_target: None,
             initiated_by_manual: true,
             active_blocks_persisted: 0,
             side_blocks_persisted: 0,
@@ -5521,6 +6348,7 @@ mod tests {
                     blocks_applied: 0,
                     final_height: 0,
                     final_tip_id: Hash::ZERO,
+                    target: None,
                 }),
             }
         });
@@ -5535,6 +6363,7 @@ mod tests {
             abort_handle: handle,
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             advertised_claim,
+            active_target: None,
             initiated_by_manual,
             active_blocks_persisted: 0,
             side_blocks_persisted: 0,
@@ -5868,6 +6697,7 @@ mod tests {
                 blocks_applied: 0,
                 final_height: 0,
                 final_tip_id: Hash::ZERO,
+                target: None,
             }),
             t0,
         );
@@ -5927,6 +6757,7 @@ mod tests {
                 blocks_applied: 1,
                 final_height: 1,
                 final_tip_id: block_1_id,
+                target: None,
             }),
             t0,
         );
@@ -6098,6 +6929,7 @@ mod tests {
                 blocks_applied: 0,
                 final_height: 0,
                 final_tip_id: Hash::ZERO,
+                target: None,
             }),
             t0,
         );
@@ -6141,6 +6973,7 @@ mod tests {
                 blocks_applied: 1,
                 final_height: 1,
                 final_tip_id: block_1_id,
+                target: None,
             }),
             t1,
         );
@@ -6593,6 +7426,7 @@ mod tests {
             Ok(SyncWorkerSuccess::AlreadySynchronized {
                 tip_height: 1,
                 tip_block_id: block_1_id,
+                target: None,
             }),
             t0,
         );
@@ -6614,6 +7448,7 @@ mod tests {
             Ok(SyncWorkerSuccess::AlreadySynchronized {
                 tip_height: 1,
                 tip_block_id: block_1_id,
+                target: None,
             }),
             t0,
         );
@@ -6707,6 +7542,10 @@ mod tests {
             sync_tx,
             advertised_claim: None,
             sync_timeout: None,
+            target: None,
+
+            storage: None,
+
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -6741,6 +7580,10 @@ mod tests {
             sync_tx,
             advertised_claim: None,
             sync_timeout: None,
+            target: None,
+
+            storage: None,
+
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -6779,6 +7622,10 @@ mod tests {
             sync_tx,
             advertised_claim: None,
             sync_timeout: None,
+            target: None,
+
+            storage: None,
+
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -6816,6 +7663,10 @@ mod tests {
             sync_tx,
             advertised_claim: None,
             sync_timeout: None,
+            target: None,
+
+            storage: None,
+
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -6854,6 +7705,10 @@ mod tests {
             sync_tx,
             advertised_claim: None,
             sync_timeout: None,
+            target: None,
+
+            storage: None,
+
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -6892,6 +7747,10 @@ mod tests {
             sync_tx,
             advertised_claim: None,
             sync_timeout: None,
+            target: None,
+
+            storage: None,
+
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -6937,6 +7796,10 @@ mod tests {
             sync_tx,
             advertised_claim: None,
             sync_timeout: None,
+            target: None,
+
+            storage: None,
+
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -6980,6 +7843,10 @@ mod tests {
             sync_tx,
             advertised_claim: None,
             sync_timeout: None,
+            target: None,
+
+            storage: None,
+
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -7024,6 +7891,10 @@ mod tests {
             sync_tx,
             advertised_claim: None,
             sync_timeout: None,
+            target: None,
+
+            storage: None,
+
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -7068,6 +7939,10 @@ mod tests {
             sync_tx,
             advertised_claim: None,
             sync_timeout: None,
+            target: None,
+
+            storage: None,
+
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -7112,6 +7987,10 @@ mod tests {
             sync_tx,
             advertised_claim: None,
             sync_timeout: None,
+            target: None,
+
+            storage: None,
+
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -7157,6 +8036,10 @@ mod tests {
             sync_tx,
             advertised_claim: None,
             sync_timeout: None,
+            target: None,
+
+            storage: None,
+
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -7214,6 +8097,10 @@ mod tests {
             sync_tx,
             advertised_claim: None,
             sync_timeout: None,
+            target: None,
+
+            storage: None,
+
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -7269,6 +8156,10 @@ mod tests {
             sync_tx,
             advertised_claim: None,
             sync_timeout: None,
+            target: None,
+
+            storage: None,
+
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -7324,6 +8215,10 @@ mod tests {
             sync_tx,
             advertised_claim: None,
             sync_timeout: None,
+            target: None,
+
+            storage: None,
+
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -7379,6 +8274,10 @@ mod tests {
             sync_tx,
             advertised_claim: None,
             sync_timeout: None,
+            target: None,
+
+            storage: None,
+
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -7433,6 +8332,10 @@ mod tests {
             sync_tx,
             advertised_claim: None,
             sync_timeout: None,
+            target: None,
+
+            storage: None,
+
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -7522,6 +8425,7 @@ mod tests {
                 blocks_applied,
                 final_height,
                 final_tip_id,
+                ..
             }) => {
                 assert_eq!(blocks_applied, 2);
                 assert_eq!(final_height, 3);
@@ -7593,6 +8497,7 @@ mod tests {
             Ok(SyncWorkerSuccess::AlreadySynchronized {
                 tip_height: 1,
                 tip_block_id: block_1_id,
+                target: None,
             }),
             t0,
         );
@@ -7629,6 +8534,7 @@ mod tests {
             Ok(SyncWorkerSuccess::AlreadySynchronized {
                 tip_height: 1,
                 tip_block_id: block_1_id, // Local tip differs from peer claim
+                target: None,
             }),
             t0,
         );
@@ -7656,6 +8562,7 @@ mod tests {
             Ok(SyncWorkerSuccess::AlreadySynchronized {
                 tip_height: 1,
                 tip_block_id: block_1_id,
+                target: None,
             }),
             t0,
         );
@@ -7704,6 +8611,10 @@ mod tests {
                 sync_tx: sync_tx.clone(),
                 advertised_claim: None,
                 sync_timeout: None,
+                target: None,
+
+                storage: None,
+
                 cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
             // When min_h == 0 and peer_tip_height == 0, worker immediately completes with AlreadySynchronized at height 0
@@ -7712,13 +8623,14 @@ mod tests {
                     .await
                     .expect("Must not hang")
                     .unwrap();
-            assert_eq!(
+            assert!(matches!(
                 res,
                 SyncWorkerSuccess::AlreadySynchronized {
                     tip_height: 0,
-                    tip_block_id: genesis_id,
-                }
-            );
+                    tip_block_id,
+                    ..
+                } if tip_block_id == genesis_id
+            ));
         }
 
         // 2. Ancestor search where common ancestor is at height 0 (genesis)
@@ -7742,6 +8654,10 @@ mod tests {
                 sync_tx: sync_tx.clone(),
                 advertised_claim: None,
                 sync_timeout: None,
+                target: None,
+
+                storage: None,
+
                 cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
             tokio::spawn(async move {
@@ -7819,6 +8735,10 @@ mod tests {
                 sync_tx: sync_tx.clone(),
                 advertised_claim: None,
                 sync_timeout: None,
+                target: None,
+
+                storage: None,
+
                 cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
             tokio::spawn(async move {
@@ -7909,6 +8829,10 @@ mod tests {
                 sync_tx: sync_tx_max,
                 advertised_claim: None,
                 sync_timeout: None,
+                target: None,
+
+                storage: None,
+
                 cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
             tokio::spawn(async move {
@@ -7971,6 +8895,7 @@ mod tests {
                     blocks_applied,
                     final_height,
                     final_tip_id,
+                    ..
                 } => {
                     assert_eq!(blocks_applied, 1);
                     assert_eq!(final_height, u64::MAX);
@@ -8000,6 +8925,10 @@ mod tests {
                 sync_tx: sync_tx_empty,
                 advertised_claim: None,
                 sync_timeout: None,
+                target: None,
+
+                storage: None,
+
                 cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
             tokio::spawn(async move {
@@ -8075,6 +9004,10 @@ mod tests {
                 sync_tx,
                 advertised_claim: None,
                 sync_timeout: None,
+                target: None,
+
+                storage: None,
+
                 cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
 
@@ -8191,6 +9124,7 @@ mod tests {
                     blocks_applied,
                     final_height,
                     final_tip_id,
+                    ..
                 } => {
                     assert_eq!(blocks_applied, 2);
                     assert_eq!(final_height, max_h);
@@ -8215,6 +9149,7 @@ mod tests {
                 abort_handle: dummy_handle.abort_handle(),
                 cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 advertised_claim: None, // Manual no-advertised-claim path
+                active_target: None,
                 initiated_by_manual: true,
                 notifier: Some(manual_tx),
                 active_blocks_persisted: 2,
@@ -8244,6 +9179,10 @@ mod tests {
                 sync_tx,
                 advertised_claim: None,
                 sync_timeout: None,
+                target: None,
+
+                storage: None,
+
                 cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
 
@@ -8323,6 +9262,10 @@ mod tests {
             sync_tx,
             advertised_claim: None,
             sync_timeout: None,
+            target: None,
+
+            storage: None,
+
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -8575,13 +9518,14 @@ mod tests {
             .expect("Worker must finish")
             .expect("Task must not panic");
 
-        assert_eq!(
+        assert!(matches!(
             task_result.result,
             Ok(SyncWorkerSuccess::AlreadySynchronized {
                 tip_height: 0,
-                tip_block_id: genesis_id,
-            })
-        );
+                tip_block_id,
+                ..
+            }) if tip_block_id == genesis_id
+        ));
 
         // Process completion through runtime handler
         runtime.handle_sync_task_success(
@@ -8691,6 +9635,10 @@ mod tests {
                 sync_tx,
                 advertised_claim: Some(claim_b1),
                 sync_timeout: None,
+                target: None,
+
+                storage: None,
+
                 cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
 
@@ -8716,6 +9664,7 @@ mod tests {
             let worker_res = Ok(SyncWorkerSuccess::AlreadySynchronized {
                 tip_height: 2,
                 tip_block_id: block_a2.block_id(),
+                target: None,
             });
 
             let now = Instant::now();
@@ -8754,6 +9703,7 @@ mod tests {
             let worker_res = Ok(SyncWorkerSuccess::AlreadySynchronized {
                 tip_height: 2,
                 tip_block_id: block_a2.block_id(),
+                target: None,
             });
 
             let now = Instant::now();
@@ -8797,6 +9747,10 @@ mod tests {
             sync_tx,
             advertised_claim: None,
             sync_timeout: Some(short_deadline),
+            target: None,
+
+            storage: None,
+
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -8860,6 +9814,10 @@ mod tests {
             sync_tx,
             advertised_claim: None,
             sync_timeout: Some(short_deadline),
+            target: None,
+
+            storage: None,
+
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -8969,12 +9927,15 @@ mod tests {
             .expect("Worker must finish")
             .expect("Task must not panic");
 
-        assert_eq!(
-            task_result.result,
-            Ok(SyncWorkerSuccess::AlreadySynchronized {
-                tip_height: 0,
-                tip_block_id: genesis_id,
-            }),
+        assert!(
+            matches!(
+                task_result.result,
+                Ok(SyncWorkerSuccess::AlreadySynchronized {
+                    tip_height: 0,
+                    tip_block_id,
+                    ..
+                }) if tip_block_id == genesis_id
+            ),
             "Worker must target authenticated height 0 and return AlreadySynchronized"
         );
 
@@ -9054,12 +10015,15 @@ mod tests {
             .expect("Worker task must complete")
             .expect("Task must not panic");
 
-        assert_eq!(
-            task_result.result,
-            Ok(SyncWorkerSuccess::AlreadySynchronized {
-                tip_height: 2,
-                tip_block_id: runtime.tip_block_id(),
-            }),
+        assert!(
+            matches!(
+                task_result.result,
+                Ok(SyncWorkerSuccess::AlreadySynchronized {
+                    tip_height: 2,
+                    tip_block_id,
+                    ..
+                }) if tip_block_id == runtime.tip_block_id()
+            ),
             "Worker must return AlreadySynchronized for genesis-only peer on canonical chain"
         );
 
@@ -9207,6 +10171,10 @@ mod tests {
             sync_tx,
             advertised_claim: None,
             sync_timeout: Some(short_deadline),
+            target: None,
+
+            storage: None,
+
             cancel_flag: cancel_flag.clone(),
         };
 
@@ -9262,6 +10230,7 @@ mod tests {
                     blocks_applied: 0,
                     final_height: 0,
                     final_tip_id: Hash::ZERO,
+                    target: None,
                 }),
             }
         });
@@ -9272,6 +10241,7 @@ mod tests {
             abort_handle: dummy_handle,
             cancel_flag: cancel_flag.clone(),
             advertised_claim: None,
+            active_target: None,
             initiated_by_manual: true,
             active_blocks_persisted: 0,
             side_blocks_persisted: 0,
@@ -9318,5 +10288,404 @@ mod tests {
                 .is_cooling_down(&peer_id, Instant::now()),
             "Peer must NOT be penalized for a locally delayed acknowledgement"
         );
+    }
+
+    #[tokio::test]
+    async fn test_sync_reorg_retry_budget_exhaustion_terminates_non_penalizing() {
+        let cid = chain_id(DEVNET);
+        let genesis_id = genesis_block(cid).block_id();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(32);
+        let (sync_tx, mut sync_rx) = mpsc::channel(32);
+
+        let h1_a = make_test_sync_header(1, cid, genesis_id);
+        let mut h1_b = make_test_sync_header(1, cid, genesis_id);
+        h1_b.nonce = 100;
+        let mut h1_c = make_test_sync_header(1, cid, genesis_id);
+        h1_c.nonce = 200;
+        let mut h1_d = make_test_sync_header(1, cid, genesis_id);
+        h1_d.nonce = 300;
+
+        let peer_id = PeerId::random();
+        let snapshot = ActiveChainSnapshot {
+            tip_height: 0,
+            tip_block_id: genesis_id,
+            block_ids: Arc::new(vec![genesis_id]),
+        };
+
+        let initial_target = SyncTarget {
+            tip_height: 1,
+            tip_block_id: h1_a.block_id(),
+            cumulative_work: U256::from_u128(1),
+        };
+
+        let ctx = SyncWorkerContext {
+            sync_operation_id: 801,
+            peer_id,
+            peer_tip_height: 1,
+            chain_id: cid,
+            snapshot,
+            network_handle: NetworkHandle::new_mock(cmd_tx, PeerId::random()),
+            sync_tx,
+            advertised_claim: None,
+            target: Some(initial_target),
+            storage: None,
+            sync_timeout: Some(Duration::from_secs(5)),
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        tokio::spawn(async move {
+            // Attempt 0: Worker sends GetHeaders for height 1. Mock responds with h1_b (mismatch!)
+            if let Some(NetworkCommand::SendSyncRequest {
+                request, sender, ..
+            }) = cmd_rx.recv().await
+            {
+                assert!(matches!(
+                    request,
+                    SyncRequest::GetHeaders {
+                        start_height: 1,
+                        ..
+                    }
+                ));
+                let _ = sender.send(Ok(SyncResponse::Headers(vec![h1_b])));
+            }
+            // Worker detects mismatch, calls GetStatus. Mock returns status h1_b (restart 1)
+            if let Some(NetworkCommand::SendSyncRequest {
+                request, sender, ..
+            }) = cmd_rx.recv().await
+            {
+                assert!(matches!(request, SyncRequest::GetStatus));
+                let _ = sender.send(Ok(SyncResponse::Status {
+                    tip_height: 1,
+                    tip_block_id: h1_b.block_id(),
+                    cumulative_work: U256::from_u128(1),
+                }));
+            }
+            // Attempt 1: Worker sends GetHeaders for height 1. Mock responds with h1_c (mismatch!)
+            if let Some(NetworkCommand::SendSyncRequest {
+                request, sender, ..
+            }) = cmd_rx.recv().await
+            {
+                assert!(matches!(
+                    request,
+                    SyncRequest::GetHeaders {
+                        start_height: 1,
+                        ..
+                    }
+                ));
+                let _ = sender.send(Ok(SyncResponse::Headers(vec![h1_c])));
+            }
+            // Worker detects mismatch, calls GetStatus. Mock returns status h1_c (restart 2)
+            if let Some(NetworkCommand::SendSyncRequest {
+                request, sender, ..
+            }) = cmd_rx.recv().await
+            {
+                assert!(matches!(request, SyncRequest::GetStatus));
+                let _ = sender.send(Ok(SyncResponse::Status {
+                    tip_height: 1,
+                    tip_block_id: h1_c.block_id(),
+                    cumulative_work: U256::from_u128(1),
+                }));
+            }
+            // Attempt 2: Worker sends GetHeaders for height 1. Mock responds with h1_d (mismatch!)
+            if let Some(NetworkCommand::SendSyncRequest {
+                request, sender, ..
+            }) = cmd_rx.recv().await
+            {
+                assert!(matches!(
+                    request,
+                    SyncRequest::GetHeaders {
+                        start_height: 1,
+                        ..
+                    }
+                ));
+                let _ = sender.send(Ok(SyncResponse::Headers(vec![h1_d])));
+            }
+            // Worker detects mismatch, calls GetStatus. Mock returns status h1_d (budget exhausted!)
+            if let Some(NetworkCommand::SendSyncRequest {
+                request, sender, ..
+            }) = cmd_rx.recv().await
+            {
+                assert!(matches!(request, SyncRequest::GetStatus));
+                let _ = sender.send(Ok(SyncResponse::Status {
+                    tip_height: 1,
+                    tip_block_id: h1_d.block_id(),
+                    cumulative_work: U256::from_u128(1),
+                }));
+            }
+        });
+
+        // Drain SetAttemptTarget messages
+        tokio::spawn(async move { while let Some(_msg) = sync_rx.recv().await {} });
+
+        let worker_res = NodeRuntime::run_sync_worker(ctx).await;
+        assert!(matches!(
+            worker_res,
+            Err(SyncWorkerError::PeerChainChanging(_))
+        ));
+
+        // Verify runtime outcome evaluation
+        let dir = TempDir::new().unwrap();
+        let mut runtime = NodeRuntime::init(make_test_config(&dir)).unwrap();
+        let dummy_handle = tokio::spawn(async {});
+        let (notifier_tx, notifier_rx) = oneshot::channel();
+        let active_op = ActiveSyncOperation {
+            sync_operation_id: 801,
+            peer_id,
+            task_id: dummy_handle.id(),
+            abort_handle: dummy_handle.abort_handle(),
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            advertised_claim: None,
+            active_target: Some(initial_target),
+            initiated_by_manual: true,
+            notifier: Some(notifier_tx),
+            active_blocks_persisted: 0,
+            side_blocks_persisted: 0,
+            reached_advertised_tip_via_sync: false,
+            observed_batch_error: None,
+        };
+
+        let eval = runtime.evaluate_active_sync_outcome(&active_op, &worker_res);
+        assert_eq!(eval, SyncOutcomeEvaluation::RetryablePeerChainChanging);
+
+        runtime.finish_active_sync_with_result_at(active_op, worker_res, Instant::now());
+        assert!(!runtime
+            .sync_penalties
+            .is_cooling_down(&peer_id, Instant::now()));
+
+        let notifier_res = notifier_rx.await.unwrap();
+        assert!(notifier_res.is_err());
+        let err_msg = notifier_res.unwrap_err();
+        assert!(err_msg.contains("retryable because peer chain is changing"));
+    }
+
+    #[tokio::test]
+    async fn test_sync_contradictory_chain_without_status_update_is_penalized() {
+        let cid = chain_id(DEVNET);
+        let genesis_id = genesis_block(cid).block_id();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(32);
+        let (sync_tx, _sync_rx) = mpsc::channel(32);
+
+        let h1_a = make_test_sync_header(1, cid, genesis_id);
+        let mut h1_b = make_test_sync_header(1, cid, genesis_id);
+        h1_b.nonce = 100;
+
+        let peer_id = PeerId::random();
+        let snapshot = ActiveChainSnapshot {
+            tip_height: 0,
+            tip_block_id: genesis_id,
+            block_ids: Arc::new(vec![genesis_id]),
+        };
+
+        let initial_target = SyncTarget {
+            tip_height: 1,
+            tip_block_id: h1_a.block_id(),
+            cumulative_work: U256::from_u128(1),
+        };
+
+        let ctx = SyncWorkerContext {
+            sync_operation_id: 802,
+            peer_id,
+            peer_tip_height: 1,
+            chain_id: cid,
+            snapshot,
+            network_handle: NetworkHandle::new_mock(cmd_tx, PeerId::random()),
+            sync_tx,
+            advertised_claim: None,
+            target: Some(initial_target),
+            storage: None,
+            sync_timeout: Some(Duration::from_secs(5)),
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        tokio::spawn(async move {
+            // Worker queries GetHeaders for height 1. Mock responds with h1_b (contradictory block!)
+            if let Some(NetworkCommand::SendSyncRequest { sender, .. }) = cmd_rx.recv().await {
+                let _ = sender.send(Ok(SyncResponse::Headers(vec![h1_b])));
+            }
+            // Worker detects discrepancy, queries GetStatus. Mock claims status is STILL h1_a (unchanged!)
+            if let Some(NetworkCommand::SendSyncRequest { sender, .. }) = cmd_rx.recv().await {
+                let _ = sender.send(Ok(SyncResponse::Status {
+                    tip_height: 1,
+                    tip_block_id: h1_a.block_id(),
+                    cumulative_work: U256::from_u128(1),
+                }));
+            }
+        });
+
+        let worker_res = NodeRuntime::run_sync_worker(ctx).await;
+        assert!(matches!(
+            worker_res,
+            Err(SyncWorkerError::FalseAdvertisedClaim(_))
+        ));
+
+        // Verify runtime penalizes peer
+        let dir = TempDir::new().unwrap();
+        let mut runtime = NodeRuntime::init(make_test_config(&dir)).unwrap();
+        let dummy_handle = tokio::spawn(async {});
+        let (notifier_tx, notifier_rx) = oneshot::channel();
+        let active_op = ActiveSyncOperation {
+            sync_operation_id: 802,
+            peer_id,
+            task_id: dummy_handle.id(),
+            abort_handle: dummy_handle.abort_handle(),
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            advertised_claim: None,
+            active_target: Some(initial_target),
+            initiated_by_manual: true,
+            notifier: Some(notifier_tx),
+            active_blocks_persisted: 0,
+            side_blocks_persisted: 0,
+            reached_advertised_tip_via_sync: false,
+            observed_batch_error: None,
+        };
+
+        let eval = runtime.evaluate_active_sync_outcome(&active_op, &worker_res);
+        assert_eq!(
+            eval,
+            SyncOutcomeEvaluation::Penalized(SyncFailureClass::FalseAdvertisedWorkClaim)
+        );
+
+        runtime.finish_active_sync_with_result_at(active_op, worker_res, Instant::now());
+        assert!(runtime
+            .sync_penalties
+            .is_cooling_down(&peer_id, Instant::now()));
+
+        let notifier_res = notifier_rx.await.unwrap();
+        assert!(notifier_res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sync_reorg_between_headers_and_blocks_retries_and_succeeds() {
+        let cid = chain_id(DEVNET);
+        let genesis_id = genesis_block(cid).block_id();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(32);
+        let (sync_tx, mut sync_rx) = mpsc::channel(32);
+
+        let h1_old = make_test_sync_header(1, cid, genesis_id);
+        let mut h1_new = make_test_sync_header(1, cid, genesis_id);
+        h1_new.nonce = 777;
+
+        let peer_id = PeerId::random();
+        let snapshot = ActiveChainSnapshot {
+            tip_height: 0,
+            tip_block_id: genesis_id,
+            block_ids: Arc::new(vec![genesis_id]),
+        };
+
+        let initial_target = SyncTarget {
+            tip_height: 1,
+            tip_block_id: h1_old.block_id(),
+            cumulative_work: U256::from_u128(1),
+        };
+
+        let ctx = SyncWorkerContext {
+            sync_operation_id: 803,
+            peer_id,
+            peer_tip_height: 1,
+            chain_id: cid,
+            snapshot,
+            network_handle: NetworkHandle::new_mock(cmd_tx, PeerId::random()),
+            sync_tx,
+            advertised_claim: None,
+            target: Some(initial_target),
+            storage: None,
+            sync_timeout: Some(Duration::from_secs(5)),
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        tokio::spawn(async move {
+            // Attempt 0:
+            // 1. GetHeaders for height 1 returns h1_old
+            if let Some(NetworkCommand::SendSyncRequest {
+                request, sender, ..
+            }) = cmd_rx.recv().await
+            {
+                assert!(matches!(
+                    request,
+                    SyncRequest::GetHeaders {
+                        start_height: 1,
+                        ..
+                    }
+                ));
+                let _ = sender.send(Ok(SyncResponse::Headers(vec![h1_old])));
+            }
+            // 2. GetBlocks for h1_old returns empty (peer reorganized before serving blocks!)
+            if let Some(NetworkCommand::SendSyncRequest {
+                request, sender, ..
+            }) = cmd_rx.recv().await
+            {
+                assert!(matches!(request, SyncRequest::GetBlocks { .. }));
+                let _ = sender.send(Ok(SyncResponse::Blocks(vec![])));
+            }
+            // 3. Worker queries GetStatus. Mock responds with h1_new!
+            if let Some(NetworkCommand::SendSyncRequest {
+                request, sender, ..
+            }) = cmd_rx.recv().await
+            {
+                assert!(matches!(request, SyncRequest::GetStatus));
+                let _ = sender.send(Ok(SyncResponse::Status {
+                    tip_height: 1,
+                    tip_block_id: h1_new.block_id(),
+                    cumulative_work: U256::from_u128(1),
+                }));
+            }
+            // Attempt 1:
+            // 4. GetHeaders for height 1 returns h1_new
+            if let Some(NetworkCommand::SendSyncRequest {
+                request, sender, ..
+            }) = cmd_rx.recv().await
+            {
+                assert!(matches!(
+                    request,
+                    SyncRequest::GetHeaders {
+                        start_height: 1,
+                        ..
+                    }
+                ));
+                let _ = sender.send(Ok(SyncResponse::Headers(vec![h1_new])));
+            }
+            // 5. GetBlocks for h1_new returns b1_new!
+            if let Some(NetworkCommand::SendSyncRequest {
+                request, sender, ..
+            }) = cmd_rx.recv().await
+            {
+                assert!(matches!(request, SyncRequest::GetBlocks { .. }));
+                let b1_new = Block {
+                    header: h1_new,
+                    transactions: vec![],
+                };
+                let _ = sender.send(Ok(SyncResponse::Blocks(vec![b1_new])));
+            }
+        });
+
+        // Mock runtime handling SetAttemptTarget and ApplyBlockBatch
+        tokio::spawn(async move {
+            while let Some(msg) = sync_rx.recv().await {
+                match msg {
+                    RuntimeSyncMessage::SetAttemptTarget { .. } => {}
+                    RuntimeSyncMessage::ApplyBlockBatch { respond_to, .. } => {
+                        let _ = respond_to.send(SyncBatchReceipt {
+                            blocks_processed: 1,
+                            active_blocks_persisted: 1,
+                            side_blocks_persisted: 0,
+                            already_known_duplicates: 0,
+                            reached_advertised_tip: true,
+                            status: Ok(()),
+                        });
+                    }
+                }
+            }
+        });
+
+        let worker_res = NodeRuntime::run_sync_worker(ctx).await;
+        assert!(matches!(
+            worker_res,
+            Ok(SyncWorkerSuccess::VerifiedSuccess {
+                blocks_applied: 1,
+                final_height: 1,
+                final_tip_id,
+                target: Some(target),
+            }) if final_tip_id == h1_new.block_id() && target.tip_block_id == h1_new.block_id()
+        ));
     }
 }
