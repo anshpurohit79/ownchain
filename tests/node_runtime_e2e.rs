@@ -293,6 +293,31 @@ async fn wait_for_mempool_tx(handle: &NodeHandle) {
     }
 }
 
+async fn wait_for_tx_mesh(handle: &NodeHandle, peer_id: PeerId) {
+    let timeout = Duration::from_secs(15);
+    let start = Instant::now();
+    loop {
+        match handle.is_tx_mesh_ready(peer_id).await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => panic!(
+                "Failed to query tx mesh readiness for peer {} on node {}: {}",
+                peer_id,
+                handle.peer_id(),
+                e
+            ),
+        }
+        if start.elapsed() > timeout {
+            panic!(
+                "Timed out waiting for tx mesh with peer {} on node {}",
+                peer_id,
+                handle.peer_id()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Test 1: Real Network Handshake & Incompatible Chain ID Rejection
 // -----------------------------------------------------------------------------
@@ -556,11 +581,6 @@ async fn test_mempool_admission_gossip_and_conflict_rejection() {
         let (node_a, _t_a) = NodeRuntime::spawn(create_node_config(&dir_a)).unwrap();
         let (node_b, _t_b) = NodeRuntime::spawn(create_node_config(&dir_b)).unwrap();
 
-        let addr_a = wait_for_listen_addr(&node_a).await;
-        node_b.dial(addr_a).await.unwrap();
-        wait_for_peer_handshake(&node_b, node_a.peer_id()).await;
-        wait_for_peer_handshake(&node_a, node_b.peer_id()).await;
-
         let devnet_chain_id = hash::chain_id(DEVNET);
         let genesis = genesis_block(devnet_chain_id);
         let mut chain_state = ChainState::from_genesis(&genesis).unwrap();
@@ -568,7 +588,8 @@ async fn test_mempool_admission_gossip_and_conflict_rejection() {
         let alice = TestKeypair::from_seed(2);
         let bob = TestKeypair::from_seed(3);
 
-        // Advance 101 blocks so miner's coinbase reward from block 1 matures and becomes spendable
+        // Advance 101 blocks on both nodes while disconnected so miner's coinbase reward
+        // from block 1 matures and becomes spendable, without generating cross-node block gossip.
         for h in 1..=101 {
             let cb = make_coinbase(devnet_chain_id, h, miner.address, 10_000_000);
             let b = make_hybrid_block(&chain_state, GENESIS_TIMESTAMP + h * 120, vec![cb]);
@@ -579,7 +600,17 @@ async fn test_mempool_admission_gossip_and_conflict_rejection() {
 
         // Both nodes independently hold the mature chain needed for the mempool checks.
         let tip_101_id = chain_state.tip_block_id().unwrap();
+        wait_for_tip(&node_a, 101, tip_101_id).await;
         wait_for_tip(&node_b, 101, tip_101_id).await;
+
+        let addr_a = wait_for_listen_addr(&node_a).await;
+        node_b.dial(addr_a).await.unwrap();
+        wait_for_peer_handshake(&node_b, node_a.peer_id()).await;
+        wait_for_peer_handshake(&node_a, node_b.peer_id()).await;
+
+        // Verify Gossipsub transaction mesh readiness between both nodes before transaction publication
+        wait_for_tx_mesh(&node_b, node_a.peer_id()).await;
+        wait_for_tx_mesh(&node_a, node_b.peer_id()).await;
 
         // Submit valid Type 1 transaction on Node B
         let tx1 =

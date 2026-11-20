@@ -17,6 +17,7 @@ use futures::StreamExt;
 use libp2p::core::Multiaddr;
 use libp2p::gossipsub::{
     Event as GossipsubEvent, IdentTopic, Message as GossipsubMessage, MessageAcceptance, MessageId,
+    PublishError,
 };
 use libp2p::identity::{Keypair, PeerId};
 use libp2p::noise;
@@ -341,6 +342,11 @@ pub enum NetworkCommand {
     ForgetSeenTransactions(Vec<Hash>),
     /// Clear all cached seen transaction IDs (e.g., after an active-chain reorganization).
     ClearSeenTransactions,
+    /// Check whether a peer is currently in the local Gossipsub mesh for the transaction topic.
+    IsTxMeshReady {
+        peer_id: PeerId,
+        respond_to: oneshot::Sender<bool>,
+    },
 }
 
 /// Events emitted by the network service to the node runtime.
@@ -549,6 +555,18 @@ impl NetworkHandle {
             .send(NetworkCommand::ClearSeenTransactions)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    pub async fn is_tx_mesh_ready(&self, peer_id: PeerId) -> Result<bool, String> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(NetworkCommand::IsTxMeshReady {
+                peer_id,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        rx.await.map_err(|e| e.to_string())
     }
 }
 
@@ -946,11 +964,24 @@ impl NetworkService {
                 if let Ok(raw_bytes) = block.to_bytes() {
                     if raw_bytes.len() <= MAX_FRAME_LENGTH {
                         if let Ok(frame) = encode_frame(&raw_bytes) {
-                            let _ = self
+                            if let Err(e) = self
                                 .swarm
                                 .behaviour_mut()
                                 .gossipsub
-                                .publish(self.blocks_topic.clone(), frame);
+                                .publish(self.blocks_topic.clone(), frame)
+                            {
+                                match e {
+                                    PublishError::InsufficientPeers => {
+                                        tracing::debug!(%block_id, "Insufficient peers to publish block to gossipsub");
+                                    }
+                                    PublishError::Duplicate => {
+                                        tracing::debug!(%block_id, "Block already published or present in gossipsub cache");
+                                    }
+                                    other => {
+                                        tracing::warn!(%block_id, error = ?other, "Failed to publish block to gossipsub");
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -960,11 +991,24 @@ impl NetworkService {
                 self.mark_tx_seen(tx_id);
                 if tx_bytes.len() <= MAX_FRAME_LENGTH {
                     if let Ok(frame) = encode_frame(&tx_bytes) {
-                        let _ = self
+                        if let Err(e) = self
                             .swarm
                             .behaviour_mut()
                             .gossipsub
-                            .publish(self.txs_topic.clone(), frame);
+                            .publish(self.txs_topic.clone(), frame)
+                        {
+                            match e {
+                                PublishError::InsufficientPeers => {
+                                    tracing::debug!(%tx_id, "Insufficient peers to publish transaction to gossipsub");
+                                }
+                                PublishError::Duplicate => {
+                                    tracing::debug!(%tx_id, "Transaction already published or present in gossipsub cache");
+                                }
+                                other => {
+                                    tracing::warn!(%tx_id, error = ?other, "Failed to publish transaction to gossipsub");
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1081,6 +1125,18 @@ impl NetworkService {
             }
             NetworkCommand::ClearSeenTransactions => {
                 self.clear_seen_txs();
+            }
+            NetworkCommand::IsTxMeshReady {
+                peer_id,
+                respond_to,
+            } => {
+                let ready = self
+                    .swarm
+                    .behaviour()
+                    .gossipsub
+                    .mesh_peers(&self.txs_topic.hash())
+                    .any(|p| *p == peer_id);
+                let _ = respond_to.send(ready);
             }
         }
     }

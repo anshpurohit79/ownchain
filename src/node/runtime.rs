@@ -1065,6 +1065,10 @@ pub enum NodeCommand {
         tip_block_id: Hash,
         respond_to: oneshot::Sender<Result<BlockProcessingOutcome, String>>,
     },
+    IsTxMeshReady {
+        peer_id: PeerId,
+        respond_to: oneshot::Sender<Result<bool, String>>,
+    },
     Stop {
         respond_to: oneshot::Sender<()>,
     },
@@ -1217,6 +1221,19 @@ impl NodeHandle {
         self.command_tx
             .send(NodeCommand::ReevaluateStoredBranch {
                 tip_block_id,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|_| "Node runtime has shut down".to_string())?;
+        rx.await
+            .map_err(|_| "Node runtime dropped response".to_string())?
+    }
+
+    pub async fn is_tx_mesh_ready(&self, peer_id: PeerId) -> Result<bool, String> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(NodeCommand::IsTxMeshReady {
+                peer_id,
                 respond_to: tx,
             })
             .await
@@ -2028,6 +2045,10 @@ impl NodeRuntime {
                         }
                         Some(NodeCommand::ReevaluateStoredBranch { tip_block_id, respond_to }) => {
                             let res = self.reevaluate_stored_branch(tip_block_id).await;
+                            let _ = respond_to.send(res);
+                        }
+                        Some(NodeCommand::IsTxMeshReady { peer_id, respond_to }) => {
+                            let res = self.network_handle.is_tx_mesh_ready(peer_id).await;
                             let _ = respond_to.send(res);
                         }
                         Some(NodeCommand::Stop { respond_to }) => {
